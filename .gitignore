@@ -195,3 +195,5 @@ scripts/kepler/figs
 *.h5
 
 slurm*.out
+test_data/
+.venv/
