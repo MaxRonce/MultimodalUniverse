@@ -7,10 +7,11 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from mmu.data import HATSDataset
+from mmu.data import CrossMatchedHATSDataset, HATSDataset
 
 TEST_DATA = os.path.join(os.path.dirname(__file__), "..", "test_data")
 HATS_CATALOG = os.path.join(TEST_DATA, "hats_from_script", "sdss_test", "sdss_test")
+HATS_MULTI = os.path.join(TEST_DATA, "sdss_multi_hats", "sdss_multi", "sdss_multi")
 
 
 @pytest.fixture
@@ -144,3 +145,33 @@ class TestClearCache:
         assert len(ds_light._pixel_cache) > 0
         ds_light.clear_cache()
         assert len(ds_light._pixel_cache) == 0
+
+
+@pytest.fixture
+def ds_multi():
+    if not os.path.exists(HATS_MULTI):
+        pytest.skip("Multi-healpix HATS test catalog not built")
+    return HATSDataset(HATS_MULTI, columns=["ra", "dec", "Z", "object_id"])
+
+
+class TestCrossMatch:
+    def test_self_crossmatch(self, ds_multi):
+        result = ds_multi.crossmatch(ds_multi, radius_arcsec=1.0, suffixes=("_a", "_b"))
+        assert isinstance(result, CrossMatchedHATSDataset)
+        assert result.matched_count == len(ds_multi)
+
+    def test_crossmatch_distance_zero(self, ds_multi):
+        result = ds_multi.crossmatch(ds_multi, radius_arcsec=1.0, suffixes=("_a", "_b"))
+        item = result[0]
+        assert "_dist_arcsec" in item
+        assert item["_dist_arcsec"] == 0.0
+
+    def test_crossmatch_dataloader(self, ds_multi):
+        result = ds_multi.crossmatch(ds_multi, radius_arcsec=1.0, suffixes=("_a", "_b"))
+        loader = torch.utils.data.DataLoader(result, batch_size=16)
+        batch = next(iter(loader))
+        assert batch["ra_a"].shape == (16,)
+
+    def test_crossmatch_tight_radius(self, ds_multi):
+        result = ds_multi.crossmatch(ds_multi, radius_arcsec=0.0001, suffixes=("_a", "_b"))
+        assert result.matched_count == len(ds_multi)

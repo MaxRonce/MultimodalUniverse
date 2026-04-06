@@ -1,13 +1,14 @@
 """HATS-native data loading for Multimodal Universe v2.
 
 Provides PyTorch Dataset and Lightning DataModule backed by HATS catalogs
-with lazy column loading and spatial filtering.
+with lazy column loading, spatial filtering, and cross-matching.
 """
 
 import typing as T
 from functools import cached_property
 
 import hats
+import lsdb
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -93,6 +94,91 @@ class HATSDataset(Dataset):
     @property
     def schema(self) -> pa.Schema:
         return self.catalog.schema
+
+    @cached_property
+    def lsdb_catalog(self) -> lsdb.Catalog:
+        """Return an LSDB catalog for cross-matching and spatial queries."""
+        return lsdb.read_hats(self.catalog.catalog_base_dir)
+
+    def crossmatch(
+        self,
+        other: "HATSDataset",
+        radius_arcsec: float = 1.0,
+        n_neighbors: int = 1,
+        columns_left: list[str] | None = None,
+        columns_right: list[str] | None = None,
+        suffixes: tuple[str, str] = ("_left", "_right"),
+    ) -> "CrossMatchedHATSDataset":
+        """Cross-match this catalog against another using LSDB.
+
+        Args:
+            other: The other HATSDataset to match against.
+            radius_arcsec: Maximum match radius in arcseconds.
+            n_neighbors: Number of nearest neighbors to find.
+            columns_left: Columns to keep from this catalog.
+            columns_right: Columns to keep from the other catalog.
+            suffixes: Suffixes for overlapping column names.
+
+        Returns:
+            A CrossMatchedHATSDataset containing matched pairs.
+        """
+        result = self.lsdb_catalog.crossmatch(
+            other.lsdb_catalog,
+            n_neighbors=n_neighbors,
+            radius_arcsec=radius_arcsec,
+            suffixes=suffixes,
+        )
+        df = result.compute()
+        return CrossMatchedHATSDataset(
+            df, columns_left=columns_left, columns_right=columns_right,
+            suffixes=suffixes,
+        )
+
+
+class CrossMatchedHATSDataset(Dataset):
+    """PyTorch Dataset from a cross-matched result.
+
+    Holds the materialized cross-match result as a DataFrame and provides
+    indexed access to matched pairs.
+    """
+
+    def __init__(
+        self,
+        df,
+        columns_left: list[str] | None = None,
+        columns_right: list[str] | None = None,
+        suffixes: tuple[str, str] = ("_left", "_right"),
+    ):
+        self.df = df.reset_index(drop=True)
+        self.suffixes = suffixes
+        self._columns_left = columns_left
+        self._columns_right = columns_right
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, idx: int) -> dict[str, T.Any]:
+        row = self.df.iloc[idx]
+        result = {}
+        for col in self.df.columns:
+            val = row[col]
+            if hasattr(val, 'to_dict'):
+                # Nested pandas DataFrame (e.g., spectrum struct) → dict of tensors
+                d = val.to_dict(orient='list')
+                result[col] = {k: _python_to_torch(v) for k, v in d.items()}
+            elif hasattr(val, 'item'):
+                result[col] = _python_to_torch(val.item())
+            else:
+                result[col] = _python_to_torch(val)
+        return result
+
+    @property
+    def matched_count(self) -> int:
+        return len(self.df)
+
+    @property
+    def columns(self) -> list[str]:
+        return list(self.df.columns)
 
 
 def _arrow_row_to_torch(row: pa.Table) -> dict[str, torch.Tensor]:
