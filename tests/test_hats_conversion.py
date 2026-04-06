@@ -1,77 +1,110 @@
-"""Tests for SDSS HDF5 -> HATS conversion pipeline."""
+"""Tests for HDF5 -> HATS conversion pipeline (SDSS and DESI)."""
 
 import os
-import sys
 
 import h5py
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
 from astropy.table import Table as AstropyTable
-from dask.distributed import Client
-from hats_import import CollectionArguments
-from hats_import.pipeline import pipeline_with_client
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts", "sdss"))
-from build_parent_sample_hats import (
-    BOOL_FEATURES,
-    FLOAT_FEATURES,
-    FLUX_FEATURES,
-    FLUX_FILTERS,
-    ArrowTableReader,
-    catalog_to_arrow,
-)
+from mmu.hats_import import build_arrow_table, write_hats
 
 TEST_DATA = os.path.join(os.path.dirname(__file__), "..", "test_data")
-HDF5_PATH = os.path.join(TEST_DATA, "sdss", "sdss", "healpix=583", "001-of-001.hdf5")
+
+# --- SDSS ---
+
+SDSS_HDF5 = os.path.join(TEST_DATA, "sdss", "sdss", "healpix=583", "001-of-001.hdf5")
+SDSS_FLOAT = ["VDISP", "VDISP_ERR", "Z", "Z_ERR"]
+SDSS_BOOL = ["ZWARNING"]
+SDSS_FLUX = ["SPECTROFLUX", "SPECTROFLUX_IVAR", "SPECTROSYNFLUX", "SPECTROSYNFLUX_IVAR"]
+SDSS_FILTERS = ["U", "G", "R", "I", "Z"]
+
+# --- DESI ---
+
+DESI_HDF5 = os.path.join(TEST_DATA, "desi", "edr_sv3", "healpix=626", "001-of-001.hdf5")
+DESI_FLOAT = [
+    "Z", "ZERR", "EBV",
+    "FLUX_G", "FLUX_R", "FLUX_Z",
+    "FLUX_IVAR_G", "FLUX_IVAR_R", "FLUX_IVAR_Z",
+    "FIBERFLUX_G", "FIBERFLUX_R", "FIBERFLUX_Z",
+    "FIBERTOTFLUX_G", "FIBERTOTFLUX_R", "FIBERTOTFLUX_Z",
+]
+DESI_BOOL = ["ZWARN"]
 
 
-@pytest.fixture
-def sdss_hdf5():
-    if not os.path.exists(HDF5_PATH):
-        pytest.skip("SDSS test data not downloaded")
-    return HDF5_PATH
-
-
-@pytest.fixture
-def sdss_astropy_table(sdss_hdf5):
-    with h5py.File(sdss_hdf5, "r") as f:
+def _load_hdf5_table(path, float_features, bool_features, flux_features=None):
+    """Load an MMU HDF5 file into an astropy Table with required columns."""
+    with h5py.File(path, "r") as f:
         cols = [
             "ra", "dec", "object_id",
             "spectrum_flux", "spectrum_ivar", "spectrum_lambda",
             "spectrum_lsf_sigma", "spectrum_mask",
-            *FLOAT_FEATURES, *BOOL_FEATURES, *FLUX_FEATURES,
         ]
+        cols += float_features + bool_features
+        if flux_features:
+            cols += flux_features
         return AstropyTable({k: f[k][:] for k in cols})
+
+
+# --- Fixtures ---
+
+@pytest.fixture
+def sdss_hdf5():
+    if not os.path.exists(SDSS_HDF5):
+        pytest.skip("SDSS test data not downloaded")
+    return SDSS_HDF5
+
+
+@pytest.fixture
+def sdss_astropy_table(sdss_hdf5):
+    return _load_hdf5_table(sdss_hdf5, SDSS_FLOAT, SDSS_BOOL, SDSS_FLUX)
 
 
 @pytest.fixture
 def sdss_arrow_table(sdss_astropy_table):
-    return catalog_to_arrow(sdss_astropy_table)
+    return build_arrow_table(
+        sdss_astropy_table,
+        float_features=SDSS_FLOAT,
+        bool_features=SDSS_BOOL,
+        flux_features=SDSS_FLUX,
+        flux_filters=SDSS_FILTERS,
+    )
 
 
 @pytest.fixture
 def hats_output_dir(sdss_arrow_table, tmp_path):
     output_dir = tmp_path / "hats_out"
-    reader = ArrowTableReader([sdss_arrow_table])
-    import_args = (
-        CollectionArguments(
-            output_artifact_name="sdss_test",
-            output_path=str(output_dir),
-            tmp_dir=str(tmp_path / "tmp"),
-        )
-        .catalog(
-            input_file_list=["0"],
-            file_reader=reader,
-            ra_column="ra",
-            dec_column="dec",
-            pixel_threshold=8192,
-            lowest_healpix_order=4,
-        )
-        .add_margin(margin_threshold=10.0, is_default=True)
+    write_hats([sdss_arrow_table], str(output_dir), "sdss_test")
+    return output_dir
+
+
+@pytest.fixture
+def desi_hdf5():
+    if not os.path.exists(DESI_HDF5):
+        pytest.skip("DESI test data not downloaded")
+    return DESI_HDF5
+
+
+@pytest.fixture
+def desi_astropy_table(desi_hdf5):
+    return _load_hdf5_table(desi_hdf5, DESI_FLOAT, DESI_BOOL)
+
+
+@pytest.fixture
+def desi_arrow_table(desi_astropy_table):
+    return build_arrow_table(
+        desi_astropy_table,
+        float_features=DESI_FLOAT,
+        bool_features=DESI_BOOL,
+        invert_bool=["ZWARN"],
     )
-    with Client(n_workers=1, threads_per_worker=1, processes=False) as client:
-        pipeline_with_client(import_args, client)
+
+
+@pytest.fixture
+def desi_hats_dir(desi_arrow_table, tmp_path):
+    output_dir = tmp_path / "desi_hats"
+    write_hats([desi_arrow_table], str(output_dir), "desi_test")
     return output_dir
 
 
@@ -92,12 +125,12 @@ class TestCatalogToArrow:
         assert set(field_names) == {"flux", "ivar", "lsf_sigma", "lambda", "mask"}
 
     def test_float_features(self, sdss_arrow_table):
-        for f in FLOAT_FEATURES:
+        for f in SDSS_FLOAT:
             assert f in sdss_arrow_table.schema.names
 
     def test_flux_features_split(self, sdss_arrow_table):
-        for f in FLUX_FEATURES:
-            for b in FLUX_FILTERS:
+        for f in SDSS_FLUX:
+            for b in SDSS_FILTERS:
                 assert f"{f}_{b}" in sdss_arrow_table.schema.names
 
     def test_object_id_is_string(self, sdss_arrow_table):
@@ -153,3 +186,64 @@ class TestHATSPipeline:
     def test_margin_catalog_exists(self, hats_output_dir):
         margin_dir = hats_output_dir / "sdss_test" / "sdss_test_10arcs"
         assert margin_dir.exists()
+
+
+class TestDESIArrow:
+    def test_row_count(self, desi_arrow_table, desi_astropy_table):
+        assert desi_arrow_table.num_rows == len(desi_astropy_table)
+
+    def test_has_required_columns(self, desi_arrow_table):
+        names = desi_arrow_table.schema.names
+        assert "ra" in names
+        assert "dec" in names
+        assert "object_id" in names
+        assert "spectrum" in names
+
+    def test_float_features(self, desi_arrow_table):
+        for f in DESI_FLOAT:
+            assert f in desi_arrow_table.schema.names
+
+    def test_bool_inverted(self, desi_arrow_table, desi_hdf5):
+        """ZWARN=0 means good, so it should be inverted to True."""
+        with h5py.File(desi_hdf5, "r") as f:
+            raw = f["ZWARN"][0]
+        arrow_val = desi_arrow_table.column("ZWARN")[0].as_py()
+        assert arrow_val == (not bool(raw))
+
+    def test_ra_dec_values(self, desi_arrow_table, desi_hdf5):
+        with h5py.File(desi_hdf5, "r") as f:
+            expected_ra = f["ra"][:]
+        actual_ra = desi_arrow_table.column("ra").to_numpy()
+        np.testing.assert_allclose(actual_ra, expected_ra)
+
+
+class TestDESIHATS:
+    def test_output_exists(self, desi_hats_dir):
+        catalog_dir = desi_hats_dir / "desi_test" / "desi_test"
+        assert (catalog_dir / "hats.properties").exists() or (catalog_dir / "properties").exists()
+
+    def test_row_count_preserved(self, desi_hats_dir, desi_arrow_table):
+        dataset_dir = desi_hats_dir / "desi_test" / "desi_test" / "dataset"
+        total = sum(
+            pq.read_metadata(p).num_rows
+            for p in dataset_dir.rglob("*.parquet")
+        )
+        assert total == desi_arrow_table.num_rows
+
+    def test_lazy_column_read(self, desi_hats_dir):
+        dataset_dir = desi_hats_dir / "desi_test" / "desi_test" / "dataset"
+        pf = next(dataset_dir.rglob("*.parquet"))
+        partial = pq.read_table(pf, columns=["ra", "dec", "Z"])
+        full = pq.read_table(pf)
+        assert partial.nbytes < full.nbytes
+
+    def test_loader_works(self, desi_hats_dir):
+        """Verify the HATS dataset loader works with DESI data."""
+        from mmu.data import HATSDataset
+
+        catalog_dir = str(desi_hats_dir / "desi_test" / "desi_test")
+        ds = HATSDataset(catalog_dir, columns=["ra", "dec", "Z", "object_id"])
+        assert len(ds) > 0
+        item = ds[0]
+        assert "ra" in item
+        assert "Z" in item

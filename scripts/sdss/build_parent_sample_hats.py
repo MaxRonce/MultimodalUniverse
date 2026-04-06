@@ -6,11 +6,8 @@ from astropy.table import Table, join
 from multiprocessing import Pool
 from tqdm import tqdm
 import healpy as hp
-import pyarrow as pa
-from dask.distributed import Client
-from hats_import import CollectionArguments
-from hats_import.catalog.file_readers import InputReader
-from hats_import.pipeline import pipeline_with_client
+
+from mmu.hats_import import build_arrow_table, write_hats
 
 _healpix_nside = 16
 
@@ -20,23 +17,10 @@ SURVEYS = ['sdss  ',
            'boss  ',
            'eboss ']
 
-# Schema definition matching the SDSS transformer
 FLOAT_FEATURES = ["VDISP", "VDISP_ERR", "Z", "Z_ERR"]
 BOOL_FEATURES = ["ZWARNING"]
 FLUX_FEATURES = ["SPECTROFLUX", "SPECTROFLUX_IVAR", "SPECTROSYNFLUX", "SPECTROSYNFLUX_IVAR"]
 FLUX_FILTERS = ["U", "G", "R", "I", "Z"]
-
-
-def np_to_pyarrow_list(array):
-    """Convert a 2D numpy array to a PyArrow ListArray."""
-    if array.dtype.byteorder == '>':
-        array = array.byteswap().view(array.dtype.newbyteorder('<'))
-    values = pa.array(array.reshape(-1))
-    if array.ndim == 1:
-        return values
-    n_lists, length = array.shape
-    offsets = np.arange(0, (n_lists + 1) * length, length, dtype=np.int32)
-    return pa.ListArray.from_arrays(values=values, offsets=offsets)
 
 
 def selection_fn(catalog):
@@ -110,56 +94,13 @@ def process_healpix_group(args):
     catalog = join(catalog, spectra, keys='object_id', join_type='inner')
     assert len(catalog) == len(spectra), "Join error: some spectra files may be missing"
 
-    return catalog_to_arrow(catalog)
-
-
-def catalog_to_arrow(catalog):
-    """Convert an astropy Table (with spectra) to a PyArrow table matching the HATS schema."""
-    columns = {}
-
-    # Spectrum struct
-    spectrum_arrays = [
-        np_to_pyarrow_list(np.array(catalog['spectrum_flux']).astype(np.float32)),
-        np_to_pyarrow_list(np.array(catalog['spectrum_ivar']).astype(np.float32)),
-        np_to_pyarrow_list(np.array(catalog['spectrum_lsf_sigma']).astype(np.float32)),
-        np_to_pyarrow_list(np.array(catalog['spectrum_lambda']).astype(np.float32)),
-        np_to_pyarrow_list(np.array(catalog['spectrum_mask'])),
-    ]
-    columns["spectrum"] = pa.StructArray.from_arrays(
-        spectrum_arrays, names=["flux", "ivar", "lsf_sigma", "lambda", "mask"]
+    return build_arrow_table(
+        catalog,
+        float_features=FLOAT_FEATURES,
+        bool_features=BOOL_FEATURES,
+        flux_features=FLUX_FEATURES,
+        flux_filters=FLUX_FILTERS,
     )
-
-    for f in FLOAT_FEATURES:
-        columns[f] = pa.array(np.array(catalog[f]).astype(np.float32))
-
-    columns["ra"] = pa.array(np.array(catalog['ra']).astype(np.float64))
-    columns["dec"] = pa.array(np.array(catalog['dec']).astype(np.float64))
-
-    for f in BOOL_FEATURES:
-        columns[f] = pa.array(np.array(catalog[f]).astype(bool))
-
-    for f in FLUX_FEATURES:
-        flux_data = np.array(catalog[f])
-        for n, b in enumerate(FLUX_FILTERS):
-            columns[f"{f}_{b}"] = pa.array(flux_data[:, n].astype(np.float32))
-
-    columns["object_id"] = pa.array([str(oid) for oid in catalog['object_id']])
-
-    return pa.table(columns)
-
-
-class ArrowTableReader(InputReader):
-    """InputReader that yields pre-built PyArrow tables."""
-
-    def __init__(self, tables):
-        self.tables = tables
-
-    def read(self, input_file, read_columns=None):
-        idx = int(input_file)
-        table = self.tables[idx]
-        if read_columns:
-            table = table.select(read_columns)
-        yield table
 
 
 def main(args):
@@ -175,7 +116,6 @@ def main(args):
             continue
         cat_survey = cat_survey.group_by(['healpix'])
 
-        # Process each healpix group and collect PyArrow tables
         map_args = [(group, args.sdss_data_path) for group in cat_survey.groups]
 
         tables = []
@@ -189,26 +129,14 @@ def main(args):
         survey_name = survey.strip()
         print(f"Writing HATS catalog for {survey_name} ({sum(t.num_rows for t in tables)} objects)...")
 
-        reader = ArrowTableReader(tables)
-        import_args = (
-            CollectionArguments(
-                output_artifact_name=f"sdss_{survey_name}",
-                output_path=args.output_dir,
-                tmp_dir=os.path.join(args.output_dir, "tmp"),
-            )
-            .catalog(
-                input_file_list=[str(i) for i in range(len(tables))],
-                file_reader=reader,
-                ra_column="ra",
-                dec_column="dec",
-                pixel_threshold=args.pixel_threshold,
-                lowest_healpix_order=4,
-            )
-            .add_margin(margin_threshold=10.0, is_default=True)
+        write_hats(
+            tables,
+            output_path=args.output_dir,
+            catalog_name=f"sdss_{survey_name}",
+            pixel_threshold=args.pixel_threshold,
+            n_workers=min(8, args.num_processes),
+            debug=False,
         )
-
-        with Client(n_workers=min(8, args.num_processes), threads_per_worker=1) as client:
-            pipeline_with_client(import_args, client)
 
         print(f"  Done: {survey_name}")
 
