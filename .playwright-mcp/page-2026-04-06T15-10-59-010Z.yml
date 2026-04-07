@@ -1,0 +1,226 @@
+- generic [active] [ref=e1]:
+  - link "Skip to main content" [ref=e3] [cursor=pointer]:
+    - /url: "#main-content"
+  - text:  
+  - banner
+  - generic [ref=e5]:
+    - generic [ref=e6]:
+      - generic [ref=e7]:
+        - link "hats-import 0.9.0 documentation" [ref=e9] [cursor=pointer]:
+          - /url: "#"
+          - paragraph [ref=e10]: hats-import 0.9.0 documentation
+        - button "Search" [ref=e12] [cursor=pointer]:
+          - img [ref=e13]: 
+          - generic [ref=e15]: Search
+          - generic [ref=e16]:
+            - generic [ref=e17]: ⌘
+            - text: +
+            - generic [ref=e18]: K
+        - navigation "Main" [ref=e20]:
+          - generic [ref=e21]:
+            - heading "Using HATS import" [level=2] [ref=e22]
+            - list [ref=e23]:
+              - listitem [ref=e24]:
+                - link "Home page" [ref=e25] [cursor=pointer]:
+                  - /url: "#"
+              - listitem [ref=e26]:
+                - link "Getting Started" [ref=e27] [cursor=pointer]:
+                  - /url: getting_started.html
+              - listitem [ref=e28]:
+                - link "Contact us" [ref=e29] [cursor=pointer]:
+                  - /url: guide/contact.html
+              - listitem [ref=e30]:
+                - link "About & Citation" [ref=e31] [cursor=pointer]:
+                  - /url: citation.html
+            - heading "Typical Catalog Creation" [level=2] [ref=e32]
+            - list [ref=e33]:
+              - listitem [ref=e34]:
+                - link "Catalog Import Arguments" [ref=e35] [cursor=pointer]:
+                  - /url: catalogs/arguments.html
+              - listitem [ref=e36]:
+                - link "Temporary files and disk usage" [ref=e37] [cursor=pointer]:
+                  - /url: catalogs/temp_files.html
+              - listitem [ref=e38]:
+                - link "HATS properties" [ref=e39] [cursor=pointer]:
+                  - /url: catalogs/properties.html
+              - listitem [ref=e40]:
+                - link "Catalog Collections" [ref=e41] [cursor=pointer]:
+                  - /url: catalogs/collections.html
+            - heading "Catalog Customization" [level=2] [ref=e42]
+            - list [ref=e43]:
+              - listitem [ref=e44]:
+                - link "Public Catalog Tips" [ref=e45] [cursor=pointer]:
+                  - /url: catalogs/public/index.html
+                - group:
+                  - img [ref=e46] [cursor=pointer]: 
+                  - text:  
+              - listitem [ref=e48]:
+                - link "Catalog Verification" [ref=e49] [cursor=pointer]:
+                  - /url: guide/verification.html
+              - listitem [ref=e50]:
+                - link "Reimporting HATS Catalogs" [ref=e51] [cursor=pointer]:
+                  - /url: guide/reimporting.html
+              - listitem [ref=e52]:
+                - link "Converting from HiPSCat" [ref=e53] [cursor=pointer]:
+                  - /url: guide/hipscat_conversion.html
+              - listitem [ref=e54]:
+                - link "Notebooks" [ref=e55] [cursor=pointer]:
+                  - /url: notebooks.html
+                - group:
+                  - img [ref=e56] [cursor=pointer]: 
+              - listitem [ref=e58]:
+                - link "Using dask-on-ray" [ref=e59] [cursor=pointer]:
+                  - /url: guide/dask_on_ray.html
+            - heading "Other Datasets" [level=2] [ref=e60]
+            - list [ref=e61]:
+              - listitem [ref=e62]:
+                - link "Margin Cache" [ref=e63] [cursor=pointer]:
+                  - /url: guide/margin_cache.html
+              - listitem [ref=e64]:
+                - link "Index Table" [ref=e65] [cursor=pointer]:
+                  - /url: guide/index_table.html
+            - heading "Developers" [level=2] [ref=e66]
+            - list [ref=e67]:
+              - listitem [ref=e68]:
+                - link "Contributing to hats-import" [ref=e69] [cursor=pointer]:
+                  - /url: guide/contributing.html
+              - listitem [ref=e70]:
+                - link "API Reference" [ref=e71] [cursor=pointer]:
+                  - /url: reference.html
+                - group:
+                  - img [ref=e72] [cursor=pointer]: 
+                  - text:  
+      - generic [ref=e77]:
+        - generic [ref=e78]:
+          - 'link "Sponsored: MongoDB" [ref=e79] [cursor=pointer]':
+            - /url: https://server.ethicalads.io/proxy/click/10124/019d6358-d288-71e0-af83-ece3664b3d0b/
+            - 'img "Sponsored: MongoDB" [ref=e80]'
+          - link "Build and run apps in over 115 regions with MongoDB Atlas, the database for every enterprise." [ref=e82] [cursor=pointer]:
+            - /url: https://server.ethicalads.io/proxy/click/10124/019d6358-d288-71e0-af83-ece3664b3d0b/
+            - strong [ref=e83]: Build and run
+            - text: apps in over 115 regions with MongoDB Atlas, the database for every enterprise.
+        - generic [ref=e84]:
+          - emphasis [ref=e86]:
+            - link "Ad by EthicalAds" [ref=e87] [cursor=pointer]:
+              - /url: https://www.ethicalads.io/?ref=rtd-sidebar
+          - text: ·
+          - link "ℹ️" [ref=e88] [cursor=pointer]:
+            - /url: https://www.ethicalads.io/advertisers/?ref=rtd-sidebar-buy-ads
+    - main [ref=e89]:
+      - generic [ref=e91]:
+        - generic [ref=e93]:
+          - button "Toggle primary sidebar" [ref=e96] [cursor=pointer]:
+            - img [ref=e97]: 
+          - generic [ref=e101]:
+            - generic [ref=e102]:
+              - button "Download this page" [ref=e103] [cursor=pointer]:
+                - img [ref=e104]: 
+              - text:  
+            - button "Fullscreen mode" [ref=e106] [cursor=pointer]:
+              - img [ref=e108]: 
+            - button "Color mode" [ref=e110] [cursor=pointer]:
+              - text:  
+              - img "System Settings" [ref=e111]: 
+            - text: 
+        - article [ref=e113]:
+          - generic [ref=e114]:
+            - heading "HATS Import" [level=1] [ref=e115]
+            - paragraph [ref=e116]: HATS is a directory structure and metadata for spatially arranging large catalog survey data. This was originally motivated by a desire to perform spatial cross-matching between surveys at large scale, but is applicable to a range of spatial analysis and algorithms.
+            - generic [ref=e117]:
+              - paragraph [ref=e118]: Attention 
+              - paragraph [ref=e119]:
+                - text: If you already have catalog in HATS format and are just looking to ingest it or analyze it, you can look instead to
+                - code [ref=e120]: LSDB
+                - text: ", a python tool for scalable analysis of large catalogs (e.g. querying and crossmatching ~10⁹ sources). It aims to address large-scale data processing challenges, in particular those brought up by"
+                - link "LSST" [ref=e121] [cursor=pointer]:
+                  - /url: https://www.lsst.org/about
+                - text: .
+            - paragraph [ref=e122]:
+              - text: The
+              - code [ref=e123]: hats-import
+              - text: package provides purpose-built map-reduce pipelines for converting large or custom catalogs into HATS format.
+            - generic [ref=e124]:
+              - heading "Using HATS import" [level=2] [ref=e125]
+              - list [ref=e126]:
+                - listitem [ref=e127]:
+                  - link "Home page" [ref=e128] [cursor=pointer]:
+                    - /url: "#"
+                - listitem [ref=e129]:
+                  - link "Getting Started" [ref=e130] [cursor=pointer]:
+                    - /url: getting_started.html
+                - listitem [ref=e131]:
+                  - link "Contact us" [ref=e132] [cursor=pointer]:
+                    - /url: guide/contact.html
+                - listitem [ref=e133]:
+                  - link "About & Citation" [ref=e134] [cursor=pointer]:
+                    - /url: citation.html
+            - generic [ref=e135]:
+              - heading "Typical Catalog Creation" [level=2] [ref=e136]
+              - list [ref=e137]:
+                - listitem [ref=e138]:
+                  - link "Catalog Import Arguments" [ref=e139] [cursor=pointer]:
+                    - /url: catalogs/arguments.html
+                - listitem [ref=e140]:
+                  - link "Temporary files and disk usage" [ref=e141] [cursor=pointer]:
+                    - /url: catalogs/temp_files.html
+                - listitem [ref=e142]:
+                  - link "HATS properties" [ref=e143] [cursor=pointer]:
+                    - /url: catalogs/properties.html
+                - listitem [ref=e144]:
+                  - link "Catalog Collections" [ref=e145] [cursor=pointer]:
+                    - /url: catalogs/collections.html
+            - generic [ref=e146]:
+              - heading "Catalog Customization" [level=2] [ref=e147]
+              - list [ref=e148]:
+                - listitem [ref=e149]:
+                  - link "Public Catalog Tips" [ref=e150] [cursor=pointer]:
+                    - /url: catalogs/public/index.html
+                - listitem [ref=e151]:
+                  - link "Catalog Verification" [ref=e152] [cursor=pointer]:
+                    - /url: guide/verification.html
+                - listitem [ref=e153]:
+                  - link "Reimporting HATS Catalogs" [ref=e154] [cursor=pointer]:
+                    - /url: guide/reimporting.html
+                - listitem [ref=e155]:
+                  - link "Converting from HiPSCat" [ref=e156] [cursor=pointer]:
+                    - /url: guide/hipscat_conversion.html
+                - listitem [ref=e157]:
+                  - link "Notebooks" [ref=e158] [cursor=pointer]:
+                    - /url: notebooks.html
+                - listitem [ref=e159]:
+                  - link "Using dask-on-ray" [ref=e160] [cursor=pointer]:
+                    - /url: guide/dask_on_ray.html
+            - generic [ref=e161]:
+              - heading "Other Datasets" [level=2] [ref=e162]
+              - list [ref=e163]:
+                - listitem [ref=e164]:
+                  - link "Margin Cache" [ref=e165] [cursor=pointer]:
+                    - /url: guide/margin_cache.html
+                - listitem [ref=e166]:
+                  - link "Index Table" [ref=e167] [cursor=pointer]:
+                    - /url: guide/index_table.html
+            - generic [ref=e168]:
+              - heading "Developers" [level=2] [ref=e169]
+              - list [ref=e170]:
+                - listitem [ref=e171]:
+                  - link "Contributing to hats-import" [ref=e172] [cursor=pointer]:
+                    - /url: guide/contributing.html
+                - listitem [ref=e173]:
+                  - link "API Reference" [ref=e174] [cursor=pointer]:
+                    - /url: reference.html
+        - link "next Getting Started with HATS import" [ref=e176] [cursor=pointer]:
+          - /url: getting_started.html
+          - generic [ref=e177]:
+            - paragraph [ref=e178]: next
+            - paragraph [ref=e179]: Getting Started with HATS import
+          - img [ref=e180]: 
+      - generic [ref=e183]:
+        - paragraph [ref=e185]: By LINCC Frameworks
+        - paragraph [ref=e187]: © Copyright 2026, LINCC Frameworks.
+  - contentinfo [ref=e188]
+  - banner [ref=e190] [cursor=pointer]:
+    - img "Read the Docs" [ref=e191]
+    - generic [ref=e192]:
+      - img [ref=e193]
+      - text: stable
+    - img [ref=e196]

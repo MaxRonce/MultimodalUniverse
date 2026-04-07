@@ -1,0 +1,236 @@
+- generic [active] [ref=e1]:
+  - link "Skip to main content" [ref=e3] [cursor=pointer]:
+    - /url: "#main-content"
+  - text:  
+  - banner
+  - generic [ref=e5]:
+    - generic [ref=e7]:
+      - link "hats-import 0.9.0 documentation" [ref=e9] [cursor=pointer]:
+        - /url: ../index.html
+        - paragraph [ref=e10]: hats-import 0.9.0 documentation
+      - button "Search" [ref=e12] [cursor=pointer]:
+        - img [ref=e13]: 
+        - generic [ref=e15]: Search
+        - generic [ref=e16]:
+          - generic [ref=e17]: ⌘
+          - text: +
+          - generic [ref=e18]: K
+      - navigation "Main" [ref=e20]:
+        - generic [ref=e21]:
+          - heading "Using HATS import" [level=2] [ref=e22]
+          - list [ref=e23]:
+            - listitem [ref=e24]:
+              - link "Home page" [ref=e25] [cursor=pointer]:
+                - /url: ../index.html
+            - listitem [ref=e26]:
+              - link "Getting Started" [ref=e27] [cursor=pointer]:
+                - /url: ../getting_started.html
+            - listitem [ref=e28]:
+              - link "Contact us" [ref=e29] [cursor=pointer]:
+                - /url: ../guide/contact.html
+            - listitem [ref=e30]:
+              - link "About & Citation" [ref=e31] [cursor=pointer]:
+                - /url: ../citation.html
+          - heading "Typical Catalog Creation" [level=2] [ref=e32]
+          - list [ref=e33]:
+            - listitem [ref=e34]:
+              - link "Catalog Import Arguments" [ref=e35] [cursor=pointer]:
+                - /url: arguments.html
+            - listitem [ref=e36]:
+              - link "Temporary files and disk usage" [ref=e37] [cursor=pointer]:
+                - /url: temp_files.html
+            - listitem [ref=e38]:
+              - link "HATS properties" [ref=e39] [cursor=pointer]:
+                - /url: properties.html
+            - listitem [ref=e40]:
+              - link "Catalog Collections" [ref=e41] [cursor=pointer]:
+                - /url: "#"
+          - heading "Catalog Customization" [level=2] [ref=e42]
+          - list [ref=e43]:
+            - listitem [ref=e44]:
+              - link "Public Catalog Tips" [ref=e45] [cursor=pointer]:
+                - /url: public/index.html
+              - group:
+                - img [ref=e46] [cursor=pointer]: 
+                - text:  
+            - listitem [ref=e48]:
+              - link "Catalog Verification" [ref=e49] [cursor=pointer]:
+                - /url: ../guide/verification.html
+            - listitem [ref=e50]:
+              - link "Reimporting HATS Catalogs" [ref=e51] [cursor=pointer]:
+                - /url: ../guide/reimporting.html
+            - listitem [ref=e52]:
+              - link "Converting from HiPSCat" [ref=e53] [cursor=pointer]:
+                - /url: ../guide/hipscat_conversion.html
+            - listitem [ref=e54]:
+              - link "Notebooks" [ref=e55] [cursor=pointer]:
+                - /url: ../notebooks.html
+              - group:
+                - img [ref=e56] [cursor=pointer]: 
+            - listitem [ref=e58]:
+              - link "Using dask-on-ray" [ref=e59] [cursor=pointer]:
+                - /url: ../guide/dask_on_ray.html
+          - heading "Other Datasets" [level=2] [ref=e60]
+          - list [ref=e61]:
+            - listitem [ref=e62]:
+              - link "Margin Cache" [ref=e63] [cursor=pointer]:
+                - /url: ../guide/margin_cache.html
+            - listitem [ref=e64]:
+              - link "Index Table" [ref=e65] [cursor=pointer]:
+                - /url: ../guide/index_table.html
+          - heading "Developers" [level=2] [ref=e66]
+          - list [ref=e67]:
+            - listitem [ref=e68]:
+              - link "Contributing to hats-import" [ref=e69] [cursor=pointer]:
+                - /url: ../guide/contributing.html
+            - listitem [ref=e70]:
+              - link "API Reference" [ref=e71] [cursor=pointer]:
+                - /url: ../reference.html
+              - group:
+                - img [ref=e72] [cursor=pointer]: 
+                - text:  
+    - main [ref=e76]:
+      - generic [ref=e77]:
+        - generic [ref=e78]:
+          - generic [ref=e80]:
+            - button "Toggle primary sidebar" [ref=e83] [cursor=pointer]:
+              - img [ref=e84]: 
+            - generic [ref=e88]:
+              - generic [ref=e89]:
+                - button "Download this page" [ref=e90] [cursor=pointer]:
+                  - img [ref=e91]: 
+                - text:  
+              - button "Fullscreen mode" [ref=e93] [cursor=pointer]:
+                - img [ref=e95]: 
+              - button "Color mode" [ref=e97] [cursor=pointer]:
+                - text:  
+                - img "System Settings" [ref=e98]: 
+              - text:  
+          - article [ref=e100]:
+            - generic [ref=e101]:
+              - heading "Catalog Collections" [level=1] [ref=e102]
+              - generic [ref=e103]:
+                - heading "What’s a catalog collection?" [level=2] [ref=e104]
+                - paragraph [ref=e105]: Catalog collections are a particular directory structure that provide explicit linking with a primary object catalog and the supplemental tables that support users in their analysis of those catalogs.
+                - paragraph [ref=e106]: "Below is an example of a collection directory structure:"
+                - generic [ref=e109]: gaia_dr3 / |-- collection.properties |-- gaia_dr3 / | | -- hats.properties | + -- . . . |-- gaia_dr3_5arcs / | | -- hats.properties | + -- . . . |-- gaia_dr3_100arcs / | | -- hats.properties | + -- . . . +-- gaia_dr3_designation / |-- hats.properties + -- . . .
+                - paragraph [ref=e110]: Here, the primary object catalog is named simply “gaia_dr3”. There are two margin tables (with widths of 5 and 100 arcseconds), as you may want to have different margins for different scientific use cases. The last table, “gaia_dr3_designation”, is an index table to enable fast lookup of objects by their “designation”, which is not a spatial property.
+                - paragraph [ref=e111]:
+                  - text: The
+                  - code [ref=e112]: collection.properties
+                  - text: file provides the links between those tables.
+                - paragraph [ref=e113]: "Below is an example of what the properties file would look like for the above directory structure:"
+                - generic [ref=e116]: "# HATS Collection obs_collection = gaia_dr3 hats_primary_table_url = catalog all_margins = gaia_dr3_5arcs gaia_dr3_100arcs default_margin = gaia_dr3_5arcs all_indexes = designation gaia_dr3_designation"
+                - paragraph [ref=e117]: The collection pipeline is intended to be a single pipeline that will create the object table, requested margins and indexes, and the properties file to link them all together.
+                - paragraph [ref=e118]: If you have existing catalogs and tables, this pipeline can be used to create the properties file, and any tables that haven’t been created yet.
+              - generic [ref=e119]:
+                - heading "Pipeline setup" [level=2] [ref=e120]
+                - paragraph [ref=e121]: The arguments for a collection pipeline use a builder pattern, meaning we will construct a custom pipeline, step by step.
+                - generic [ref=e123]:
+                  - generic [ref=e124]: "from hats_import import CollectionArguments args = ( CollectionArguments( output_artifact_name=\"my-catalog\", output_path=\"/path/to/place/collection/\", ## dask arguments go here ## progress reporting arguments go here ) .catalog( input_path=\"/path/to/csv/files\", file_reader=\"csv\", ra_column=\"ra\", dec_column=\"dec\", sort_columns=\"source_id\", ) .add_margin(margin_threshold=5.0, is_default=True) .add_margin(margin_threshold=100.0) .add_index(indexing_column=\"designation\", include_healpix_29=False) )"
+                  - button "Copy to clipboard" [ref=e125] [cursor=pointer]:
+                    - img "Copy to clipboard" [ref=e126]
+                - generic [ref=e130]:
+                  - heading "Overall collection arguments" [level=3] [ref=e131]
+                  - paragraph [ref=e132]: First, you should specify the root directory for all of the collection to live in.
+                  - paragraph [ref=e133]:
+                    - text: Any arguments dealing with the creation of the dask client, resume behavior, or progress reporting can be specified at the initialization of the
+                    - code [ref=e134]: CollectionArguments
+                    - text: object, and they will be carried through to all of the other parts of the pipeline.
+                - generic [ref=e135]:
+                  - heading "Catalog arguments" [level=3] [ref=e136]
+                  - paragraph [ref=e137]: You MUST specify a SINGLE catalog to serve as the object catalog for your collection.
+                  - paragraph [ref=e138]:
+                    - text: You do this by calling
+                    - code [ref=e139]: .catalog()
+                    - text: on the
+                    - code [ref=e140]: CollectionArguments
+                    - text: object.
+                  - paragraph [ref=e141]:
+                    - text: Every argument that can be specified in the
+                    - link "ImportArguments" [ref=e142] [cursor=pointer]:
+                      - /url: arguments.html
+                    - text: can be used with this method, so you have the same level of flexibility over the creation of your dataset here as you do in the primary catalog creation pipeline.
+                  - paragraph [ref=e143]:
+                    - strong [ref=e144]: If your catalog already exists
+                    - text: ", that’s ok! You can get away with just specifying the"
+                    - code [ref=e145]: catalog_path
+                    - text: argument, and the pipeline will take care of the rest.
+                - generic [ref=e146]:
+                  - heading "Margin arguments" [level=3] [ref=e147]
+                  - paragraph [ref=e148]: You can specify as many margins as you’d like for your catalog collection. Or none!
+                  - paragraph [ref=e149]:
+                    - text: You do this by calling
+                    - code [ref=e150]: .add_margin()
+                    - text: on the
+                    - code [ref=e151]: CollectionArguments
+                    - text: object for each margin you would like to create.
+                  - paragraph [ref=e152]:
+                    - text: Every argument that can be specified in the
+                    - link "MarginCacheArguments" [ref=e153] [cursor=pointer]:
+                      - /url: ../guide/margin_cache.html
+                    - text: can be used with this method, so you have the same level of flexibility over the creation of your dataset here as you do in the traditional margin cache creation pipeline.
+                  - paragraph [ref=e154]:
+                    - text: Additionally, you can add the
+                    - code [ref=e155]: is_default
+                    - text: argument to
+                    - emphasis [ref=e156]: at most
+                    - text: one of the margins. If a margin is set as the default, then analysis tools like LSDB can use that margin for cross-matching, if none other is specified.
+                  - paragraph [ref=e157]:
+                    - text: For convenience, you are allowed to specify
+                    - emphasis [ref=e158]: fewer
+                    - text: arguments than the traditional margin cache pipeline. You MUST specify the margin distance, either in
+                    - code [ref=e159]: margin_threshold
+                    - text: or
+                    - code [ref=e160]: margin_order
+                    - text: . If you don’t specify a name for the margin catalog, we will construct it based on the primary catalog name and the margin distance.
+                - generic [ref=e161]:
+                  - heading "Index arguments" [level=3] [ref=e162]
+                  - paragraph [ref=e163]: You can specify as many indexes as you’d like for your catalog collection. Or none!
+                  - paragraph [ref=e164]:
+                    - text: You do this by calling
+                    - code [ref=e165]: .add_index()
+                    - text: on the
+                    - code [ref=e166]: CollectionArguments
+                    - text: object for each index you would like to create.
+                  - paragraph [ref=e167]:
+                    - text: Every argument that can be specified in the
+                    - link "IndexArguments" [ref=e168] [cursor=pointer]:
+                      - /url: ../guide/index_table.html
+                    - text: can be used with this method, so you have the same level of flexibility over the creation of your dataset here as you do in the tradition index table creation pipeline.
+                  - paragraph [ref=e169]:
+                    - text: For convenience, you are allowed to specify
+                    - emphasis [ref=e170]: fewer
+                    - text: arguments than the traditional margin cache pipeline. You MUST specify the
+                    - code [ref=e171]: indexing_column
+                    - text: . If you don’t specify a name for the index table, we will construct it based on the primary catalog name and the indexing column.
+          - generic [ref=e172]:
+            - generic:
+              - link "previous HATS properties" [ref=e173] [cursor=pointer]:
+                - /url: properties.html
+                - img [ref=e174]: 
+                - generic [ref=e176]:
+                  - paragraph [ref=e177]: previous
+                  - paragraph [ref=e178]: HATS properties
+              - link "next Public Catalog Tips" [ref=e179] [cursor=pointer]:
+                - /url: public/index.html
+                - generic [ref=e180]:
+                  - paragraph [ref=e181]: next
+                  - paragraph [ref=e182]: Public Catalog Tips
+                - img [ref=e183]: 
+        - generic [ref=e187]:
+          - generic [ref=e188]:
+            - img [ref=e189]: 
+            - text: Contents
+          - navigation "Contents" [ref=e191]:
+            - list [ref=e192]:
+              - listitem [ref=e193]:
+                - link "What’s a catalog collection?" [ref=e194] [cursor=pointer]:
+                  - /url: "#what-s-a-catalog-collection"
+              - listitem [ref=e195]:
+                - link "Pipeline setup" [ref=e196] [cursor=pointer]:
+                  - /url: "#pipeline-setup"
+      - generic [ref=e198]:
+        - paragraph [ref=e200]: By LINCC Frameworks
+        - paragraph [ref=e202]: © Copyright 2026, LINCC Frameworks.
+  - contentinfo [ref=e203]

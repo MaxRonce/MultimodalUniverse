@@ -54,12 +54,10 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["mmu", "mmu.benchmark", "mmu.benchmark.eval", "mmu.benchmark.models", "mmu.cli"]
+packages = ["mmu", "mmu.benchmark", "mmu.benchmark.eval", "mmu.benchmark.models"]
 
 [tool.setuptools_scm]
 write_to = "mmu/_version.py"
 
 [project.scripts]
 mmu_cli = "mmu.benchmark.trainer:trainer_cli"
-mmu_build_hats = "mmu.cli.build_hats:main"
-mmu_verify_hats = "mmu.verify:main"

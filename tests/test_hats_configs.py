@@ -2,115 +2,83 @@
 
 import pytest
 
-from mmu.hats_configs import (
-    DATASET_CONFIGS,
-    get_dataset_config,
-    hdf5_path,
-    list_datasets,
-)
+from mmu.hats_configs import DATASETS, get_dataset, list_datasets
 
 
-EXPECTED_DATASETS = {
+EXPECTED_NON_SKIPPED = {
     "sdss", "desi", "vipers", "galah", "apogee", "chandra",
     "gaia", "desi_provabgs",
     "legacysurvey", "ssl_legacysurvey", "hsc", "jwst", "btsbot", "gz10",
-    "plasticc", "tess", "kepler", "foundation", "snls",
-    "ps1_sne_ia", "des_y3_sne_ia", "swift_sne_ia", "yse",
+    "tess", "kepler", "foundation", "snls",
+    "ps1_sne_ia", "des_y3_sne_ia", "swift_sne_ia",
     "allwise", "twomass", "galex", "sages",
     "manga",
 }
-
-SKIPPED_DATASETS = {"lamost", "cfa", "csp"}
+EXPECTED_SKIPPED = {"plasticc"}  # raw dir empty on cluster
+VALID_MODALITIES = {"spectra", "image", "timeseries", "tabular", "ifu"}
 
 
 class TestRegistry:
-    def test_all_expected_datasets_present(self):
-        non_skipped = {n for n, c in DATASET_CONFIGS.items() if not c.get("skip")}
-        assert non_skipped == EXPECTED_DATASETS
+    def test_non_skipped_datasets_present(self):
+        non_skipped = {n for n, c in DATASETS.items() if not c.skip}
+        assert non_skipped == EXPECTED_NON_SKIPPED
 
-    def test_manga_uses_grouped_layout(self):
-        assert DATASET_CONFIGS["manga"].get("grouped_layout") is True
-        assert not DATASET_CONFIGS["manga"].get("skip")
+    def test_skipped_datasets_present(self):
+        skipped = {n for n, c in DATASETS.items() if c.skip}
+        assert skipped == EXPECTED_SKIPPED
 
-    def test_all_skipped_datasets_present(self):
-        skipped = {n for n, c in DATASET_CONFIGS.items() if c.get("skip")}
-        assert skipped == SKIPPED_DATASETS
-
-    def test_every_entry_has_modality(self):
-        for name, cfg in DATASET_CONFIGS.items():
-            assert "modality" in cfg, f"{name} missing modality"
-
-    def test_modalities_are_known(self):
-        valid = {"spectra", "image", "timeseries", "tabular", "ifu"}
-        for name, cfg in DATASET_CONFIGS.items():
-            assert cfg["modality"] in valid, f"{name} has unknown modality {cfg['modality']}"
-
-    def test_non_skipped_have_configs_and_default(self):
-        for name, cfg in DATASET_CONFIGS.items():
-            if cfg.get("skip"):
-                continue
-            assert "configs" in cfg, f"{name} missing configs"
-            if cfg.get("flat_layout"):
-                # Flat layout datasets (e.g. kepler) don't need a sub-config
-                continue
-            assert "default_config" in cfg, f"{name} missing default_config"
-            assert cfg["default_config"] in cfg["configs"], (
-                f"{name} default_config not in configs"
+    def test_all_modalities_known(self):
+        for name, cfg in DATASETS.items():
+            assert cfg.modality in VALID_MODALITIES, (
+                f"{name} has unknown modality {cfg.modality}"
             )
+
+    def test_skipped_have_reason(self):
+        for name, cfg in DATASETS.items():
+            if cfg.skip:
+                assert cfg.skip_reason, f"{name} skipped without reason"
+
+    def test_raw_subdir_set(self):
+        for name, cfg in DATASETS.items():
+            assert cfg.raw_subdir, f"{name} missing raw_subdir"
+
+    def test_raw_path_format(self):
+        sdss = DATASETS["sdss"]
+        assert sdss.raw_path.startswith("/mnt/ceph/users/polymathic/external_data/astro/")
+        assert sdss.raw_path.endswith("/SDSS")
 
 
 class TestHelpers:
-    def test_hdf5_path_format(self):
-        path = hdf5_path("sdss", 583, config="sdss")
-        assert path.endswith("/sdss/sdss/healpix=583/001-of-001.hdf5")
-        assert path.startswith("/mnt/ceph/users/polymathic/MultimodalUniverse/")
+    def test_get_dataset_known(self):
+        cfg = get_dataset("sdss")
+        assert cfg.modality == "spectra"
+        assert cfg.name == "sdss"
 
-    def test_hdf5_path_default_config(self):
-        path = hdf5_path("sdss", 583)
-        assert "/sdss/sdss/healpix=583/" in path  # uses default_config
-
-    def test_hdf5_path_flat_layout(self):
-        path = hdf5_path("kepler", 909)
-        assert path.endswith("/kepler/healpix=909/001-of-001.hdf5")
-        assert "/data/" not in path
-
-    def test_get_dataset_config_unknown(self):
+    def test_get_dataset_unknown(self):
         with pytest.raises(KeyError):
-            get_dataset_config("not_a_dataset")
+            get_dataset("not_a_dataset")
 
-    def test_get_dataset_config_skipped(self):
+    def test_get_dataset_skipped(self):
         with pytest.raises(ValueError, match="skipped"):
-            get_dataset_config("lamost")
-
-    def test_get_dataset_config_returns_dict(self):
-        cfg = get_dataset_config("sdss")
-        assert cfg["modality"] == "spectra"
-        assert "sdss" in cfg["configs"]
+            get_dataset("plasticc")
 
 
 class TestListDatasets:
     def test_list_all(self):
         all_ds = list_datasets()
-        assert "sdss" in all_ds
-        assert "manga" in all_ds  # MaNGA is no longer skipped
-        assert "lamost" not in all_ds
-        assert len(all_ds) == len(EXPECTED_DATASETS)
+        assert set(all_ds) == EXPECTED_NON_SKIPPED
 
     def test_list_by_modality(self):
-        spectra = list_datasets("spectra")
+        spectra = set(list_datasets("spectra"))
         assert "sdss" in spectra
         assert "desi" in spectra
         assert "legacysurvey" not in spectra
 
-        images = list_datasets("image")
+        images = set(list_datasets("image"))
         assert "legacysurvey" in images
         assert "hsc" in images
         assert "sdss" not in images
 
-        timeseries = list_datasets("timeseries")
-        assert "plasticc" in timeseries
-        assert "kepler" in timeseries
-
-        tabular = list_datasets("tabular")
+        tabular = set(list_datasets("tabular"))
         assert "allwise" in tabular
         assert "twomass" in tabular
