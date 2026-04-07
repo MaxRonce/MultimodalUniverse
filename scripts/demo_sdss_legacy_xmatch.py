@@ -101,13 +101,22 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
-    # Build SDSS HATS catalog
-    sdss_table = load_sdss_tile(args.healpix)
-    write_hats([sdss_table], args.output, "sdss_demo", debug=True)
+    sdss_dir = os.path.join(args.output, "sdss_demo", "sdss_demo")
+    legacy_dir = os.path.join(args.output, "legacy_demo", "legacy_demo")
 
-    # Build LegacySurvey HATS catalog (lazy slice)
-    legacy_table = load_legacy_tile_lazy(args.healpix, args.legacy_rows)
-    write_hats([legacy_table], args.output, "legacy_demo", debug=True)
+    # Build SDSS HATS catalog (skip if already built)
+    if not os.path.exists(sdss_dir):
+        sdss_table = load_sdss_tile(args.healpix)
+        write_hats([sdss_table], args.output, "sdss_demo", debug=True)
+    else:
+        print(f"Reusing existing SDSS catalog at {sdss_dir}")
+
+    # Build LegacySurvey HATS catalog (skip if already built)
+    if not os.path.exists(legacy_dir):
+        legacy_table = load_legacy_tile_lazy(args.healpix, args.legacy_rows)
+        write_hats([legacy_table], args.output, "legacy_demo", debug=True)
+    else:
+        print(f"Reusing existing LegacySurvey catalog at {legacy_dir}")
 
     # Cross-match using LSDB
     from mmu.data import HATSDataset
@@ -145,28 +154,28 @@ def main():
             item = matched[i]
 
             # Image: reconstruct from flat list + shape
-            img_flat = np.array(item["image_flat"])
-            shape = list(item["image_shape"])
-            img = img_flat.reshape(shape)  # (4, 160, 160)
-            # Use g, r, z bands for RGB-ish
-            rgb = np.stack([img[2], img[1], img[0]], axis=-1)
+            img_flat = np.array(item["image_flat_legacy"])
+            shape = list(item["image_shape_legacy"])
+            img = img_flat.reshape(shape)  # (4, 160, 160) — bands g, r, i, z
+            # Use g, r, z bands for RGB-ish (indices 0, 1, 3)
+            rgb = np.stack([img[3], img[1], img[0]], axis=-1)
             rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
             rgb = np.clip(rgb ** 0.5, 0, 1)
             axes[i, 0].imshow(rgb, origin="lower")
             axes[i, 0].set_title(
-                f"LegacySurvey image  ra={item['ra_legacy']:.4f}, dec={item['dec_legacy']:.4f}"
+                f"LegacySurvey  ra={item['ra_legacy']:.4f}, dec={item['dec_legacy']:.4f}"
             )
             axes[i, 0].axis("off")
 
             # Spectrum
-            spec = item["spectrum"]
+            spec = item["spectrum_sdss"]
             lam = np.array(spec["lambda"])
             flux = np.array(spec["flux"])
             mask = np.array(spec["mask"])
             flux_masked = np.where(mask, np.nan, flux)
             axes[i, 1].plot(lam, flux_masked, linewidth=0.5)
             axes[i, 1].set_title(
-                f"SDSS spectrum  z={item['Z']:.4f}, dist={item['_dist_arcsec']:.2f}\""
+                f"SDSS spectrum  z={item['Z_sdss']:.4f}, sep={item['_dist_arcsec']:.2f}\""
             )
             axes[i, 1].set_xlabel("Wavelength [Å]")
             axes[i, 1].set_ylabel("Flux")
