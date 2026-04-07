@@ -53,7 +53,11 @@ def read_table(raw_root: str, max_rows: int | None = None) -> pa.Table:
     columns: dict[str, pa.Array] = {
         "ra": pa.array(to_native_endian(np.asarray(t["RA"], dtype=np.float64))),
         "dec": pa.array(to_native_endian(np.asarray(t["DEC"], dtype=np.float64))),
-        "object_id": pa.array([str(int(x)) for x in t["SAGE_ID"]], type=pa.string()),
+        "object_id": pa.array(
+            [x.decode().strip() if isinstance(x, (bytes, np.bytes_)) else str(x).strip()
+             for x in t["SAGE_ID"]],
+            type=pa.string(),
+        ),
     }
     # Pass everything else through with whatever dtype astropy gave us.
     for col_name in t.colnames:

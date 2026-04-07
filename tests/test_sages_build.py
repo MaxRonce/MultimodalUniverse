@@ -26,7 +26,9 @@ build = _load_build_module()
 def _write_fake_dr1_uv(path: str, n_rows: int = 8) -> None:
     rng = np.random.default_rng(0)
     cols = [
-        fits.Column(name="SAGE_ID", format="K", array=np.arange(1_000_000_000, 1_000_000_000 + n_rows)),
+        # SAGES IDs are strings like 'SAGE000206.1+000720', not integers.
+        fits.Column(name="SAGE_ID", format="20A",
+                    array=np.array([f"SAGE{i:06d}.1+000000" for i in range(n_rows)])),
         fits.Column(name="RA", format="D", array=rng.uniform(0, 360, n_rows)),
         fits.Column(name="DEC", format="D", array=rng.uniform(-90, 90, n_rows)),
         # Two rows below the magnitude floor + one with bad flag => 5 should pass cuts.
@@ -72,6 +74,8 @@ class TestReadTable:
     def test_object_id_string(self, fake_raw_root):
         table = build.read_table(fake_raw_root)
         assert table.schema.field("object_id").type == pa.string()
+        # Should retain the SAGES designation format, not be re-formatted as int.
+        assert table.column("object_id")[0].as_py().startswith("SAGE")
 
     def test_cuts_applied(self, fake_raw_root):
         # Of the 8 fake rows, 2 have MAG_U=-999 and 1 has FLAG_U=1, so 5 survive.
