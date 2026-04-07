@@ -57,6 +57,7 @@ PORTED = [
     "galex",     # multi-FITS GUVCat shards (latitude-partitioned)
     "desi",      # raw DESI coadd FITS files (B/R/Z cameras, no desispec needed)
     "tess",      # raw TESS-SPOC FFI lightcurves (one file per TIC, sector)
+    "ssl_legacysurvey",  # raw Stein-et-al DECaLS image chunks (h5 per 1M objects)
 ]
 
 
@@ -139,5 +140,14 @@ rule build_tess:
         marker = catalog_marker("tess"),
     params:
         cmd = build_command("tess"),
+    shell:
+        "{params.cmd}"
+
+
+rule build_ssl_legacysurvey:
+    output:
+        marker = catalog_marker("ssl_legacysurvey"),
+    params:
+        cmd = build_command("ssl_legacysurvey"),
     shell:
         "{params.cmd}"

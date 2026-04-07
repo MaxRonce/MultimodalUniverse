@@ -115,3 +115,44 @@ class TestBuildTable:
         spec = table.schema.field("lightcurve").type
         names = [spec.field(i).name for i in range(spec.num_fields)]
         assert set(names) == {"time", "flux", "flux_err", "quality"}
+
+
+class TestVariableLengthLightcurves:
+    """Regression: lightcurves of different lengths must round-trip without padding."""
+
+    def _make_row(self, tic, n):
+        return {
+            "tic_id": tic,
+            "sector": 1,
+            "ra": float(tic),
+            "dec": 0.0,
+            "time": np.linspace(0, 10, n, dtype=np.float64),
+            "flux": np.ones(n, dtype=np.float32),
+            "flux_err": np.ones(n, dtype=np.float32) * 0.01,
+            "quality": np.zeros(n, dtype=np.int32),
+        }
+
+    def test_different_lengths_preserved(self):
+        rows = [self._make_row(1, 10), self._make_row(2, 50), self._make_row(3, 7)]
+        table = build.build_table(rows)
+        lcs = table.column("lightcurve")
+        assert len(lcs[0].as_py()["flux"]) == 10
+        assert len(lcs[1].as_py()["flux"]) == 50
+        assert len(lcs[2].as_py()["flux"]) == 7
+
+    def test_lightcurve_field_is_list_type(self):
+        rows = [self._make_row(1, 10), self._make_row(2, 5)]
+        table = build.build_table(rows)
+        spec = table.schema.field("lightcurve").type
+        flux_field = spec.field("flux")
+        assert pa.types.is_list(flux_field.type), (
+            "flux should be a variable-length pa.list_, not a fixed-width array"
+        )
+
+    def test_no_padding_artifacts(self):
+        # 3-row lightcurve should NOT have any extra zeros appended.
+        row = self._make_row(99, 3)
+        row["flux"] = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        table = build.build_table([row])
+        flux = table.column("lightcurve")[0].as_py()["flux"]
+        assert flux == [1.0, 2.0, 3.0]

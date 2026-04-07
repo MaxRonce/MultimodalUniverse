@@ -28,7 +28,7 @@ import pyarrow as pa
 from astropy.io import fits
 
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import np_to_pyarrow_list, to_native_endian, write_hats
+from mmu.hats_import import to_native_endian, write_hats
 
 
 CATALOG_NAME = "tess"
@@ -99,24 +99,10 @@ def read_lightcurve(path: str) -> dict | None:
 def build_table(rows: list[dict]) -> pa.Table:
     """Stack per-lightcurve dicts into a single PyArrow table.
 
-    Per-row time/flux arrays may have different lengths across rows; we pad
-    them to the longest length so they fit a 2D layout. Padded cadences get
-    ``time=-1`` and ``quality=-1`` so downstream code can drop them.
+    Each lightcurve keeps its true length: stored as PyArrow ``list_<float>``
+    columns inside a ``lightcurve`` struct. No padding, no fixed-width 2D.
+    Different rows can (and typically do) have different lengths.
     """
-    n_rows = len(rows)
-    max_len = max(len(r["time"]) for r in rows)
-
-    def _pad(arr, fill):
-        out = np.full((n_rows, max_len), fill, dtype=arr[0].dtype if arr else np.float32)
-        for i, a in enumerate(arr):
-            out[i, : len(a)] = a
-        return out
-
-    times = _pad([r["time"] for r in rows], fill=-1.0)
-    fluxes = _pad([r["flux"] for r in rows], fill=np.nan)
-    flux_errs = _pad([r["flux_err"] for r in rows], fill=np.nan)
-    qualities = _pad([r["quality"] for r in rows], fill=-1)
-
     columns = {
         "ra": pa.array([r["ra"] for r in rows], type=pa.float64()),
         "dec": pa.array([r["dec"] for r in rows], type=pa.float64()),
@@ -125,10 +111,10 @@ def build_table(rows: list[dict]) -> pa.Table:
         "sector": pa.array([r["sector"] for r in rows], type=pa.int32()),
         "lightcurve": pa.StructArray.from_arrays(
             [
-                np_to_pyarrow_list(times),
-                np_to_pyarrow_list(fluxes),
-                np_to_pyarrow_list(flux_errs),
-                np_to_pyarrow_list(qualities),
+                pa.array([r["time"] for r in rows], type=pa.list_(pa.float64())),
+                pa.array([r["flux"] for r in rows], type=pa.list_(pa.float32())),
+                pa.array([r["flux_err"] for r in rows], type=pa.list_(pa.float32())),
+                pa.array([r["quality"] for r in rows], type=pa.list_(pa.int32())),
             ],
             names=["time", "flux", "flux_err", "quality"],
         ),
