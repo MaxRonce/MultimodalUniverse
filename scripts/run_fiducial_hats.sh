@@ -10,7 +10,7 @@ set -uo pipefail
 
 HEALPIX="${1:-1177}"
 N_ROWS="${2:-2000}"
-OUTPUT="/mnt/ceph/users/polymathic/MultimodalUniverse_v2_hats/healpix_${HEALPIX}"
+ROOT="${ROOT:-/mnt/ceph/users/polymathic/MultimodalUniverse_v2_hats}"
 
 # Locate venv python (must be set up before running this script)
 PYTHON="${PYTHON:-$HOME/mmu_hats_demo/.venv/bin/python}"
@@ -19,7 +19,7 @@ if [ ! -x "$PYTHON" ]; then
     exit 1
 fi
 
-mkdir -p "$OUTPUT"
+mkdir -p "$ROOT"
 
 # Datasets known to have data at healpix=1177 (verified 2026-04-07)
 # Format: "dataset:config"
@@ -39,9 +39,10 @@ DATASETS=(
     "chandra:spectra"
 )
 
-LOG="$OUTPUT/run.log"
-echo "Starting batch HATS conversion for healpix=$HEALPIX (n_rows=$N_ROWS)" | tee "$LOG"
-echo "Output: $OUTPUT" | tee -a "$LOG"
+LOG="$ROOT/run.log"
+: > "$LOG"
+echo "Starting batch HATS conversion for healpix=$HEALPIX (n_rows=$N_ROWS)" | tee -a "$LOG"
+echo "Root: $ROOT" | tee -a "$LOG"
 echo "Datasets: ${#DATASETS[@]}" | tee -a "$LOG"
 echo "===" | tee -a "$LOG"
 
@@ -52,15 +53,17 @@ failed_list=()
 for entry in "${DATASETS[@]}"; do
     ds="${entry%%:*}"
     cfg="${entry##*:}"
+    out_dir="$ROOT/$ds"
+    mkdir -p "$out_dir"
     echo "" | tee -a "$LOG"
-    echo "[$(date +%H:%M:%S)] $ds/$cfg ..." | tee -a "$LOG"
+    echo "[$(date +%H:%M:%S)] $ds/$cfg -> $out_dir" | tee -a "$LOG"
 
     if "$PYTHON" -m mmu.cli.build_hats \
         --dataset "$ds" \
         --config "$cfg" \
         --healpix "$HEALPIX" \
         --n-rows "$N_ROWS" \
-        --output "$OUTPUT" 2>&1 | tee -a "$LOG"; then
+        --output "$out_dir" 2>&1 | tee -a "$LOG"; then
         success=$((success + 1))
         echo "  [$(date +%H:%M:%S)] OK $ds/$cfg" | tee -a "$LOG"
     else
