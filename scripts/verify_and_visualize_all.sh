@@ -43,7 +43,7 @@ for catalog_dir in "$ROOT"/*/; do
 
     echo ""
     echo "[$name] verifying..."
-    if "$PYTHON" -m mmu.verify --catalog "$inner" --source-hdf5 "$src" --n-rows 2000; then
+    if "$PYTHON" -m mmu.verify --catalog "$inner" --source-hdf5 "$src"; then
         ok=$((ok + 1))
         echo "[$name] OK"
     else
