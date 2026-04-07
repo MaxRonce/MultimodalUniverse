@@ -35,6 +35,7 @@ dependencies = [
     "universal_pathlib",
     # PyTorch loader (mmu.data depends on torch at module-import time)
     "torch",
+    "desispec>=0.70.0",
 ]
 dynamic = ["version"]
 

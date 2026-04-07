@@ -391,6 +391,15 @@ wheels = [
 ]
 
 [[package]]
+name = "configobj"
+version = "5.0.9"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f5/c4/c7f9e41bc2e5f8eeae4a08a01c91b2aea3dfab40a3e14b25e87e7db8d501/configobj-5.0.9.tar.gz", hash = "sha256:03c881bbf23aa07bccf1b837005975993c4ab4427ba57f959afdd9d1a2386848", size = 101518, upload-time = "2024-09-21T12:47:46.315Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a6/c4/0679472c60052c27efa612b4cd3ddd2a23e885dcdc73461781d2c802d39e/configobj-5.0.9-py2.py3-none-any.whl", hash = "sha256:1ba10c5b6ee16229c79a05047aeda2b55eb4e80d7c7d8ecf17ec1ca600c79882", size = 35615, upload-time = "2024-11-26T14:03:32.972Z" },
+]
+
+[[package]]
 name = "connection-pool"
 version = "0.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -643,6 +652,83 @@ wheels = [
 ]
 
 [[package]]
+name = "desimodel"
+version = "0.20.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "astropy" },
+    { name = "configobj" },
+    { name = "desiutil" },
+    { name = "healpy" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pyyaml" },
+    { name = "requests" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/59/c5/2e6a0bbc6e881d16d08f11f4f8fa3609f68c36e12286145740e4a9410f9a/desimodel-0.20.0.tar.gz", hash = "sha256:299df80a6d55eec6c96a6e472cd9afd1f725f22becdcae9cb2fe37305052e81e", size = 96424, upload-time = "2025-11-24T18:47:11.089Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/60/c0857e0784d45bc2aa15f7dfa8f781af76c1d341997b6928bd25f3b573bd/desimodel-0.20.0-py3-none-any.whl", hash = "sha256:3dbed73f43bdc39c91fa25f48b63ce35353fa2e53beb650f5488f66c47d42fd0", size = 112377, upload-time = "2025-11-24T18:47:09.364Z" },
+]
+
+[[package]]
+name = "desispec"
+version = "0.70.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "astropy" },
+    { name = "desimodel" },
+    { name = "desitarget" },
+    { name = "desiutil" },
+    { name = "fitsio" },
+    { name = "healpy" },
+    { name = "numba" },
+    { name = "pytz" },
+    { name = "requests" },
+    { name = "scipy" },
+    { name = "speclite" },
+    { name = "sqlalchemy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ed/b4/7b455ba3e21f6a256cae08c0fd8785f91b84df4571150406cf299c3384a4/desispec-0.70.0.tar.gz", hash = "sha256:4731e6f7d71bf84e217e5796e45bad1c3ef05315ddcb02df17c70b75351794b3", size = 2921659, upload-time = "2025-12-04T18:22:59.107Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/27/9d/ed3bf14ef6c26b02d6e2fcbbf1c9d5b745b9b3c5a785a871c6f8cf697e5e/desispec-0.70.0-py3-none-any.whl", hash = "sha256:47cb75b783d7869661da49cdc481ff245308bc92bee7c33ab88f47391f5e7d3a", size = 3122259, upload-time = "2025-12-04T18:22:57.401Z" },
+]
+
+[[package]]
+name = "desitarget"
+version = "4.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "astropy" },
+    { name = "desimodel" },
+    { name = "desiutil" },
+    { name = "fitsio" },
+    { name = "healpy" },
+    { name = "matplotlib" },
+    { name = "numba" },
+    { name = "pytz" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/42/b4/3fa4308af231c63a119a11156dac475bf4bbd8097ea49ce181b38a5d3701/desitarget-4.4.0.tar.gz", hash = "sha256:ea906374a186377403917a3f784cc5da127a8279d7ce9725b25dd361b63b9631", size = 52317760, upload-time = "2025-11-24T21:13:12.352Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e1/a6/5f2528b11492c7a6f4741921769e1c4466abb30fc9f4c15f65c33eee01de/desitarget-4.4.0-py3-none-any.whl", hash = "sha256:009c235645af1ced635dcf766df2075070273bc19e1e6a257b3a72d908dbe715", size = 52447464, upload-time = "2025-11-24T21:10:40.385Z" },
+]
+
+[[package]]
+name = "desiutil"
+version = "3.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "astropy" },
+    { name = "pyyaml" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/39/38/20580498101e85679250b9124b2f58eb7e4b737ae97e8315624f09dba458/desiutil-3.6.1.tar.gz", hash = "sha256:335e9dd4397ba07f53b76d31b3fb70b162b884541561a752836d26f90f304dc0", size = 2954801, upload-time = "2026-03-24T21:32:16.987Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/27/3a/5ce6050b0b92ba52c3578b1c21ea09c26d7d8d04e00695e01f021cf335ea/desiutil-3.6.1-py3-none-any.whl", hash = "sha256:a56e391b70cda89fb7d22af8fbd63a839ccf4f5b244f4fef4f2618d3a56e29c3", size = 2970438, upload-time = "2026-03-24T21:32:15.255Z" },
+]
+
+[[package]]
 name = "dill"
 version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -745,6 +831,29 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/b8/00651a0f559862f3bb7d6f7477b192afe3f583cc5e26403b44e59a55ab34/filelock-3.25.2.tar.gz", hash = "sha256:b64ece2b38f4ca29dd3e810287aa8c48182bbecd1ae6e9ae126c9b35f1382694", size = 40480, upload-time = "2026-03-11T20:45:38.487Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a4/a5/842ae8f0c08b61d6484b52f99a03510a3a72d23141942d216ebe81fefbce/filelock-3.25.2-py3-none-any.whl", hash = "sha256:ca8afb0da15f229774c9ad1b455ed96e85a81373065fb10446672f64444ddf70", size = 26759, upload-time = "2026-03-11T20:45:37.437Z" },
+]
+
+[[package]]
+name = "fitsio"
+version = "1.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9e/f1/319003b56bcf6c83ef299461d601e13ad5910c1d62fa683d86fdb2fec2c6/fitsio-1.3.0.tar.gz", hash = "sha256:e2394fb0dca62f46feaaf61a48ad89fad6d2428a5a96a78ebfb4299a084b9260", size = 4995996, upload-time = "2025-11-12T15:24:25.021Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/af/0d/13f7bd26c6ff29b2f29ced97a19117dd6d6ad54a9aeed99f672780a47a00/fitsio-1.3.0-cp311-cp311-macosx_13_0_x86_64.whl", hash = "sha256:1316b7e12922c9902a0be44670b3f0d852aabf8e368ab7e09c178dacf1cec6b9", size = 687155, upload-time = "2025-11-12T15:23:54.632Z" },
+    { url = "https://files.pythonhosted.org/packages/74/b5/cc1159e3d7c34cbf883383900cdefc2a0f2a774a271bcad1135ee0cf2c3f/fitsio-1.3.0-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:1751f93fbe73ba0de67dbd0f5557e2618581c00f284de7781f1829b8f453ac6c", size = 676635, upload-time = "2025-11-12T15:23:55.765Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/69/97fa1ddb1ba364a0e658ae22c793cb6262c20a1d4736709caddd89ca9b3c/fitsio-1.3.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:3286f1b7588ab95dea88225e4f177df222820e036b906eb09e50c40edd3d36b1", size = 802235, upload-time = "2025-11-12T15:23:57.197Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/b1/9a6462f7bdc6090b8d77b9e3aa8ff4e647e0548c3eb62f237759be50e5eb/fitsio-1.3.0-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:4a9bb5354d202913ad481ee24cffa4633749074f2a5ebb2c6a352452bdce87aa", size = 821721, upload-time = "2025-11-12T15:23:58.317Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/3f/6ecf0a9b597bd61de2705a10ae3ad1a8ec27da5f948cf38101376a3c5084/fitsio-1.3.0-cp312-cp312-macosx_13_0_x86_64.whl", hash = "sha256:e81b837a5e802784a487f00ef87783aee13204591c0f8283d020a48f348fa290", size = 687297, upload-time = "2025-11-12T15:23:59.312Z" },
+    { url = "https://files.pythonhosted.org/packages/33/35/e037ab8263507d922f5201afb69c10a32a3d45ea1571b2a08cdd6ce0fff7/fitsio-1.3.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:ac477c4b8f24d8e6fffe448f74e814b29e2ff24043797d497b0cacc8aef395db", size = 676817, upload-time = "2025-11-12T15:24:00.34Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/5c/5713b58b7a848ba0738ce70f461dbf937f94f22a194762ef679b66293884/fitsio-1.3.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:b0c6d0528947dd81bf0a50c8d0187edd05b2112bf890fc4dc825babb7f6e1d10", size = 804603, upload-time = "2025-11-12T15:24:01.685Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/9a/399a1e59664a5945ffe51b09230e9973104b8e1ba2bc6a894e1266a2ed16/fitsio-1.3.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:91556f6140e60a77cda96727fb7cb11316fc0f530ea6ddce4bee8b356737468c", size = 824075, upload-time = "2025-11-12T15:24:02.826Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/a4/9a07cff037542479a6d606b705b471bd878f477ebbec4a17a95e55899bbf/fitsio-1.3.0-cp313-cp313-macosx_13_0_x86_64.whl", hash = "sha256:4636c63228527028fe73b4ff5f7202be668dcd784c44bae4d4d2013a5e40902b", size = 687295, upload-time = "2025-11-12T15:24:04.37Z" },
+    { url = "https://files.pythonhosted.org/packages/53/55/f57eb7813534b5783db8ca25f25a2cdbc19d005c088a6b132af37f9268a1/fitsio-1.3.0-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:5c124fdc03318b66a5227a44428b7b161e07d4841b4a58b13b5db99383959322", size = 676817, upload-time = "2025-11-12T15:24:05.948Z" },
+    { url = "https://files.pythonhosted.org/packages/55/9b/a270a186b38280579a5cc4342ef619cb488521d28f3a1872d4d81840cd0c/fitsio-1.3.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:37568c7e8d3193e96ebbd5d9221bbb5e288e8e3e44d3780bc656680404dc5ee6", size = 804706, upload-time = "2025-11-12T15:24:07.22Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/42/683fd9ed3b5069ac41b0469fd1121d5c4c4aafb88b41d383206afe688223/fitsio-1.3.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:b1017eea6a3924ce47e3aae6f7451147ffb8251729a14c5fffc24b655924c862", size = 824191, upload-time = "2025-11-12T15:24:08.406Z" },
 ]
 
 [[package]]
@@ -1676,6 +1785,7 @@ dependencies = [
     { name = "dask", version = "2025.3.1", source = { registry = "https://pypi.org/simple" }, extra = ["distributed"], marker = "python_full_version < '3.12'" },
     { name = "dask", version = "2026.3.0", source = { registry = "https://pypi.org/simple" }, extra = ["distributed"], marker = "python_full_version >= '3.12'" },
     { name = "datasets" },
+    { name = "desispec" },
     { name = "h5py" },
     { name = "hats" },
     { name = "hats-import" },
@@ -1709,6 +1819,7 @@ requires-dist = [
     { name = "astropy" },
     { name = "dask", extras = ["distributed"] },
     { name = "datasets" },
+    { name = "desispec", specifier = ">=0.70.0" },
     { name = "h5py" },
     { name = "hats", specifier = ">=0.9.0" },
     { name = "hats-import", specifier = ">=0.9.0" },
@@ -3133,6 +3244,21 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e8/c4/ba2f8066cceb6f23394729afe52f3bf7adec04bf9ed2c820b39e19299111/sortedcontainers-2.4.0.tar.gz", hash = "sha256:25caa5a06cc30b6b83d11423433f65d1f9d76c4c6a0c90e3379eaa43b9bfdb88", size = 30594, upload-time = "2021-05-16T22:03:42.897Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/32/46/9cb0e58b2deb7f82b84065f37f3bffeb12413f947f9388e4cac22c4621ce/sortedcontainers-2.4.0-py2.py3-none-any.whl", hash = "sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0", size = 29575, upload-time = "2021-05-16T22:03:41.177Z" },
+]
+
+[[package]]
+name = "speclite"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "astropy" },
+    { name = "matplotlib" },
+    { name = "pyyaml" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c8/5c/0ae1e308b957137800d0678d140f918f879f845d259250da3ff366aca36b/speclite-1.0.0.tar.gz", hash = "sha256:51cdff676004e5671cb4696e9e056f9b83505e8ebcf91ae474659015fc730d24", size = 2117483, upload-time = "2026-03-16T22:05:10.85Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7a/9c/ded2f0569b2f393f149e32126c4055400c2f692990b467bd1136ba9160af/speclite-1.0.0-py3-none-any.whl", hash = "sha256:4bc8cb7f718b347e0ce566cb5ed341684c8efebe4a77f2a49aabe8ee085465d7", size = 2170548, upload-time = "2026-03-16T22:05:09.287Z" },
 ]
 
 [[package]]
