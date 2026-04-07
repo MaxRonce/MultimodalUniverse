@@ -1,9 +1,17 @@
 # Snakemake config for the raw -> HATS pipeline.
 #
+# IMPORTANT: every profile here assumes you are on the Flatiron cluster, where
+# the raw survey inputs live under /mnt/ceph/users/polymathic/external_data/astro.
+# Neither the build scripts nor Snakemake download anything; the `test` profile
+# is just a small subset of the cluster build, NOT a hermetic local test.
+#
+# For local development (laptop / CI), use the unit tests in `tests/` — they
+# build synthetic in-memory data and don't touch real raw inputs.
+#
 # Pick a profile with `--config profile=NAME`. Defaults to `cluster`.
 #
 #   uv run snakemake --cores 4 build_allwise                       # cluster, full
-#   uv run snakemake --cores 1 build_allwise --config profile=test # tiny smoke test
+#   uv run snakemake --cores 1 build_allwise --config profile=test # cluster, 1 shard
 #
 # To override paths on your own machine without committing them, drop a
 # `snakemake_config.local.yaml` next to this file (gitignored). It is loaded

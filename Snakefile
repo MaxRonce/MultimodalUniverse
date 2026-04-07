@@ -2,22 +2,26 @@
 
 Each dataset has a `build_parent_sample_hats.py` under `scripts/{dataset}/`
 that reads the survey-native raw inputs (parquet, FITS, etc.) and writes a
-HATS catalog under `MMU_V2_HATS_ROOT/{dataset}/{dataset}/{dataset}/`.
+HATS catalog under `HATS_ROOT/{dataset}/{dataset}/{dataset}/`.
 
 The Snakefile is intentionally a thin wrapper: it just declares one rule per
 ported dataset and a top-level `all` target. Adding a new dataset is two lines
 in `PORTED` plus the build script.
 
-Usage:
+REQUIREMENTS: this pipeline only runs on the Flatiron cluster. Raw inputs live
+under `/mnt/ceph/users/polymathic/external_data/astro/` and are NOT downloaded
+by anything here. For local development use the unit tests in `tests/`.
 
-    # Build everything that's been ported:
+Usage (run from a cluster login/compute node):
+
+    # Build everything that's been ported, full size:
     uv run snakemake --cores 4 all
 
     # Build just one dataset:
     uv run snakemake --cores 1 build_allwise
 
-    # Smoke-test against a small slice:
-    uv run snakemake --cores 1 --config max_files=2 build_allwise
+    # Smoke-test against one raw shard per dataset:
+    uv run snakemake --cores 1 build_allwise --config profile=test
 """
 
 import os
