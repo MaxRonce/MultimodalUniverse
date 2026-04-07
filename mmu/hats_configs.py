@@ -184,20 +184,35 @@ MMU_V1_ROOT = "/mnt/ceph/users/polymathic/MultimodalUniverse"
 MMU_V2_HATS_ROOT = "/mnt/ceph/users/polymathic/MultimodalUniverse_v2_hats"
 
 
+_HDF5_FILENAME_PATTERNS = ("001-of-001.hdf5", "0001-of-0001.hdf5")
+
+
 def hdf5_path(dataset: str, healpix: int, config: str | None = None) -> str:
     """Return the path to an MMU v1 HDF5 tile on the cluster.
 
+    Tries the standard ``001-of-001.hdf5`` filename first, then falls back to
+    ``0001-of-0001.hdf5`` (used by MaNGA).
+
     For flat-layout datasets (like kepler), pass config=None.
-    Otherwise, config is required.
     """
+    import os
+
     cfg = DATASET_CONFIGS.get(dataset, {})
     if cfg.get("flat_layout"):
-        return f"{MMU_V1_ROOT}/{dataset}/healpix={healpix}/001-of-001.hdf5"
-    if config is None:
-        config = cfg.get("default_config")
+        base = f"{MMU_V1_ROOT}/{dataset}/healpix={healpix}"
+    else:
         if config is None:
-            raise ValueError(f"config required for non-flat dataset {dataset}")
-    return f"{MMU_V1_ROOT}/{dataset}/{config}/healpix={healpix}/001-of-001.hdf5"
+            config = cfg.get("default_config")
+            if config is None:
+                raise ValueError(f"config required for non-flat dataset {dataset}")
+        base = f"{MMU_V1_ROOT}/{dataset}/{config}/healpix={healpix}"
+
+    for fname in _HDF5_FILENAME_PATTERNS:
+        full = f"{base}/{fname}"
+        if os.path.exists(full):
+            return full
+    # Default to the standard pattern even if it doesn't exist (caller checks)
+    return f"{base}/{_HDF5_FILENAME_PATTERNS[0]}"
 
 
 def get_dataset_config(dataset: str) -> dict:
