@@ -7,12 +7,16 @@ Two API styles are provided:
   with the same code path.
 """
 
+import logging
+
 import h5py
 import numpy as np
 import pyarrow as pa
 from hats_import import CollectionArguments
 from hats_import.catalog.file_readers import InputReader
 from hats_import.pipeline import pipeline_with_client
+
+LOGGER = logging.getLogger(__name__)
 
 # Keys we recognize as parts of a spectrum struct.
 SPECTRUM_KEYS = {
@@ -117,12 +121,16 @@ def build_arrow_table(
 
 
 def _decode_strings(arr: np.ndarray) -> list[str]:
-    """Convert a numpy array of bytes/strings/numbers to a list of Python strings."""
-    if arr.dtype.kind == "S":
-        return [x.decode("utf-8", errors="replace") for x in arr]
-    if arr.dtype.kind == "U":
-        return [str(x) for x in arr]
-    return [str(x) for x in arr]
+    """Convert a 1-D numpy array of bytes/str/numeric scalars to Python strings."""
+    out = []
+    for x in arr:
+        if isinstance(x, bytes):
+            out.append(x.decode("utf-8", errors="replace"))
+        elif x is None:
+            out.append("")
+        else:
+            out.append(str(x))
+    return out
 
 
 def _flatten_array_to_list_with_shape(
@@ -145,28 +153,45 @@ def _flatten_array_to_list_with_shape(
     return pa.ListArray.from_arrays(values=values, offsets=offsets), per_row_shape
 
 
-def _column_to_pyarrow(arr: np.ndarray) -> pa.Array | None:
-    """Best-effort conversion of an HDF5 column to a PyArrow array.
+def _column_to_pyarrow(arr: np.ndarray, *, name: str = "<unknown>") -> pa.Array | None:
+    """Convert an HDF5 column to a PyArrow array via explicit dispatch on dtype/shape.
 
-    Returns None if the column should be dropped (e.g., 0-D scalar).
+    Returns None if the column should be dropped (0-D scalar metadata).
+    Raises a clear error if the dtype is unsupported — the caller decides what to do.
     """
     if arr.ndim == 0:
         return None  # scalar metadata, skip
 
-    # String/bytes columns
-    if arr.dtype.kind in ("S", "U", "O"):
+    # Object dtype: only supported when every element is bytes or str (variable-length string).
+    if arr.dtype.kind == "O":
+        if arr.ndim != 1:
+            raise ValueError(
+                f"Column {name!r}: object dtype with ndim={arr.ndim} not supported"
+            )
+        first = arr[0] if len(arr) > 0 else None
+        if isinstance(first, (bytes, str, type(None))):
+            return pa.array(_decode_strings(arr))
+        raise ValueError(
+            f"Column {name!r}: object dtype with element type {type(first).__name__} not supported"
+        )
+
+    # Fixed-length string columns
+    if arr.dtype.kind in ("S", "U"):
+        if arr.ndim != 1:
+            raise ValueError(
+                f"Column {name!r}: string dtype with ndim={arr.ndim} not supported"
+            )
         return pa.array(_decode_strings(arr))
 
+    # Numeric dtypes (int/float/bool)
     if arr.dtype.byteorder == ">":
         arr = arr.byteswap().view(arr.dtype.newbyteorder("<"))
 
     if arr.ndim == 1:
         return pa.array(arr)
-
     if arr.ndim == 2:
         return np_to_pyarrow_list(arr)
-
-    # 3D+ array — flatten per-row, caller is expected to also store shape
+    # 3D+: flatten per-row to a list (shape is added separately for known image cols)
     flat, _ = _flatten_array_to_list_with_shape(arr)
     return flat
 
@@ -186,14 +211,14 @@ def auto_arrow_table_from_hdf5(
     n_rows: int | None = None,
     skip_columns: set[str] | None = None,
     spectrum_struct: bool = True,
-    image_columns: tuple[str, ...] = ("image_array",),
 ) -> pa.Table:
     """Build a PyArrow table from an MMU HDF5 file by introspection.
 
     Handles:
     - 1D scalar columns (float/int/bool/string)
     - 2D array columns (e.g., flux × filter, spectrum_flux × wavelength) → list
-    - 3D+ array columns (e.g., image_array (N, bands, H, W)) → flat list + shape column
+    - 3D+ numeric array columns (e.g., image_array (N, bands, H, W)) →
+      flat list + a sibling ``{name}_shape`` column
     - Spectrum struct (groups spectrum_* columns into a struct named ``spectrum``)
     - RA/Dec aliases (RA, dec, decl, etc.) → normalized to ``ra``/``dec``
     - object_id → cast to string
@@ -203,7 +228,6 @@ def auto_arrow_table_from_hdf5(
         n_rows: If set, read only the first ``n_rows`` rows from each column.
         skip_columns: Set of column names to skip.
         spectrum_struct: If True, group spectrum_* columns into a single struct column.
-        image_columns: Tuple of column names that should be flattened with shape metadata.
     """
     skip_columns = set(skip_columns or set())
 
@@ -259,32 +283,50 @@ def auto_arrow_table_from_hdf5(
         # re-added at the top level — they'd fail there too)
         skip_columns.update(spectrum_keys_present)
 
-    # Image columns: flatten + add shape metadata
-    for img_key in image_columns:
-        if img_key in keys:
-            arr = np.asarray(h5_file[img_key][sl])
-            if arr.ndim >= 3:
-                flat, shape = _flatten_array_to_list_with_shape(arr)
-                columns[img_key] = flat
-                columns[f"{img_key}_shape"] = pa.array(
-                    [shape] * len(flat), type=pa.list_(pa.int32())
-                )
-                skip_columns.add(img_key)
-
-    # All remaining columns
+    # Walk all remaining columns. For 3D+ arrays, also store a shape column
+    # (so the image cube can be reconstructed at read time).
     handled = {ra_key, dec_key} | (
         {obj_id_key} if obj_id_key else set()
     ) | skip_columns
+
+    n_rows_actual = len(columns["ra"])
 
     for k in keys:
         if k in handled:
             continue
         try:
             arr = np.asarray(h5_file[k][sl])
-        except (TypeError, ValueError):
-            continue  # skip unreadable
-        col = _column_to_pyarrow(arr)
-        if col is None or len(col) != len(columns["ra"]):
+        except (TypeError, ValueError) as e:
+            LOGGER.warning("Skipping column %r: failed to read (%s)", k, e)
+            continue
+
+        # 3D+ numeric arrays: flatten and store shape alongside
+        if arr.ndim >= 3 and arr.dtype.kind in "fiub":
+            flat, shape = _flatten_array_to_list_with_shape(arr)
+            if len(flat) != n_rows_actual:
+                LOGGER.warning(
+                    "Skipping column %r: length mismatch (%d vs %d expected)",
+                    k, len(flat), n_rows_actual,
+                )
+                continue
+            columns[k] = flat
+            columns[f"{k}_shape"] = pa.array(
+                [shape] * n_rows_actual, type=pa.list_(pa.int32())
+            )
+            continue
+
+        try:
+            col = _column_to_pyarrow(arr, name=k)
+        except ValueError as e:
+            LOGGER.warning("Skipping column %r: %s", k, e)
+            continue
+        if col is None:
+            continue  # explicit drop (e.g., 0-D scalar)
+        if len(col) != n_rows_actual:
+            LOGGER.warning(
+                "Skipping column %r: length mismatch (%d vs %d expected)",
+                k, len(col), n_rows_actual,
+            )
             continue
         columns[k] = col
 

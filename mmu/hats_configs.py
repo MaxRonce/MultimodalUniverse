@@ -66,7 +66,6 @@ DATASET_CONFIGS = {
         "configs": ["dr10_south_21"],
         "modality": "image",
         "default_config": "dr10_south_21",
-        "image_columns": ("image_array", "image_blobmodel", "image_rgb", "image_mask"),
     },
     "ssl_legacysurvey": {
         "configs": ["north"],  # cluster only has 'north', not stein_et_al

@@ -265,3 +265,55 @@ class TestStringColumns:
         table = auto_arrow_table_from_hdf5(h5)
         assert table.column("obj_class")[0].as_py() == "GALAXY"
         assert table.schema.field("obj_class").type == pa.string()
+
+
+class TestColumnDispatchErrors:
+    """Verify _column_to_pyarrow raises with column name on bad input."""
+
+    def test_object_dtype_with_ndim2_raises(self):
+        from mmu.hats_import import _column_to_pyarrow
+        arr = np.empty((5, 2), dtype=object)
+        with pytest.raises(ValueError, match="myfield.*object dtype.*ndim=2"):
+            _column_to_pyarrow(arr, name="myfield")
+
+    def test_object_dtype_with_array_elements_raises(self):
+        from mmu.hats_import import _column_to_pyarrow
+        arr = np.empty(3, dtype=object)
+        for i in range(3):
+            arr[i] = np.array([1.0, 2.0, 3.0])
+        with pytest.raises(ValueError, match="object dtype with element type ndarray"):
+            _column_to_pyarrow(arr, name="oddcol")
+
+
+class TestImageColumn4D:
+    """Auto-converter should handle 4D image cubes (e.g., LegacySurvey image_array)."""
+
+    @pytest.fixture
+    def h5(self, coords, n):
+        rng = np.random.default_rng(8)
+        cols = {
+            **coords,
+            # 4D image cube: (N, bands, H, W)
+            "image_array": rng.normal(0, 1, (n, 4, 16, 16)).astype(np.float32),
+            # 3D mask
+            "image_mask": rng.integers(0, 2, (n, 16, 16)).astype(np.uint8),
+        }
+        return make_hdf5(cols)
+
+    def test_4d_image_column_present(self, h5):
+        table = auto_arrow_table_from_hdf5(h5)
+        assert "image_array" in table.schema.names
+        assert "image_array_shape" in table.schema.names
+
+    def test_4d_image_reconstructable(self, h5):
+        table = auto_arrow_table_from_hdf5(h5)
+        flat = np.array(table.column("image_array")[0].as_py(), dtype=np.float32)
+        shape = list(table.column("image_array_shape")[0].as_py())
+        assert shape == [4, 16, 16]
+        img = flat.reshape(shape)
+        assert img.shape == (4, 16, 16)
+
+    def test_3d_mask_also_handled(self, h5):
+        table = auto_arrow_table_from_hdf5(h5)
+        assert "image_mask" in table.schema.names
+        assert "image_mask_shape" in table.schema.names
