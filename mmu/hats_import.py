@@ -18,17 +18,8 @@ from hats_import.pipeline import pipeline_with_client
 
 LOGGER = logging.getLogger(__name__)
 
-# Keys we recognize as parts of a spectrum struct.
-SPECTRUM_KEYS = {
-    "spectrum_flux", "spectrum_ivar", "spectrum_lambda",
-    "spectrum_lsf_sigma", "spectrum_lsf", "spectrum_mask",
-    # GALAH variants
-    "spectrum_norm_flux", "spectrum_norm_ivar", "spectrum_norm_lambda",
-    # APOGEE variants
-    "spectrum_pseudo_continuum",
-    # LAMOST uses spectrum_wavelength instead of spectrum_lambda
-    "spectrum_wavelength",
-}
+# Spectrum columns are detected by prefix.
+SPECTRUM_PREFIX = "spectrum_"
 
 # Possible RA/Dec column name aliases.
 RA_ALIASES = ("ra", "RA", "Ra")
@@ -260,8 +251,8 @@ def auto_arrow_table_from_hdf5(
     if obj_id_key is not None:
         columns["object_id"] = pa.array(_decode_strings(h5_file[obj_id_key][sl]))
 
-    # Spectrum struct
-    spectrum_keys_present = [k for k in keys if k in SPECTRUM_KEYS]
+    # Spectrum struct: any column whose name starts with "spectrum_"
+    spectrum_keys_present = [k for k in keys if k.startswith(SPECTRUM_PREFIX)]
     if spectrum_struct and spectrum_keys_present:
         struct_arrays = []
         struct_names = []
