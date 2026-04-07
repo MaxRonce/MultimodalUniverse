@@ -97,6 +97,8 @@ def main():
                         default=os.path.expanduser("~/ceph/general_data/mmu_hats_demo_out"),
                         help="Output directory for HATS catalogs and plot")
     parser.add_argument("--radius-arcsec", type=float, default=1.0)
+    parser.add_argument("--n-show", type=int, default=4,
+                        help="Number of matched galaxies to plot")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -139,47 +141,75 @@ def main():
     )
     print(f"Matched {matched.matched_count} pairs")
 
-    # Visualize a few matched galaxies: image + spectrum
+    # Visualize: pick the brightest low-z galaxies for clearest spectra/images
     if matched.matched_count > 0:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        n_show = min(4, matched.matched_count)
-        fig, axes = plt.subplots(n_show, 2, figsize=(12, 3 * n_show))
+        df = matched.df.copy()
+        # Filter to nearby galaxies (z < 0.3) where features are obvious
+        df = df[(df["Z_sdss"] > 0.005) & (df["Z_sdss"] < 0.3)]
+        # Sort by brightness (LegacySurvey r-band flux, descending)
+        df = df.sort_values("FLUX_R_legacy", ascending=False).reset_index(drop=True)
+        print(f"After filtering to bright low-z galaxies: {len(df)} pairs")
+
+        n_show = min(args.n_show, len(df))
+        fig, axes = plt.subplots(n_show, 2, figsize=(11, 3 * n_show))
         if n_show == 1:
             axes = axes.reshape(1, -1)
 
         for i in range(n_show):
-            item = matched[i]
+            row = df.iloc[i]
 
             # Image: reconstruct from flat list + shape
-            img_flat = np.array(item["image_flat_legacy"])
-            shape = list(item["image_shape_legacy"])
+            img_flat = np.asarray(row["image_flat_legacy"], dtype=np.float32)
+            shape = list(row["image_shape_legacy"])
             img = img_flat.reshape(shape)  # (4, 160, 160) — bands g, r, i, z
-            # Use g, r, z bands for RGB-ish (indices 0, 1, 3)
+
+            # RGB from z, r, g (red, green, blue)
             rgb = np.stack([img[3], img[1], img[0]], axis=-1)
-            rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
-            rgb = np.clip(rgb ** 0.5, 0, 1)
+            # Per-band percentile stretch for visibility
+            for c in range(3):
+                lo, hi = np.percentile(rgb[..., c], [1, 99.5])
+                rgb[..., c] = np.clip((rgb[..., c] - lo) / (hi - lo + 1e-8), 0, 1)
+            rgb = rgb ** 0.5  # gamma stretch
+
             axes[i, 0].imshow(rgb, origin="lower")
             axes[i, 0].set_title(
-                f"LegacySurvey  ra={item['ra_legacy']:.4f}, dec={item['dec_legacy']:.4f}"
+                f"LegacySurvey grz  flux_r={row['FLUX_R_legacy']:.1f} nMgy"
             )
             axes[i, 0].axis("off")
 
             # Spectrum
-            spec = item["spectrum_sdss"]
-            lam = np.array(spec["lambda"])
-            flux = np.array(spec["flux"])
-            mask = np.array(spec["mask"])
+            spec = row["spectrum_sdss"]
+            # spec is a nested pandas DataFrame with columns flux/ivar/lambda/mask
+            lam = np.asarray(spec["lambda"].values, dtype=np.float32)
+            flux = np.asarray(spec["flux"].values, dtype=np.float32)
+            mask = np.asarray(spec["mask"].values, dtype=bool)
             flux_masked = np.where(mask, np.nan, flux)
-            axes[i, 1].plot(lam, flux_masked, linewidth=0.5)
+
+            axes[i, 1].plot(lam, flux_masked, linewidth=0.6, color="navy")
             axes[i, 1].set_title(
-                f"SDSS spectrum  z={item['Z_sdss']:.4f}, sep={item['_dist_arcsec']:.2f}\""
+                f"SDSS spectrum  z={row['Z_sdss']:.4f}  sep={row['_dist_arcsec']:.2f}\""
             )
-            axes[i, 1].set_xlabel("Wavelength [Å]")
+            axes[i, 1].set_xlabel("Observed wavelength [Å]")
             axes[i, 1].set_ylabel("Flux")
             axes[i, 1].set_xlim(3800, 9200)
+
+            # Mark common emission lines at observed wavelength (z corrected)
+            z = row["Z_sdss"]
+            lines = {
+                "Hβ": 4861, "[OIII]": 5007, "Mg": 5175, "Na": 5893,
+                "Hα": 6563, "[SII]": 6724,
+            }
+            ymin, ymax = axes[i, 1].get_ylim()
+            for name, rest in lines.items():
+                obs = rest * (1 + z)
+                if 3800 < obs < 9200:
+                    axes[i, 1].axvline(obs, color="red", alpha=0.25, linewidth=0.5)
+                    axes[i, 1].text(obs, ymax * 0.92, name, fontsize=7,
+                                    rotation=90, ha="right", va="top", color="red", alpha=0.6)
 
         plt.tight_layout()
         plot_path = os.path.join(args.output, "xmatch_demo.png")
