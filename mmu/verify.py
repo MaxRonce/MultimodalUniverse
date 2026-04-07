@@ -106,6 +106,23 @@ def verify_catalog_against_hdf5(
 
     with h5py.File(source_hdf5, "r") as f:
         keys = list(f.keys())
+        # Detect grouped layout: top-level entries are groups, not datasets
+        first = f[keys[0]] if keys else None
+        is_grouped = isinstance(first, h5py.Group)
+
+        if is_grouped:
+            # Grouped layout (e.g. MaNGA): one row per top-level group
+            n_src_total = len(keys)
+            n_src = min(n_src_total, n_rows_used) if n_rows_used else n_src_total
+            report.add(
+                "row count matches (grouped)",
+                hats_table.num_rows == n_src,
+                f"hats={hats_table.num_rows}, hdf5_groups={n_src}",
+            )
+            for col in ("ra", "dec", "object_id"):
+                report.add(f"{col} column present", col in hats_table.schema.names)
+            return report  # skip flat-layout-specific checks below
+
         ra_key = _resolve_alias(keys, RA_ALIASES)
         dec_key = _resolve_alias(keys, DEC_ALIASES)
         obj_key = _resolve_alias(keys, OBJECT_ID_ALIASES)

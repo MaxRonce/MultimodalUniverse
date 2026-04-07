@@ -88,3 +88,38 @@ class TestVerification:
         summary = report.summary()
         assert "Verification of" in summary
         assert "Result:" in summary
+
+
+class TestGroupedHDF5Verify:
+    @pytest.fixture
+    def grouped_h5_file(self, tmp_path):
+        import h5py
+        import numpy as np
+        path = tmp_path / "manga_like.hdf5"
+        with h5py.File(path, "w") as f:
+            for i, name in enumerate(["a-1", "a-2", "a-3"]):
+                g = f.create_group(name)
+                g.create_dataset("object_id", data=name.encode())
+                g.create_dataset("ra", data=float(180 + i))
+                g.create_dataset("dec", data=float(20 + i))
+                g.create_dataset("z", data=0.01 * (i + 1))
+        return str(path)
+
+    @pytest.fixture
+    def grouped_catalog(self, grouped_h5_file, tmp_path):
+        import h5py
+        from mmu.hats_import import auto_arrow_table_from_grouped_hdf5, write_hats
+        with h5py.File(grouped_h5_file, "r") as f:
+            table = auto_arrow_table_from_grouped_hdf5(f)
+        out = tmp_path / "out"
+        write_hats([table], str(out), "grouped_test")
+        return str(out / "grouped_test" / "grouped_test")
+
+    def test_grouped_verify_passes(self, grouped_catalog, grouped_h5_file):
+        report = verify_catalog_against_hdf5(grouped_catalog, grouped_h5_file)
+        assert report.ok, "\n" + report.summary()
+
+    def test_grouped_row_count(self, grouped_catalog, grouped_h5_file):
+        report = verify_catalog_against_hdf5(grouped_catalog, grouped_h5_file)
+        check = next(c for c in report.checks if "row count matches" in c[0])
+        assert check[1] is True
