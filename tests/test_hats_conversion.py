@@ -72,10 +72,20 @@ def sdss_arrow_table(sdss_astropy_table):
     )
 
 
-@pytest.fixture
-def hats_output_dir(sdss_arrow_table, tmp_path):
-    output_dir = tmp_path / "hats_out"
-    write_hats([sdss_arrow_table], str(output_dir), "sdss_test")
+@pytest.fixture(scope="module")
+def hats_output_dir(tmp_path_factory):
+    """Build the SDSS HATS catalog ONCE for all tests in this module."""
+    if not os.path.exists(SDSS_HDF5):
+        pytest.skip("SDSS test HDF5 not downloaded")
+    table = build_arrow_table(
+        _load_hdf5_table(SDSS_HDF5, SDSS_FLOAT, SDSS_BOOL, SDSS_FLUX),
+        float_features=SDSS_FLOAT,
+        bool_features=SDSS_BOOL,
+        flux_features=SDSS_FLUX,
+        flux_filters=SDSS_FILTERS,
+    )
+    output_dir = tmp_path_factory.mktemp("sdss_hats_out")
+    write_hats([table], str(output_dir), "sdss_test")
     return output_dir
 
 
@@ -101,10 +111,19 @@ def desi_arrow_table(desi_astropy_table):
     )
 
 
-@pytest.fixture
-def desi_hats_dir(desi_arrow_table, tmp_path):
-    output_dir = tmp_path / "desi_hats"
-    write_hats([desi_arrow_table], str(output_dir), "desi_test")
+@pytest.fixture(scope="module")
+def desi_hats_dir(tmp_path_factory):
+    """Build the DESI HATS catalog ONCE for all tests in this module."""
+    if not os.path.exists(DESI_HDF5):
+        pytest.skip("DESI test HDF5 not downloaded")
+    table = build_arrow_table(
+        _load_hdf5_table(DESI_HDF5, DESI_FLOAT, DESI_BOOL),
+        float_features=DESI_FLOAT,
+        bool_features=DESI_BOOL,
+        invert_bool=["ZWARN"],
+    )
+    output_dir = tmp_path_factory.mktemp("desi_hats_out")
+    write_hats([table], str(output_dir), "desi_test")
     return output_dir
 
 
@@ -147,7 +166,10 @@ class TestCatalogToArrow:
         np.testing.assert_allclose(actual_dec, expected_dec)
 
 
+@pytest.mark.slow
 class TestHATSPipeline:
+    """Integration tests that actually run the hats-import pipeline (slow)."""
+
     def test_output_exists(self, hats_output_dir):
         catalog_dir = hats_output_dir / "sdss_test" / "sdss_test"
         assert (catalog_dir / "hats.properties").exists() or (catalog_dir / "properties").exists()
@@ -217,7 +239,10 @@ class TestDESIArrow:
         np.testing.assert_allclose(actual_ra, expected_ra)
 
 
+@pytest.mark.slow
 class TestDESIHATS:
+    """Integration tests that actually run the hats-import pipeline (slow)."""
+
     def test_output_exists(self, desi_hats_dir):
         catalog_dir = desi_hats_dir / "desi_test" / "desi_test"
         assert (catalog_dir / "hats.properties").exists() or (catalog_dir / "properties").exists()

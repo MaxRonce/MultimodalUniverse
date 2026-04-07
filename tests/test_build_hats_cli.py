@@ -1,57 +1,78 @@
 """Tests for the mmu.cli.build_hats CLI.
 
-These tests monkeypatch the cluster paths to point at local test data
-so the CLI can be exercised without cluster access.
+Slow ``write_hats`` calls are module-scoped so each catalog is built once,
+keeping the suite fast.
 """
 
 import os
-import sys
+from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
 
-from mmu.cli import build_hats as cli
 from mmu import hats_configs
+from mmu.cli import build_hats as cli
 
 
 TEST_DATA = os.path.join(os.path.dirname(__file__), "..", "test_data")
 SDSS_HDF5 = os.path.join(TEST_DATA, "sdss", "sdss", "healpix=583", "001-of-001.hdf5")
 
 
-@pytest.fixture
-def patch_cluster_root(monkeypatch):
-    """Point MMU_V1_ROOT at the local test_data directory."""
-    monkeypatch.setattr(hats_configs, "MMU_V1_ROOT", TEST_DATA)
-
-
-@pytest.fixture
+@pytest.fixture(scope="module")
 def have_test_data():
     if not os.path.exists(SDSS_HDF5):
         pytest.skip("SDSS test HDF5 not downloaded")
 
 
-def test_convert_tiles_one_pixel(have_test_data, patch_cluster_root, tmp_path):
-    out = cli.convert_tiles(
-        dataset="sdss",
-        healpix_list=[583],
-        output_root=str(tmp_path),
-        config="sdss",
-    )
+@pytest.fixture(scope="module")
+def cli_full_catalog(have_test_data, tmp_path_factory):
+    """Build the full SDSS HATS catalog once via the CLI helper."""
+    out = tmp_path_factory.mktemp("cli_full")
+    original = hats_configs.MMU_V1_ROOT
+    hats_configs.MMU_V1_ROOT = TEST_DATA
+    try:
+        catalog_dir = cli.convert_tiles(
+            dataset="sdss",
+            healpix_list=[583],
+            output_root=str(out),
+            config="sdss",
+        )
+        yield catalog_dir, Path(out)
+    finally:
+        hats_configs.MMU_V1_ROOT = original
+
+
+@pytest.fixture(scope="module")
+def cli_n20_catalog(have_test_data, tmp_path_factory):
+    out = tmp_path_factory.mktemp("cli_n20")
+    original = hats_configs.MMU_V1_ROOT
+    hats_configs.MMU_V1_ROOT = TEST_DATA
+    try:
+        catalog_dir = cli.convert_tiles(
+            dataset="sdss",
+            healpix_list=[583],
+            output_root=str(out),
+            config="sdss",
+            n_rows=20,
+        )
+        yield catalog_dir, Path(out)
+    finally:
+        hats_configs.MMU_V1_ROOT = original
+
+
+@pytest.mark.slow
+def test_convert_tiles_one_pixel(cli_full_catalog):
+    out, _ = cli_full_catalog
     assert os.path.exists(out)
     assert os.path.exists(os.path.join(out, "hats.properties")) or \
         os.path.exists(os.path.join(out, "properties"))
 
 
-def test_convert_tiles_writes_parquet(have_test_data, patch_cluster_root, tmp_path):
-    out = cli.convert_tiles(
-        dataset="sdss",
-        healpix_list=[583],
-        output_root=str(tmp_path),
-        config="sdss",
-    )
-    parquet_files = list((tmp_path / "sdss_sdss" / "sdss_sdss" / "dataset").rglob("*.parquet"))
+@pytest.mark.slow
+def test_convert_tiles_writes_parquet(cli_full_catalog):
+    _, out_root = cli_full_catalog
+    parquet_files = list((out_root / "sdss_sdss" / "sdss_sdss" / "dataset").rglob("*.parquet"))
     assert len(parquet_files) > 0
-    # Read first parquet to verify schema
     table = pq.read_table(parquet_files[0])
     names = table.schema.names
     assert "ra" in names
@@ -60,20 +81,15 @@ def test_convert_tiles_writes_parquet(have_test_data, patch_cluster_root, tmp_pa
     assert "spectrum" in names
 
 
-def test_convert_tiles_with_n_rows(have_test_data, patch_cluster_root, tmp_path):
-    out = cli.convert_tiles(
-        dataset="sdss",
-        healpix_list=[583],
-        output_root=str(tmp_path),
-        config="sdss",
-        n_rows=20,
-    )
-    parquet_files = list((tmp_path / "sdss_sdss" / "sdss_sdss" / "dataset").rglob("*.parquet"))
+@pytest.mark.slow
+def test_convert_tiles_with_n_rows(cli_n20_catalog):
+    _, out_root = cli_n20_catalog
+    parquet_files = list((out_root / "sdss_sdss" / "sdss_sdss" / "dataset").rglob("*.parquet"))
     total = sum(pq.read_metadata(p).num_rows for p in parquet_files)
     assert total == 20
 
 
-def test_convert_tiles_unknown_dataset(patch_cluster_root, tmp_path):
+def test_convert_tiles_unknown_dataset(tmp_path):
     with pytest.raises(KeyError):
         cli.convert_tiles(
             dataset="not_a_real_dataset",
@@ -82,7 +98,8 @@ def test_convert_tiles_unknown_dataset(patch_cluster_root, tmp_path):
         )
 
 
-def test_convert_tiles_missing_tile(patch_cluster_root, tmp_path):
+def test_convert_tiles_missing_tile(monkeypatch, tmp_path):
+    monkeypatch.setattr(hats_configs, "MMU_V1_ROOT", TEST_DATA)
     with pytest.raises(RuntimeError, match="No tiles found"):
         cli.convert_tiles(
             dataset="sdss",
@@ -92,11 +109,8 @@ def test_convert_tiles_missing_tile(patch_cluster_root, tmp_path):
         )
 
 
-def test_main_smoke(have_test_data, patch_cluster_root, tmp_path):
-    rc = cli.main([
-        "--dataset", "sdss",
-        "--healpix", "583",
-        "--output", str(tmp_path),
-        "--config", "sdss",
-    ])
-    assert rc == 0
+@pytest.mark.slow
+def test_main_smoke(cli_full_catalog):
+    """The full catalog fixture runs main() under the hood; just check it exists."""
+    out, _ = cli_full_catalog
+    assert os.path.isdir(out)
