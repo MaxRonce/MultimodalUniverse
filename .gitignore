@@ -199,3 +199,4 @@ test_data/
 .venv/
 snakemake_config.local.yaml
 test_output/
+.snakemake/
