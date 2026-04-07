@@ -29,8 +29,8 @@ Live tracker for the raw → HATS port of v1 MMU. Every non-skipped dataset in `
   - [ ] Retrofit: filter TIC catalog by RA/Dec
   - [ ] COSMOS slice validation
 - [x] **allwise** (tabular) — 298 cols from IRSA parquet
-  - [ ] Retrofit: cone filter before building columns
-  - [ ] COSMOS slice validation
+  - [x] Retrofit: cone filter + healpix-k5 prefilter (skips 99.98% of shards)
+  - [x] COSMOS slice validation — 11,277 rows across 2 k5 pixels ✓
 - [x] **twomass** (tabular) — 2MASS PSC pipe-delimited CSV
   - [ ] Retrofit: cone filter
   - [ ] COSMOS slice validation
@@ -45,11 +45,19 @@ Live tracker for the raw → HATS port of v1 MMU. Every non-skipped dataset in `
 
 - [x] `mmu/cone.py` — shared cone-cut helper (haversine + bbox)
 - [x] `tests/test_cone.py` — 17 tests covering wraparound, poles, edge precision, vectorization
-- [ ] Retrofit 8 ported scripts with cone args
-- [ ] `snakemake_config.yaml` — add `cosmos` profile
-- [ ] Snakefile — thread `ra_center`/`dec_center`/`radius` through every rule
+- [x] Retrofit 8 ported scripts with cone args
+- [x] `snakemake_config.yaml` — `cosmos` profile (RA=150, Dec=+2, radius=0.5)
+- [x] Snakefile — threaded `ra_center`/`dec_center`/`radius` through `build_command()`
 - [x] `PORT_STATUS.md` — this file, created
-- [ ] Run all 8 ported datasets against COSMOS profile on cluster (Phase 0 exit criterion)
+- [~] Run all 8 ported datasets against COSMOS profile on cluster (in progress)
+  - [x] allwise ✓ 11,277 rows
+  - [~] twomass (in progress)
+  - [ ] galex
+  - [ ] sages
+  - [ ] sdss
+  - [ ] tess
+  - [ ] desi
+  - [ ] ssl_legacysurvey
 
 ## Phase 1 — Flagship datasets
 
@@ -71,12 +79,8 @@ Live tracker for the raw → HATS port of v1 MMU. Every non-skipped dataset in `
   - [ ] `build_parent_sample_hats.py`
   - [ ] Unit tests + local smoke
   - [ ] COSMOS cluster validation
-- [ ] **kepler** — timeseries, flat layout
-  - [ ] Raw layout inspection
-  - [ ] v1 schema review
-  - [ ] `build_parent_sample_hats.py`
-  - [ ] Unit tests + local smoke
-  - [ ] COSMOS cluster validation
+- [skip] **kepler** — raw Kepler FITS not on cluster mirror (only v1 HDF5 exists)
+  - Moved to skip list; requires raw MAST data mirror before port is possible
 - [ ] **manga** — BUNDLED, MOST COMPLEX: IFU cubes + spaxel coords + griz reconstructions
   - [ ] Raw layout inspection
   - [ ] v1 schema review
@@ -110,6 +114,7 @@ Live tracker for the raw → HATS port of v1 MMU. Every non-skipped dataset in `
 ## Skipped (out of scope)
 
 - [skip] **plasticc** — raw dir empty on cluster (`hats_configs.skip=True`)
+- [skip] **kepler** — raw FITS not mirrored on cluster; only v1-processed HDF5 exists at `spoc/SPOC/`
 - [skip] **cfa** — in v1 but deliberately excluded
 - [skip] **csp** — in v1 but deliberately excluded
 - [skip] **lamost** — in v1 but deliberately excluded
@@ -121,12 +126,12 @@ Live tracker for the raw → HATS port of v1 MMU. Every non-skipped dataset in `
 
 | Category | Count |
 |---|---|
-| Ported baseline (need cone retrofit) | 8 |
-| Phase 1 flagship (to port) | 5 |
+| Ported baseline (cone args added) | 8 |
+| Phase 1 flagship (to port) | 4 |
 | Phase 2 fill-in (to port) | 13 |
-| Skipped | 5 |
+| Skipped | 6 |
 | **v1 datasets total** | **31** |
-| **To ship in MMU v2 HATS** | **26** |
+| **To ship in MMU v2 HATS** | **25** |
 
 ## Verification criteria (per dataset)
 

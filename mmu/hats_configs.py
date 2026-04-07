@@ -60,7 +60,10 @@ DATASETS: dict[str, DatasetConfig] = {
     "plasticc":     DatasetConfig("plasticc", "timeseries", "PLAsTiCC",
                                   skip=True, skip_reason="raw dir empty on cluster"),
     "tess":         DatasetConfig("tess", "timeseries", "tess"),
-    "kepler":       DatasetConfig("kepler", "timeseries", "Kepler"),
+    "kepler":       DatasetConfig("kepler", "timeseries", "Kepler",
+                                  skip=True,
+                                  skip_reason="raw Kepler FITS not mirrored on cluster; "
+                                              "only v1-processed HDF5 exists at spoc/SPOC/"),
     "foundation":   DatasetConfig("foundation", "timeseries", "foundation"),
     "snls":         DatasetConfig("snls", "timeseries", "snls"),
     "ps1_sne_ia":   DatasetConfig("ps1_sne_ia", "timeseries", "ps1_sne_ia"),
