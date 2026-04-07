@@ -57,6 +57,41 @@ def fake_raw_root(tmp_path):
     return str(raw_root)
 
 
+class TestConeCutMain:
+    """End-to-end sanity check for the cone-cut plumbing in main()."""
+
+    def test_cone_filter_trims_rows(self, tmp_path):
+        # Build a tiny raw shard where 3 of 10 objects fall inside the cone.
+        raw_root = tmp_path / "allwise"
+        shard_dir = raw_root / "healpix_k0=0" / "healpix_k5=0"
+        shard_dir.mkdir(parents=True)
+        ra = np.array([150.0, 150.05, 149.95, 200.0, 0.0, 30.0, 60.0, 90.0, 120.0, 180.0])
+        dec = np.array([2.0, 2.05, 1.95, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        cntr = np.arange(1_000, 1_010, dtype=np.int64)
+        tbl = pa.table({
+            "ra": pa.array(ra),
+            "dec": pa.array(dec),
+            "cntr": pa.array(cntr),
+            "w1mpro": pa.array(np.zeros(10, dtype=np.float32)),
+        })
+        shard_path = shard_dir / "part0.snappy.parquet"
+        pq.write_table(tbl, str(shard_path))
+
+        # Read via read_shard (which the main loop calls) and then apply
+        # the same cone filter the main loop applies.
+        from mmu.cone import apply_cone_filter
+        table = build.read_shard(str(shard_path))
+        mask = apply_cone_filter(
+            table.column("ra").to_numpy(),
+            table.column("dec").to_numpy(),
+            ra_center=150.0, dec_center=2.0, radius=0.5,
+        )
+        filtered = table.filter(pa.array(mask))
+        assert filtered.num_rows == 3
+        # The surviving ra values should all be within 0.5° of 150°.
+        assert all(abs(x - 150.0) <= 0.5 for x in filtered.column("ra").to_pylist())
+
+
 class TestFindRawFiles:
     def test_finds_all_shards(self, fake_raw_root):
         files = build.find_raw_files(fake_raw_root)

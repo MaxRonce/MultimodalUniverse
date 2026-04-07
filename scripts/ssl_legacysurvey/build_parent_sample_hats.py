@@ -57,6 +57,7 @@ import h5py
 import numpy as np
 import pyarrow as pa
 
+from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import to_native_endian, write_hats
 
@@ -134,29 +135,54 @@ def _build_image_struct(image_array: np.ndarray, psfsize: np.ndarray) -> pa.Stru
     )
 
 
-def read_chunk(path: str, max_rows: int | None = None) -> pa.Table:
-    """Read one images_npix152_*.h5 file and return a PyArrow table."""
+def read_chunk(
+    path: str,
+    max_rows: int | None = None,
+    ra_center: float | None = None,
+    dec_center: float | None = None,
+    radius: float | None = None,
+) -> pa.Table | None:
+    """Read one images_npix152_*.h5 file and return a PyArrow table.
+
+    If a cone cut is active (``ra_center``/``dec_center``/``radius``), ra/dec
+    are read first and the image cube / per-band arrays are read only for
+    surviving indices. Returns ``None`` if no rows survive the cut.
+    """
     with h5py.File(path, "r") as f:
         n_total = f["ra"].shape[0]
         n = min(n_total, max_rows) if max_rows else n_total
 
         ra = np.asarray(f["ra"][:n], dtype=np.float64)
         dec = np.asarray(f["dec"][:n], dtype=np.float64)
-        # ssl_legacysurvey uses `inds` as the unique source ID.
-        inds = np.asarray(f["inds"][:n])
 
-        image_array = np.asarray(f["images"][:n], dtype=np.float32)
-        psfsize = np.asarray(f["psfsize"][:n], dtype=np.float32)
+        # Cone cut BEFORE the expensive image array read.
+        if ra_center is not None and dec_center is not None and radius is not None:
+            cone_mask = apply_cone_filter(ra, dec, ra_center, dec_center, radius)
+            keep = np.where(cone_mask)[0]
+            if keep.size == 0:
+                return None
+            ra = ra[keep]
+            dec = dec[keep]
+        else:
+            keep = np.arange(n)
+
+        # ssl_legacysurvey uses `inds` as the unique source ID.
+        inds = np.asarray(f["inds"][:n])[keep]
+
+        # h5py accepts ndarray indices (fancy indexing); use keep for all
+        # expensive arrays so we only load what the cone cut passed.
+        image_array = np.asarray(f["images"][:n], dtype=np.float32)[keep]
+        psfsize = np.asarray(f["psfsize"][:n], dtype=np.float32)[keep]
 
         scalars: dict[str, np.ndarray] = {}
         for c in SCALAR_COLUMNS:
             if c in f:
-                scalars[c] = np.asarray(f[c][:n], dtype=np.float32)
+                scalars[c] = np.asarray(f[c][:n], dtype=np.float32)[keep]
 
         per_band: dict[str, np.ndarray] = {}
         for c in PER_BAND_COLUMNS:
             if c in f:
-                per_band[c] = np.asarray(f[c][:n], dtype=np.float32)
+                per_band[c] = np.asarray(f[c][:n], dtype=np.float32)[keep]
 
     columns: dict[str, pa.Array] = {
         "ra": pa.array(to_native_endian(ra)),
@@ -183,6 +209,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-rows-per-file", type=int, default=None,
                         help="Cap rows read PER chunk (useful when chunks are very large).")
     parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--ra-center", type=float, default=None)
+    parser.add_argument("--dec-center", type=float, default=None)
+    parser.add_argument("--radius", type=float, default=None,
+                        help="Cone radius in degrees; requires --ra-center/--dec-center.")
     args = parser.parse_args(argv)
 
     files = find_raw_files(args.raw_root, max_files=args.max_files)
@@ -194,10 +224,22 @@ def main(argv: list[str] | None = None) -> int:
     tables: list[pa.Table] = []
     total = 0
     for i, p in enumerate(files, 1):
-        t = read_chunk(p, max_rows=args.max_rows_per_file)
+        t = read_chunk(
+            p,
+            max_rows=args.max_rows_per_file,
+            ra_center=args.ra_center,
+            dec_center=args.dec_center,
+            radius=args.radius,
+        )
+        if t is None:
+            continue
         tables.append(t)
         total += t.num_rows
         print(f"  [{i}/{len(files)}] {os.path.basename(p)}: {t.num_rows} objects")
+
+    if not tables:
+        print("ERROR: no rows survived the cone cut", file=sys.stderr)
+        return 1
 
     print(f"\nWriting HATS catalog: {total} rows from {len(tables)} chunks")
     catalog_dir = write_hats(

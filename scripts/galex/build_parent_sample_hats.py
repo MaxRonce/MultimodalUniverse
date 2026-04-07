@@ -22,6 +22,7 @@ import numpy as np
 import pyarrow as pa
 from astropy.table import Table
 
+from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import to_native_endian, write_hats
 
@@ -68,7 +69,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--ra-center", type=float, default=None)
+    parser.add_argument("--dec-center", type=float, default=None)
+    parser.add_argument("--radius", type=float, default=None,
+                        help="Cone radius in degrees; requires --ra-center/--dec-center.")
     args = parser.parse_args(argv)
+
+    cone_active = (
+        args.ra_center is not None
+        and args.dec_center is not None
+        and args.radius is not None
+    )
 
     files = find_raw_files(args.raw_root, max_files=args.max_files)
     if not files:
@@ -80,9 +91,20 @@ def main(argv: list[str] | None = None) -> int:
     total = 0
     for i, p in enumerate(files, 1):
         t = read_shard(p)
+        if cone_active:
+            ra = t.column("ra").to_numpy()
+            dec = t.column("dec").to_numpy()
+            mask = apply_cone_filter(ra, dec, args.ra_center, args.dec_center, args.radius)
+            t = t.filter(pa.array(mask))
+            if t.num_rows == 0:
+                continue
         tables.append(t)
         total += t.num_rows
         print(f"  [{i}/{len(files)}] {os.path.basename(p)}: {t.num_rows} rows")
+
+    if not tables:
+        print("ERROR: no rows survived the cone cut", file=sys.stderr)
+        return 1
 
     print(f"\nWriting HATS catalog: {total} rows from {len(tables)} shards")
     catalog_dir = write_hats(

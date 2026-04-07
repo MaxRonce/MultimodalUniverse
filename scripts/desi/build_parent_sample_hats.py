@@ -64,6 +64,7 @@ os.environ.setdefault("DESI_LOGLEVEL", "WARNING")
 import desispec.io
 from desispec import coaddition
 
+from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import to_native_endian, write_hats
 
@@ -339,6 +340,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Cap on number of (survey, program, healpix) groups to process.",
     )
     parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--ra-center", type=float, default=None,
+                        help="Cone-cut center RA in degrees; requires --dec-center/--radius.")
+    parser.add_argument("--dec-center", type=float, default=None,
+                        help="Cone-cut center Dec in degrees; requires --ra-center/--radius.")
+    parser.add_argument("--radius", type=float, default=None,
+                        help="Cone-cut radius in degrees; requires --ra-center/--dec-center.")
     args = parser.parse_args(argv)
 
     zcat_path = args.zcatalog or os.path.join(args.raw_root, "zall-pix-iron.fits")
@@ -352,6 +359,23 @@ def main(argv: list[str] | None = None) -> int:
     mask = selection_fn(catalog)
     catalog = catalog[mask]
     print(f"  {len(catalog)} rows after selection_fn")
+
+    if args.ra_center is not None and args.dec_center is not None and args.radius is not None:
+        cone_mask = apply_cone_filter(
+            np.asarray(catalog["TARGET_RA"]),
+            np.asarray(catalog["TARGET_DEC"]),
+            args.ra_center,
+            args.dec_center,
+            args.radius,
+        )
+        catalog = catalog[cone_mask]
+        print(
+            f"  {len(catalog)} rows after cone cut "
+            f"(ra={args.ra_center}, dec={args.dec_center}, radius={args.radius})"
+        )
+        if len(catalog) == 0:
+            print("  WARNING: cone cut left zero rows; no catalog to build.", file=sys.stderr)
+            return 1
 
     table = build_table(catalog, args.raw_root, max_groups=args.max_groups)
     print(f"\nWriting HATS catalog: {table.num_rows} rows")

@@ -21,6 +21,7 @@ import numpy as np
 import pyarrow as pa
 from astropy.table import Table
 
+from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import to_native_endian, write_hats
 
@@ -38,7 +39,13 @@ def selection_fn(t: Table) -> np.ndarray:
     return mask
 
 
-def read_table(raw_root: str, max_rows: int | None = None) -> pa.Table:
+def read_table(
+    raw_root: str,
+    max_rows: int | None = None,
+    ra_center: float | None = None,
+    dec_center: float | None = None,
+    radius: float | None = None,
+) -> pa.Table:
     """Read dr1-uv.fits, apply cuts, and return a PyArrow table normalized for HATS."""
     fits_path = os.path.join(raw_root, DEFAULT_INPUT)
     if not os.path.exists(fits_path):
@@ -48,6 +55,14 @@ def read_table(raw_root: str, max_rows: int | None = None) -> pa.Table:
     if max_rows is not None:
         t = t[:max_rows]
     t = t[selection_fn(t)]
+
+    if ra_center is not None and dec_center is not None and radius is not None:
+        cone_mask = apply_cone_filter(
+            np.asarray(t["RA"]),
+            np.asarray(t["DEC"]),
+            ra_center, dec_center, radius,
+        )
+        t = t[cone_mask]
 
     # Build PyArrow columns explicitly so we control the schema and casting.
     columns: dict[str, pa.Array] = {
@@ -83,10 +98,20 @@ def main(argv: list[str] | None = None) -> int:
              "the number of catalog rows read (since there's only one file).",
     )
     parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--ra-center", type=float, default=None)
+    parser.add_argument("--dec-center", type=float, default=None)
+    parser.add_argument("--radius", type=float, default=None,
+                        help="Cone radius in degrees; requires --ra-center/--dec-center.")
     args = parser.parse_args(argv)
 
     print(f"Reading {DEFAULT_INPUT} from {args.raw_root}")
-    table = read_table(args.raw_root, max_rows=args.max_files * 100_000 if args.max_files else None)
+    table = read_table(
+        args.raw_root,
+        max_rows=args.max_files * 100_000 if args.max_files else None,
+        ra_center=args.ra_center,
+        dec_center=args.dec_center,
+        radius=args.radius,
+    )
     print(f"After cuts: {table.num_rows} rows")
 
     catalog_dir = write_hats(

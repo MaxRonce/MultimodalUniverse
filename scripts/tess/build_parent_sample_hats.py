@@ -27,6 +27,7 @@ import numpy as np
 import pyarrow as pa
 from astropy.io import fits
 
+from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import to_native_endian, write_hats
 
@@ -52,9 +53,15 @@ def find_raw_files(raw_root: str, max_files: int | None = None) -> list[str]:
     return files
 
 
-def read_lightcurve(path: str) -> dict | None:
+def read_lightcurve(
+    path: str,
+    ra_center: float | None = None,
+    dec_center: float | None = None,
+    radius: float | None = None,
+) -> dict | None:
     """Read one TESS SPOC FFI lightcurve. Returns a per-row dict, or None on
-    failure (file is unreadable / missing the expected columns / no TIC in name).
+    failure (file is unreadable / missing the expected columns / no TIC in name /
+    outside the cone cut if one is active).
     """
     parsed = parse_filename(path)
     if parsed is None:
@@ -64,13 +71,22 @@ def read_lightcurve(path: str) -> dict | None:
     with fits.open(path, memmap=False) as hdul:
         if "LIGHTCURVE" not in [h.name for h in hdul]:
             return None
-        lc = hdul["LIGHTCURVE"].data
         hdr = hdul[1].header
         try:
             ra = float(hdr["ra_obj"])
             dec = float(hdr["dec_obj"])
         except KeyError:
             return None
+
+        # Cone cut BEFORE expensive array extraction.
+        if ra_center is not None and dec_center is not None and radius is not None:
+            if not apply_cone_filter(
+                np.array([ra]), np.array([dec]),
+                ra_center, dec_center, radius,
+            )[0]:
+                return None
+
+        lc = hdul["LIGHTCURVE"].data
 
         time = np.asarray(lc["TIME"], dtype=np.float64)
         flux = np.asarray(lc["SAP_FLUX"], dtype=np.float32)
@@ -128,6 +144,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--ra-center", type=float, default=None)
+    parser.add_argument("--dec-center", type=float, default=None)
+    parser.add_argument("--radius", type=float, default=None,
+                        help="Cone radius in degrees; requires --ra-center/--dec-center.")
     args = parser.parse_args(argv)
 
     files = find_raw_files(args.raw_root, max_files=args.max_files)
@@ -138,9 +158,13 @@ def main(argv: list[str] | None = None) -> int:
 
     rows: list[dict] = []
     for i, p in enumerate(files, 1):
-        row = read_lightcurve(p)
+        row = read_lightcurve(
+            p,
+            ra_center=args.ra_center,
+            dec_center=args.dec_center,
+            radius=args.radius,
+        )
         if row is None:
-            print(f"  [{i}/{len(files)}] {os.path.basename(p)}: skipped")
             continue
         rows.append(row)
         print(f"  [{i}/{len(files)}] TIC {row['tic_id']} s{row['sector']:04d}: {len(row['time'])} cadences")

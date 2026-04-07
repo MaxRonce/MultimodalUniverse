@@ -39,6 +39,7 @@ from astropy.io import fits
 from astropy.table import Table, join
 from tqdm import tqdm
 
+from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import np_to_pyarrow_list, write_hats
 
@@ -163,7 +164,13 @@ def _build_arrow_table(catalog: Table) -> pa.Table:
     return pa.table(columns)
 
 
-def find_plate_groups(raw_root: str, max_files: int | None = None) -> list[tuple[str, Table]]:
+def find_plate_groups(
+    raw_root: str,
+    max_files: int | None = None,
+    ra_center: float | None = None,
+    dec_center: float | None = None,
+    radius: float | None = None,
+) -> list[tuple[str, Table]]:
     """Read specObj, apply cuts, and return a list of (plate_path, sub_catalog) groups.
 
     Each entry is one plate FITS file with the catalog rows that belong to it.
@@ -177,6 +184,16 @@ def find_plate_groups(raw_root: str, max_files: int | None = None) -> list[tuple
     catalog["ra"] = catalog["PLUG_RA"]
     catalog["dec"] = catalog["PLUG_DEC"]
     catalog["object_id"] = catalog["SPECOBJID"]
+
+    if ra_center is not None and dec_center is not None and radius is not None:
+        cone_mask = apply_cone_filter(
+            np.asarray(catalog["ra"]),
+            np.asarray(catalog["dec"]),
+            ra_center, dec_center, radius,
+        )
+        catalog = catalog[cone_mask]
+        if len(catalog) == 0:
+            return []
 
     grouped = catalog.group_by(["SURVEY", "PLATE"])
     groups: list[tuple[str, Table]] = []
@@ -235,10 +252,20 @@ def main(argv: list[str] | None = None) -> int:
         default=8192,
         help="Max rows per HATS partition.",
     )
+    parser.add_argument("--ra-center", type=float, default=None)
+    parser.add_argument("--dec-center", type=float, default=None)
+    parser.add_argument("--radius", type=float, default=None,
+                        help="Cone radius in degrees; requires --ra-center/--dec-center.")
     args = parser.parse_args(argv)
 
     print(f"Reading specObj from {args.raw_root}")
-    groups = find_plate_groups(args.raw_root, max_files=args.max_files)
+    groups = find_plate_groups(
+        args.raw_root,
+        max_files=args.max_files,
+        ra_center=args.ra_center,
+        dec_center=args.dec_center,
+        radius=args.radius,
+    )
     if not groups:
         print(f"ERROR: no plate FITS files found under {args.raw_root}", file=sys.stderr)
         return 1

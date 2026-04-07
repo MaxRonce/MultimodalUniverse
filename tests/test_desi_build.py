@@ -58,6 +58,31 @@ def _make_catalog(n: int, seed: int = 0) -> Table:
     return Table(cols)
 
 
+class TestConeCutIntegration:
+    """Sanity check that the DESI cone cut (applied via mmu.cone in main())
+    trims the catalog correctly. We test the underlying filter directly
+    against DESI's TARGET_RA/TARGET_DEC columns."""
+
+    def test_cone_filter_against_target_ra_dec(self):
+        from mmu.cone import apply_cone_filter
+
+        cat = _make_catalog(10)
+        cat["TARGET_RA"] = np.array(
+            [150.0, 150.1, 149.9, 150.3, 200.0, 0.0, 150.0, 150.0, 150.0, 150.0]
+        )
+        cat["TARGET_DEC"] = np.array(
+            [2.0, 2.1, 1.9, 2.3, 30.0, 0.0, 2.0, -30.0, 45.0, 89.0]
+        )
+        mask = apply_cone_filter(
+            np.asarray(cat["TARGET_RA"]), np.asarray(cat["TARGET_DEC"]),
+            ra_center=150.0, dec_center=2.0, radius=0.5,
+        )
+        # Indices 0,1,2,3,6 are within 0.5 deg; rest are not.
+        assert mask.tolist() == [
+            True, True, True, True, False, False, True, False, False, False
+        ]
+
+
 class TestSelectionFn:
     def test_all_pass_baseline(self):
         cat = _make_catalog(10)

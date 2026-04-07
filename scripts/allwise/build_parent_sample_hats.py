@@ -25,9 +25,11 @@ import glob
 import os
 import sys
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import write_hats
 
@@ -87,7 +89,17 @@ def main(argv: list[str] | None = None) -> int:
         default=8192,
         help="Max rows per HATS partition.",
     )
+    parser.add_argument("--ra-center", type=float, default=None)
+    parser.add_argument("--dec-center", type=float, default=None)
+    parser.add_argument("--radius", type=float, default=None,
+                        help="Cone radius in degrees; requires --ra-center/--dec-center.")
     args = parser.parse_args(argv)
+
+    cone_active = (
+        args.ra_center is not None
+        and args.dec_center is not None
+        and args.radius is not None
+    )
 
     files = find_raw_files(args.raw_root, max_files=args.max_files)
     if not files:
@@ -99,9 +111,20 @@ def main(argv: list[str] | None = None) -> int:
     total_rows = 0
     for i, path in enumerate(files, 1):
         table = read_shard(path)
+        if cone_active:
+            ra = table.column("ra").to_numpy()
+            dec = table.column("dec").to_numpy()
+            mask = apply_cone_filter(ra, dec, args.ra_center, args.dec_center, args.radius)
+            table = table.filter(pa.array(mask))
+            if table.num_rows == 0:
+                continue
         tables.append(table)
         total_rows += table.num_rows
         print(f"  [{i}/{len(files)}] {os.path.basename(os.path.dirname(path))}: {table.num_rows} rows")
+
+    if not tables:
+        print("ERROR: no rows survived the cone cut", file=sys.stderr)
+        return 1
 
     print(f"\nWriting HATS catalog: {total_rows} rows from {len(tables)} shards")
     catalog_dir = write_hats(
