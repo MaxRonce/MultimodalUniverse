@@ -47,6 +47,9 @@ def _resolve(key, default=None):
 
 HATS_ROOT = _resolve("hats_root", MMU_V2_HATS_ROOT)
 MAX_FILES = _resolve("max_files", None)  # None = build everything
+RA_CENTER = _resolve("ra_center", None)
+DEC_CENTER = _resolve("dec_center", None)
+RADIUS = _resolve("radius", None)
 
 # Datasets that have a working raw -> HATS build script under scripts/{name}/
 PORTED = [
@@ -55,7 +58,7 @@ PORTED = [
     "twomass",   # raw IRSA gzipped CSV
     "sages",     # single FITS table (DR1 u/v photometry)
     "galex",     # multi-FITS GUVCat shards (latitude-partitioned)
-    "desi",      # raw DESI coadd FITS files (B/R/Z cameras, no desispec needed)
+    "desi",      # raw DESI coadd FITS files, merged via desispec.coadd_cameras
     "tess",      # raw TESS-SPOC FFI lightcurves (one file per TIC, sector)
     "ssl_legacysurvey",  # raw Stein-et-al DECaLS image chunks (h5 per 1M objects)
 ]
@@ -73,6 +76,12 @@ def build_command(dataset: str) -> str:
     ]
     if MAX_FILES is not None:
         parts += ["--max-files", str(MAX_FILES)]
+    if RA_CENTER is not None and DEC_CENTER is not None and RADIUS is not None:
+        parts += [
+            "--ra-center", str(RA_CENTER),
+            "--dec-center", str(DEC_CENTER),
+            "--radius", str(RADIUS),
+        ]
     return " ".join(parts)
 
 

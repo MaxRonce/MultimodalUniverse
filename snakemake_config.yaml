@@ -24,6 +24,21 @@ profiles:
     # Production: write to the shared polymathic ceph mount, build every shard.
     hats_root: /mnt/ceph/users/polymathic/MultimodalUniverse_v2_hats
     max_files: null
+    ra_center: null
+    dec_center: null
+    radius: null
+
+  cosmos:
+    # 1° COSMOS-field test slice. Every build script filters its input catalog
+    # (or file list) to (ra, dec) within 0.5° of (150, +2) before processing.
+    # Finishes in seconds to minutes per dataset instead of the hours/days a
+    # full build takes. Used for end-to-end validation of the schema + pipeline
+    # for every MMU dataset against a consistent multi-survey sky region.
+    hats_root: /mnt/ceph/users/polymathic/MultimodalUniverse_v2_hats_cosmos
+    max_files: null
+    ra_center: 150.0
+    dec_center: 2.0
+    radius: 0.5
 
   test:
     # Smoke test: one shard per dataset, write under the repo so it's easy to
@@ -31,3 +46,6 @@ profiles:
     # (i.e. you need to be on the cluster, or have local mirrors).
     hats_root: ./test_output/hats
     max_files: 1
+    ra_center: null
+    dec_center: null
+    radius: null
