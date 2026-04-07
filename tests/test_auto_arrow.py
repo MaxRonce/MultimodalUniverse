@@ -220,6 +220,42 @@ class TestRADecAliases:
             auto_arrow_table_from_hdf5(h5)
 
 
+class TestSpectrum3DSkip:
+    """DESI has spectrum_lsf with shape (N, 11, 7781) — should be skipped, not crash."""
+
+    @pytest.fixture
+    def h5(self, coords, n):
+        rng = np.random.default_rng(7)
+        spec_len = 30
+        n_lsf = 11
+        cols = {
+            **coords,
+            "spectrum_flux": rng.normal(0, 1, (n, spec_len)).astype(np.float32),
+            "spectrum_ivar": rng.uniform(0.1, 1, (n, spec_len)).astype(np.float32),
+            "spectrum_lambda": np.tile(np.linspace(3800, 9200, spec_len), (n, 1)).astype(np.float32),
+            "spectrum_lsf_sigma": np.ones((n, spec_len), dtype=np.float32),
+            "spectrum_mask": np.zeros((n, spec_len), dtype=bool),
+            # 3D resolution matrix - should be silently skipped
+            "spectrum_lsf": rng.normal(0, 1, (n, n_lsf, spec_len)).astype(np.float32),
+        }
+        return make_hdf5(cols)
+
+    def test_does_not_crash(self, h5):
+        table = auto_arrow_table_from_hdf5(h5)
+        assert "spectrum" in table.schema.names
+
+    def test_3d_field_not_in_struct(self, h5):
+        table = auto_arrow_table_from_hdf5(h5)
+        spec_type = table.schema.field("spectrum").type
+        names = [spec_type.field(i).name for i in range(spec_type.num_fields)]
+        assert "lsf" not in names  # the 3D one
+        assert "lsf_sigma" in names  # the 2D one
+
+    def test_3d_not_at_top_level_either(self, h5):
+        table = auto_arrow_table_from_hdf5(h5)
+        assert "spectrum_lsf" not in table.schema.names
+
+
 class TestStringColumns:
     def test_byte_strings_decoded(self, n, coords):
         h5 = make_hdf5({

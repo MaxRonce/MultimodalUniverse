@@ -241,15 +241,22 @@ def auto_arrow_table_from_hdf5(
     if spectrum_struct and spectrum_keys_present:
         struct_arrays = []
         struct_names = []
+        skipped_3d = []
         for k in spectrum_keys_present:
             arr = np.asarray(h5_file[k][sl])
-            if arr.ndim == 2:
+            if arr.ndim == 1:
+                struct_arrays.append(pa.array(arr))
+            elif arr.ndim == 2:
                 struct_arrays.append(np_to_pyarrow_list(arr))
             else:
-                struct_arrays.append(pa.array(arr))
-            # Strip "spectrum_" prefix for the struct field name
+                # 3D+ (e.g., DESI spectrum_lsf has shape (N, 11, 7781)) — skip from struct
+                skipped_3d.append(k)
+                continue
             struct_names.append(k.replace("spectrum_", ""))
-        columns["spectrum"] = pa.StructArray.from_arrays(struct_arrays, names=struct_names)
+        if struct_arrays:
+            columns["spectrum"] = pa.StructArray.from_arrays(struct_arrays, names=struct_names)
+        # Mark all originals as handled (including skipped 3D ones, so they don't get
+        # re-added at the top level — they'd fail there too)
         skip_columns.update(spectrum_keys_present)
 
     # Image columns: flatten + add shape metadata
