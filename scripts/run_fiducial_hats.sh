@@ -12,6 +12,13 @@ HEALPIX="${1:-1177}"
 N_ROWS="${2:-2000}"
 OUTPUT="/mnt/ceph/users/polymathic/MultimodalUniverse_v2_hats/healpix_${HEALPIX}"
 
+# Locate venv python (must be set up before running this script)
+PYTHON="${PYTHON:-$HOME/mmu_hats_demo/.venv/bin/python}"
+if [ ! -x "$PYTHON" ]; then
+    echo "ERROR: $PYTHON not found. Set PYTHON env var or create venv at ~/mmu_hats_demo/.venv"
+    exit 1
+fi
+
 mkdir -p "$OUTPUT"
 
 # Datasets known to have data at healpix=1177 (verified 2026-04-07)
@@ -48,7 +55,7 @@ for entry in "${DATASETS[@]}"; do
     echo "" | tee -a "$LOG"
     echo "[$(date +%H:%M:%S)] $ds/$cfg ..." | tee -a "$LOG"
 
-    if python -m mmu.cli.build_hats \
+    if "$PYTHON" -m mmu.cli.build_hats \
         --dataset "$ds" \
         --config "$cfg" \
         --healpix "$HEALPIX" \
