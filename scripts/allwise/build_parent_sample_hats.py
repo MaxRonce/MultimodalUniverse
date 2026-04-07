@@ -23,8 +23,10 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
 import sys
 
+import healpy as hp
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -34,13 +36,45 @@ from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import write_hats
 
 
+# IRSA's AllWISE bulk download is partitioned by healpix at two levels,
+# visible in the file path: ``healpix_k0={pix}/healpix_k5={pix}/part*.parquet``.
+# We use the k5 (nside=32) pixel to skip files whose footprint doesn't
+# intersect the cone.
+ALLWISE_K5_NSIDE = 32
+ALLWISE_PATH_K5_RE = re.compile(r"healpix_k5=(\d+)")
+
+
 CATALOG_NAME = "allwise"
 
 
-def find_raw_files(raw_root: str, max_files: int | None = None) -> list[str]:
-    """Find AllWISE raw parquet shards under ``raw_root``."""
+def find_raw_files(
+    raw_root: str,
+    max_files: int | None = None,
+    ra_center: float | None = None,
+    dec_center: float | None = None,
+    radius: float | None = None,
+) -> list[str]:
+    """Find AllWISE raw parquet shards under ``raw_root``.
+
+    If a cone cut is active, use ``healpy.query_disc`` to compute the set of
+    ``nside=32`` pixels touching the cone, and skip any shard whose
+    ``healpix_k5=N`` directory name doesn't fall in that set. A 1° cone
+    typically reduces 12288 shards to ~2-4.
+    """
     pattern = os.path.join(raw_root, "healpix_k0=*", "healpix_k5=*", "part*.parquet")
     files = sorted(glob.glob(pattern))
+
+    if ra_center is not None and dec_center is not None and radius is not None:
+        vec = hp.ang2vec(ra_center, dec_center, lonlat=True)
+        keep = set(hp.query_disc(
+            ALLWISE_K5_NSIDE, vec, np.deg2rad(radius),
+            nest=True, inclusive=True,
+        ).tolist())
+        files = [
+            f for f in files
+            if (m := ALLWISE_PATH_K5_RE.search(f)) and int(m.group(1)) in keep
+        ]
+
     if max_files is not None:
         files = files[:max_files]
     return files
@@ -101,7 +135,13 @@ def main(argv: list[str] | None = None) -> int:
         and args.radius is not None
     )
 
-    files = find_raw_files(args.raw_root, max_files=args.max_files)
+    files = find_raw_files(
+        args.raw_root,
+        max_files=args.max_files,
+        ra_center=args.ra_center,
+        dec_center=args.dec_center,
+        radius=args.radius,
+    )
     if not files:
         print(f"ERROR: no raw parquet files under {args.raw_root}", file=sys.stderr)
         return 1

@@ -57,6 +57,38 @@ def fake_raw_root(tmp_path):
     return str(raw_root)
 
 
+class TestHealpixPrefilter:
+    """find_raw_files should restrict returned shards to the set of k5 pixels
+    touching the cone, using healpy.query_disc."""
+
+    def _make_dataset(self, tmp_path, k5_pixels):
+        """Create empty parquet files at healpix_k5={pix} for each given pixel."""
+        raw_root = tmp_path / "allwise"
+        for pix in k5_pixels:
+            # k0 is nside=1 parent of each k5 pixel. For the test we just pick one.
+            d = raw_root / "healpix_k0=6" / f"healpix_k5={pix}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "part0.snappy.parquet").write_bytes(b"")
+        return str(raw_root)
+
+    def test_cone_filters_to_cosmos_pixels(self, tmp_path):
+        # Create pixel dirs including the two that COSMOS (150, 2) should hit
+        # plus some decoys.
+        raw_root = self._make_dataset(tmp_path, [6811, 6814, 0, 100, 9999])
+        files = build.find_raw_files(
+            raw_root, ra_center=150.0, dec_center=2.0, radius=0.5
+        )
+        pixels = sorted(
+            int(build.ALLWISE_PATH_K5_RE.search(f).group(1)) for f in files
+        )
+        assert pixels == [6811, 6814]
+
+    def test_no_cone_returns_all(self, tmp_path):
+        raw_root = self._make_dataset(tmp_path, [100, 200, 6811])
+        files = build.find_raw_files(raw_root)
+        assert len(files) == 3
+
+
 class TestConeCutMain:
     """End-to-end sanity check for the cone-cut plumbing in main()."""
 
