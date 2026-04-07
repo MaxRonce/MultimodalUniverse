@@ -127,17 +127,16 @@ def verify_catalog_against_hdf5(
         dec_key = _resolve_alias(keys, DEC_ALIASES)
         obj_key = _resolve_alias(keys, OBJECT_ID_ALIASES)
 
-        # Row count: if n_rows_used not given, infer from catalog (for slices)
+        # Row count: if n_rows_used is given, the source is sliced to that many rows.
+        # If not given, the catalog must contain ALL source rows — partial conversions
+        # without an explicit n_rows_used are a verification failure.
         n_src_total = f[ra_key].shape[0]
-        if n_rows_used is None and hats_table.num_rows < n_src_total:
-            # Treat the catalog row count as authoritative for the slice
-            n_rows_used = hats_table.num_rows
         n_src = min(n_src_total, n_rows_used) if n_rows_used else n_src_total
-        report.add(
-            "row count matches",
-            hats_table.num_rows == n_src,
-            f"hats={hats_table.num_rows}, hdf5={n_src}",
-        )
+        row_count_ok = hats_table.num_rows == n_src
+        detail = f"hats={hats_table.num_rows}, hdf5={n_src}"
+        if not row_count_ok and n_rows_used is None and hats_table.num_rows < n_src_total:
+            detail += " (pass --n-rows to verify a deliberate slice)"
+        report.add("row count matches", row_count_ok, detail)
 
         # Required columns present
         has_ra = "ra" in hats_table.schema.names
@@ -148,16 +147,21 @@ def verify_catalog_against_hdf5(
         if obj_key:
             report.add("object_id column present", has_obj)
 
-        # RA/Dec value match (sorted, since HATS may reorder)
+        # RA/Dec value match: sort jointly (lexicographic on (ra, dec)) so that
+        # scrambled row associations are caught.
         if has_ra and has_dec:
-            src_ra = np.sort(f[ra_key][:n_src])
-            src_dec = np.sort(f[dec_key][:n_src])
-            hats_ra = np.sort(hats_table.column("ra").to_numpy())
-            hats_dec = np.sort(hats_table.column("dec").to_numpy())
-            ra_match = np.allclose(src_ra, hats_ra, equal_nan=True)
-            dec_match = np.allclose(src_dec, hats_dec, equal_nan=True)
-            report.add("ra values match (sorted)", ra_match)
-            report.add("dec values match (sorted)", dec_match)
+            src_ra = np.asarray(f[ra_key][:n_src])
+            src_dec = np.asarray(f[dec_key][:n_src])
+            hats_ra = hats_table.column("ra").to_numpy()
+            hats_dec = hats_table.column("dec").to_numpy()
+            src_order = np.lexsort((src_dec, src_ra))
+            hats_order = np.lexsort((hats_dec, hats_ra))
+            radec_match = (
+                len(src_ra) == len(hats_ra)
+                and np.allclose(src_ra[src_order], hats_ra[hats_order], equal_nan=True)
+                and np.allclose(src_dec[src_order], hats_dec[hats_order], equal_nan=True)
+            )
+            report.add("ra/dec rows match (joint-sorted)", radec_match)
 
         # RA/Dec ranges sane
         if has_ra:

@@ -1684,6 +1684,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "pyarrow" },
+    { name = "torch" },
     { name = "tqdm" },
     { name = "universal-pathlib" },
 ]
@@ -1693,7 +1694,6 @@ bench = [
     { name = "lightning" },
     { name = "scikit-learn" },
     { name = "spender" },
-    { name = "torch" },
     { name = "torchvision" },
 ]
 dev = [
@@ -1723,7 +1723,7 @@ requires-dist = [
     { name = "scikit-learn", marker = "extra == 'bench'" },
     { name = "snakemake", marker = "extra == 'dev'" },
     { name = "spender", marker = "extra == 'bench'" },
-    { name = "torch", marker = "extra == 'bench'" },
+    { name = "torch" },
     { name = "torchvision", marker = "extra == 'bench'" },
     { name = "tqdm" },
     { name = "universal-pathlib" },

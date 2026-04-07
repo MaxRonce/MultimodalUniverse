@@ -5,9 +5,10 @@ import os
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
-import torch
 
-from mmu.data import CrossMatchedHATSDataset, HATSDataset
+torch = pytest.importorskip("torch")
+
+from mmu.data import CrossMatchedHATSDataset, HATSDataset  # noqa: E402
 
 TEST_DATA = os.path.join(os.path.dirname(__file__), "..", "test_data")
 HATS_CATALOG = os.path.join(TEST_DATA, "hats_from_script", "sdss_test", "sdss_test")
@@ -179,3 +180,26 @@ class TestCrossMatch:
         """Self cross-match: every match should have ~zero separation."""
         dists = self_crossmatch.df["_dist_arcsec"].to_numpy()
         assert (dists < 1e-6).all()
+
+    def test_filter_then_crossmatch_uses_filter(self, ds_multi):
+        """Regression for review 2.1: filter_by_cone applied before crossmatch
+        must actually shrink the cross-match input, not silently use the
+        unfiltered catalog. Note that hats `filter_by_cone` is pixel-level
+        (so `len()` doesn't shrink to the cone), but lsdb `cone_search` IS
+        row-level, so the cross-match output should reflect the cone."""
+        full = ds_multi.crossmatch(ds_multi)
+        full_count = full.matched_count
+        assert full_count == len(ds_multi), "test setup: full self-xmatch matches all rows"
+
+        # 5-arcsec cone around the first object should leave only that object.
+        first = ds_multi[0]
+        ra0, dec0 = float(first["ra"]), float(first["dec"])
+        filtered = ds_multi.filter_by_cone(ra0, dec0, 5.0)
+        filtered_xm = filtered.crossmatch(filtered)
+
+        assert filtered_xm.matched_count < full_count, (
+            "filter_by_cone was silently ignored by crossmatch — "
+            "lsdb_catalog must be rebuilt under filters"
+        )
+        # A 5-arcsec cone around a real source should match exactly that one source.
+        assert filtered_xm.matched_count == 1

@@ -33,12 +33,13 @@ dependencies = [
     "healpy",
     "dask[distributed]",
     "universal_pathlib",
+    # PyTorch loader (mmu.data depends on torch at module-import time)
+    "torch",
 ]
 dynamic = ["version"]
 
 [project.optional-dependencies]
 bench = [
-    "torch",
     "torchvision",
     "lightning",
     "scikit-learn",

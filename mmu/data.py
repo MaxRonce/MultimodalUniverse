@@ -5,6 +5,7 @@ with lazy column loading, spatial filtering, and cross-matching.
 """
 
 import typing as T
+from dataclasses import dataclass
 from functools import cached_property
 
 import hats
@@ -16,16 +17,46 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 
+@dataclass(frozen=True)
+class _ConeFilter:
+    ra: float
+    dec: float
+    radius_arcsec: float
+
+    def apply_hats(self, cat: "hats.catalog.Catalog") -> "hats.catalog.Catalog":
+        return cat.filter_by_cone(self.ra, self.dec, self.radius_arcsec)
+
+    def apply_lsdb(self, cat: "lsdb.Catalog") -> "lsdb.Catalog":
+        return cat.cone_search(self.ra, self.dec, self.radius_arcsec)
+
+
+@dataclass(frozen=True)
+class _BoxFilter:
+    ra_range: tuple[float, float]
+    dec_range: tuple[float, float]
+
+    def apply_hats(self, cat: "hats.catalog.Catalog") -> "hats.catalog.Catalog":
+        return cat.filter_by_box(self.ra_range, self.dec_range)
+
+    def apply_lsdb(self, cat: "lsdb.Catalog") -> "lsdb.Catalog":
+        return cat.box_search(ra=self.ra_range, dec=self.dec_range)
+
+
 class HATSDataset(Dataset):
     """PyTorch Dataset backed by a HATS catalog.
 
     Reads only the requested columns from Parquet files, caching loaded
-    pixels in memory. Supports spatial filtering via cone/box/MOC.
+    pixels in memory. Supports spatial filtering via cone/box and cross-matching
+    via LSDB. All filter operations return a new HATSDataset that defers the
+    same filter to both the underlying ``hats`` and ``lsdb`` views, so e.g.
+    ``ds.filter_by_cone(...).crossmatch(other)`` matches against the cone, not
+    the unfiltered catalog.
 
     Args:
         catalog_path: Path to a HATS catalog directory.
         columns: Columns to load. None means all columns.
         catalog: Pre-loaded hats.Catalog (alternative to catalog_path).
+        _filters: Internal — list of filter operations to apply lazily.
     """
 
     def __init__(
@@ -33,16 +64,20 @@ class HATSDataset(Dataset):
         catalog_path: str | None = None,
         columns: list[str] | None = None,
         catalog: hats.catalog.Catalog | None = None,
+        _filters: tuple = (),
     ):
         if catalog is not None:
             self.catalog = catalog
+            self._catalog_base_dir = str(catalog.catalog_base_dir)
         elif catalog_path is not None:
             self.catalog = hats.read_hats(catalog_path)
+            self._catalog_base_dir = catalog_path
         else:
             raise ValueError("Provide either catalog_path or catalog")
 
         self.columns = columns
-        self._pixel_cache: dict[tuple[int, int], pa.Table] = {}
+        self._filters = tuple(_filters)
+        self._pixel_cache: dict[int, pa.Table] = {}
 
     @cached_property
     def _pixel_paths(self) -> list:
@@ -79,14 +114,26 @@ class HATSDataset(Dataset):
         return _arrow_row_to_torch(row)
 
     def filter_by_cone(self, ra: float, dec: float, radius_arcsec: float) -> "HATSDataset":
-        filtered = self.catalog.filter_by_cone(ra, dec, radius_arcsec)
-        return HATSDataset(columns=self.columns, catalog=filtered)
+        f = _ConeFilter(ra, dec, radius_arcsec)
+        new = HATSDataset(
+            columns=self.columns,
+            catalog=f.apply_hats(self.catalog),
+            _filters=self._filters + (f,),
+        )
+        new._catalog_base_dir = self._catalog_base_dir
+        return new
 
     def filter_by_box(
         self, ra: tuple[float, float], dec: tuple[float, float]
     ) -> "HATSDataset":
-        filtered = self.catalog.filter_by_box(ra, dec)
-        return HATSDataset(columns=self.columns, catalog=filtered)
+        f = _BoxFilter(ra, dec)
+        new = HATSDataset(
+            columns=self.columns,
+            catalog=f.apply_hats(self.catalog),
+            _filters=self._filters + (f,),
+        )
+        new._catalog_base_dir = self._catalog_base_dir
+        return new
 
     def clear_cache(self):
         self._pixel_cache.clear()
@@ -97,30 +144,32 @@ class HATSDataset(Dataset):
 
     @cached_property
     def lsdb_catalog(self) -> lsdb.Catalog:
-        """Return an LSDB catalog for cross-matching and spatial queries."""
-        return lsdb.read_hats(self.catalog.catalog_base_dir)
+        """Return an LSDB catalog with this dataset's column projection AND any
+        spatial filters applied. Reads the same on-disk catalog the hats view
+        was built from."""
+        cat = lsdb.read_hats(self._catalog_base_dir, columns=self.columns)
+        for f in self._filters:
+            cat = f.apply_lsdb(cat)
+        return cat
 
     def crossmatch(
         self,
         other: "HATSDataset",
         radius_arcsec: float = 1.0,
         n_neighbors: int = 1,
-        columns_left: list[str] | None = None,
-        columns_right: list[str] | None = None,
         suffixes: tuple[str, str] = ("_left", "_right"),
     ) -> "CrossMatchedHATSDataset":
         """Cross-match this catalog against another using LSDB.
+
+        Honors ``self.columns`` / ``other.columns`` (passed through to
+        ``lsdb.read_hats(columns=...)``) and any spatial filters previously
+        applied via ``filter_by_cone`` / ``filter_by_box``.
 
         Args:
             other: The other HATSDataset to match against.
             radius_arcsec: Maximum match radius in arcseconds.
             n_neighbors: Number of nearest neighbors to find.
-            columns_left: Columns to keep from this catalog.
-            columns_right: Columns to keep from the other catalog.
-            suffixes: Suffixes for overlapping column names.
-
-        Returns:
-            A CrossMatchedHATSDataset containing matched pairs.
+            suffixes: Suffixes appended to overlapping column names.
         """
         result = self.lsdb_catalog.crossmatch(
             other.lsdb_catalog,
@@ -129,10 +178,7 @@ class HATSDataset(Dataset):
             suffixes=suffixes,
         )
         df = result.compute()
-        return CrossMatchedHATSDataset(
-            df, columns_left=columns_left, columns_right=columns_right,
-            suffixes=suffixes,
-        )
+        return CrossMatchedHATSDataset(df, suffixes=suffixes)
 
 
 class CrossMatchedHATSDataset(Dataset):
@@ -145,14 +191,10 @@ class CrossMatchedHATSDataset(Dataset):
     def __init__(
         self,
         df,
-        columns_left: list[str] | None = None,
-        columns_right: list[str] | None = None,
         suffixes: tuple[str, str] = ("_left", "_right"),
     ):
         self.df = df.reset_index(drop=True)
         self.suffixes = suffixes
-        self._columns_left = columns_left
-        self._columns_right = columns_right
 
     def __len__(self) -> int:
         return len(self.df)

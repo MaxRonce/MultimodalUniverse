@@ -92,12 +92,10 @@ class TestVerification:
         row_check = next(c for c in report.checks if c[0] == "row count matches")
         assert row_check[1] is True
 
-    def test_ra_dec_value_check(self, fake_sdss_catalog):
+    def test_radec_joint_check_passes(self, fake_sdss_catalog):
         report = verify_catalog_against_hdf5(fake_sdss_catalog, SDSS_HDF5)
-        ra_check = next(c for c in report.checks if "ra values match" in c[0])
-        dec_check = next(c for c in report.checks if "dec values match" in c[0])
-        assert ra_check[1] is True
-        assert dec_check[1] is True
+        check = next(c for c in report.checks if "ra/dec rows match" in c[0])
+        assert check[1] is True
 
     def test_spectrum_struct_check(self, fake_sdss_catalog):
         report = verify_catalog_against_hdf5(fake_sdss_catalog, SDSS_HDF5)
@@ -119,6 +117,58 @@ class TestVerification:
         summary = report.summary()
         assert "Verification of" in summary
         assert "Result:" in summary
+
+
+class TestVerificationFailureModes:
+    """Verify that the verifier actually FAILS on the things it claims to check."""
+
+    def test_row_count_loss_fails(self, have_sdss_test_data, tmp_path):
+        """A catalog missing rows from a non-sliced source should fail row count."""
+        with h5py.File(SDSS_HDF5, "r") as f:
+            full = auto_arrow_table_from_hdf5(f)
+        # Drop half the rows
+        truncated = full.slice(0, full.num_rows // 2)
+        out = tmp_path / "trunc"
+        _make_fake_hats_catalog(str(out), truncated)
+        report = verify_catalog_against_hdf5(str(out), SDSS_HDF5)
+        row_check = next(c for c in report.checks if c[0] == "row count matches")
+        assert row_check[1] is False
+        assert not report.ok
+
+    def test_radec_scrambled_fails(self, have_sdss_test_data, tmp_path):
+        """If RA values are right but Dec is scrambled, joint check must fail."""
+        with h5py.File(SDSS_HDF5, "r") as f:
+            full = auto_arrow_table_from_hdf5(f)
+        # Permute dec independently of ra
+        rng = np.random.default_rng(0)
+        dec = full.column("dec").to_numpy().copy()
+        rng.shuffle(dec)
+        scrambled = full.set_column(
+            full.schema.get_field_index("dec"),
+            "dec",
+            pa.array(dec),
+        )
+        out = tmp_path / "scrambled"
+        _make_fake_hats_catalog(str(out), scrambled)
+        report = verify_catalog_against_hdf5(str(out), SDSS_HDF5)
+        check = next(c for c in report.checks if "ra/dec rows match" in c[0])
+        assert check[1] is False, (
+            "joint sort check should detect scrambled dec values"
+        )
+
+    def test_explicit_n_rows_pass(self, fake_sdss_catalog_n10):
+        """A 10-row slice with explicit n_rows_used=10 should pass."""
+        report = verify_catalog_against_hdf5(
+            fake_sdss_catalog_n10, SDSS_HDF5, n_rows_used=10
+        )
+        row_check = next(c for c in report.checks if c[0] == "row count matches")
+        assert row_check[1] is True
+
+    def test_implicit_slice_no_longer_passes(self, fake_sdss_catalog_n10):
+        """A 10-row slice WITHOUT explicit n_rows_used should now fail (was vacuous)."""
+        report = verify_catalog_against_hdf5(fake_sdss_catalog_n10, SDSS_HDF5)
+        row_check = next(c for c in report.checks if c[0] == "row count matches")
+        assert row_check[1] is False
 
 
 class TestGroupedHDF5Verify:
