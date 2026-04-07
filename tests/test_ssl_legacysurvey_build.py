@@ -68,6 +68,7 @@ class TestReadChunk:
         assert "dec" in names
         assert "object_id" in names
         assert "image" in names
+        assert "psf_fwhm" in names
         assert "ebv" in names
         assert "z_spec" in names
         # per-band flux unrolled
@@ -87,33 +88,33 @@ class TestReadChunk:
         table = build.read_chunk(files[0])
         assert table.schema.field("object_id").type == pa.string()
 
-    def test_image_struct_fields(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_chunk(files[0])
-        spec = table.schema.field("image").type
-        names = [spec.field(i).name for i in range(spec.num_fields)]
-        assert set(names) == {"band", "flux", "psf_fwhm", "scale"}
-
-    def test_image_band_names(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_chunk(files[0])
-        first = table.column("image")[0].as_py()
-        assert first["band"] == ["DES-G", "DES-R", "DES-Z"]
-
-    def test_image_shape_from_schema(self, fake_raw_root):
-        """The Array2DExtensionType storage should preserve (152, 152) shape info."""
+    def test_image_is_fixed_shape_tensor(self, fake_raw_root):
+        """Image column must be a (3, 152, 152) float32 fixed-shape tensor with
+        the shape preserved in the parquet schema metadata."""
         files = build.find_raw_files(fake_raw_root)
         table = build.read_chunk(files[0])
         image_type = table.schema.field("image").type
-        flux_field = image_type.field("flux").type
-        # flux is list<Array2DExtensionType>; check the value type.
-        assert pa.types.is_list(flux_field)
-        inner = flux_field.value_type
-        # Extension types expose .shape on the Array2DExtensionType instance.
-        assert hasattr(inner, "shape"), (
-            "flux value type should be an Array2DExtensionType with .shape"
-        )
-        assert tuple(inner.shape) == (build.IMAGE_SIZE, build.IMAGE_SIZE)
+        assert isinstance(image_type, pa.FixedShapeTensorType)
+        assert tuple(image_type.shape) == (build.N_BANDS, build.IMAGE_SIZE, build.IMAGE_SIZE)
+        assert image_type.value_type == pa.float32()
+
+    def test_image_roundtrip_to_numpy(self, fake_raw_root):
+        """Reading image back should give a (3, 152, 152) numpy array per row."""
+        files = build.find_raw_files(fake_raw_root)
+        table = build.read_chunk(files[0])
+        # ChunkedArray -> combine chunks -> FixedShapeTensorArray -> numpy
+        chunks = table.column("image").chunks
+        assert len(chunks) == 1
+        arr = chunks[0].to_numpy_ndarray()
+        assert arr.shape == (5, build.N_BANDS, build.IMAGE_SIZE, build.IMAGE_SIZE)
+        assert arr.dtype == np.float32
+
+    def test_psf_fwhm_is_tensor(self, fake_raw_root):
+        files = build.find_raw_files(fake_raw_root)
+        table = build.read_chunk(files[0])
+        psf_type = table.schema.field("psf_fwhm").type
+        assert isinstance(psf_type, pa.FixedShapeTensorType)
+        assert tuple(psf_type.shape) == (build.N_BANDS,)
 
     def test_max_rows_per_file(self, fake_raw_root):
         files = build.find_raw_files(fake_raw_root)
