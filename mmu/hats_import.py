@@ -30,6 +30,18 @@ from hats_import.pipeline import pipeline_with_client
 LOGGER = logging.getLogger(__name__)
 
 
+def to_native_endian(array: np.ndarray) -> np.ndarray:
+    """Return a copy of ``array`` in the machine's native byte order.
+
+    Astropy reads FITS files in the file's byte order (usually big-endian) but
+    PyArrow refuses to ingest byte-swapped arrays — convert before handing to
+    ``pa.array``.
+    """
+    if array.dtype.byteorder in ("=", "|"):
+        return array
+    return array.byteswap().view(array.dtype.newbyteorder("="))
+
+
 def np_to_pyarrow_list(array: np.ndarray) -> pa.Array:
     """Convert a 1D numpy array to a flat PyArrow array, or a 2D numpy array
     (shape ``(n_rows, length)``) to a PyArrow ListArray with one ``length``-long

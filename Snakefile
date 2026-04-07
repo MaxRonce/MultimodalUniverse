@@ -50,9 +50,13 @@ MAX_FILES = _resolve("max_files", None)  # None = build everything
 
 # Datasets that have a working raw -> HATS build script under scripts/{name}/
 PORTED = [
-    "sdss",      # scripts/sdss/build_parent_sample_hats.py (raw FITS plate files)
-    "allwise",   # scripts/allwise/build_parent_sample_hats.py (raw IRSA parquet)
-    "twomass",   # scripts/twomass/build_parent_sample_hats.py (raw IRSA gzipped CSV)
+    "sdss",      # raw FITS plate files
+    "allwise",   # raw IRSA parquet
+    "twomass",   # raw IRSA gzipped CSV
+    "sages",     # single FITS table (DR1 u/v photometry)
+    "galex",     # multi-FITS GUVCat shards (latitude-partitioned)
+    "desi",      # raw DESI coadd FITS files (B/R/Z cameras, no desispec needed)
+    "tess",      # raw TESS-SPOC FFI lightcurves (one file per TIC, sector)
 ]
 
 
@@ -99,5 +103,41 @@ rule build_twomass:
         marker = catalog_marker("twomass"),
     params:
         cmd = build_command("twomass"),
+    shell:
+        "{params.cmd}"
+
+
+rule build_sages:
+    output:
+        marker = catalog_marker("sages"),
+    params:
+        cmd = build_command("sages"),
+    shell:
+        "{params.cmd}"
+
+
+rule build_galex:
+    output:
+        marker = catalog_marker("galex"),
+    params:
+        cmd = build_command("galex"),
+    shell:
+        "{params.cmd}"
+
+
+rule build_desi:
+    output:
+        marker = catalog_marker("desi"),
+    params:
+        cmd = build_command("desi"),
+    shell:
+        "{params.cmd}"
+
+
+rule build_tess:
+    output:
+        marker = catalog_marker("tess"),
+    params:
+        cmd = build_command("tess"),
     shell:
         "{params.cmd}"
