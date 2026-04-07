@@ -16,12 +16,18 @@ Each h5 file contains up to 1,000,000 objects with:
     - ebv          shape (N,)
     - images       shape (N, 3, 152, 152)   <-- the actual cutouts
 
-The 3 bands are DES-G, DES-R, DES-Z. Image cubes are stored as a PyArrow
-``fixed_shape_tensor(float32, (3, 152, 152))`` extension column. This preserves
-the per-row tensor shape in the parquet schema metadata, reads back as a numpy
-tensor through pyarrow natively, and is compatible with hats-import's
-metadata-combination step (unlike ``Array2DExtensionType`` from HuggingFace
-``datasets``, which crashes the finishing stage on nested extension types).
+The 3 bands are DES-G, DES-R, DES-Z.
+
+Image cubes are stored as a top-level ``Array3DExtensionType(shape=(3, 152, 152),
+dtype='float32')`` column. This matches the v1 MMU huggingface schema
+(``Array3D(shape=(3, 152, 152), dtype='float32')``) so the HATS output
+round-trips through ``datasets.load_dataset`` as a proper ``Array3D`` feature.
+
+Array3DExtensionType works with hats-import's finishing stage as a top-level
+column (a known hats-import bug crashes when Array2D is nested inside an
+outer ``list<>``, which is why Mike's HSC transformer pattern of
+``list<Array2DExtensionType>`` is currently broken — we sidestep it by
+putting the full (3, 152, 152) tensor in one top-level extension column).
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ import sys
 import h5py
 import numpy as np
 import pyarrow as pa
+from datasets.features.features import Array3DExtensionType
 
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import to_native_endian, write_hats
@@ -45,7 +52,7 @@ IMAGE_SIZE = 152
 BANDS = ["DES-G", "DES-R", "DES-Z"]
 N_BANDS = len(BANDS)
 PIXEL_SCALE = 0.262
-IMAGE_TENSOR_TYPE = pa.fixed_shape_tensor(pa.float32(), (N_BANDS, IMAGE_SIZE, IMAGE_SIZE))
+IMAGE_EXT_TYPE = Array3DExtensionType(shape=(N_BANDS, IMAGE_SIZE, IMAGE_SIZE), dtype="float32")
 
 # Per-object scalar columns from each h5 chunk that we keep in the HATS catalog.
 SCALAR_COLUMNS = [
@@ -69,18 +76,20 @@ def find_raw_files(raw_root: str, max_files: int | None = None) -> list[str]:
     return files
 
 
-def _build_image_tensor(image_array: np.ndarray) -> pa.Array:
-    """Build a ``fixed_shape_tensor<float32, (3, 152, 152)>`` column from a
-    (N, 3, 152, 152) numpy cube.
+def _build_image_column(image_array: np.ndarray) -> pa.Array:
+    """Build an ``Array3DExtensionType(shape=(3, 152, 152), dtype='float32')``
+    column from a (N, 3, 152, 152) numpy cube.
     """
     if image_array.shape[1:] != (N_BANDS, IMAGE_SIZE, IMAGE_SIZE):
         raise ValueError(
             f"image_array must be (N, {N_BANDS}, {IMAGE_SIZE}, {IMAGE_SIZE}); "
             f"got {image_array.shape}"
         )
-    return pa.FixedShapeTensorArray.from_numpy_ndarray(
-        np.ascontiguousarray(image_array, dtype=np.float32)
-    )
+    arr = np.ascontiguousarray(image_array, dtype=np.float32)
+    # Array3DExtensionType.storage_type is list<list<list<float32>>>
+    nested = [[[list(row) for row in img[b]] for b in range(N_BANDS)] for img in arr]
+    storage = pa.array(nested, type=IMAGE_EXT_TYPE.storage_type)
+    return pa.ExtensionArray.from_storage(IMAGE_EXT_TYPE, storage)
 
 
 def read_chunk(path: str, max_rows: int | None = None) -> pa.Table:
@@ -111,12 +120,12 @@ def read_chunk(path: str, max_rows: int | None = None) -> pa.Table:
         "ra": pa.array(to_native_endian(ra)),
         "dec": pa.array(to_native_endian(dec)),
         "object_id": pa.array([str(int(i)) for i in inds], type=pa.string()),
-        # Fixed-shape tensor: (3, 152, 152) float32 per row. Shape is in the
-        # schema; downstream reads this as a (3,152,152) numpy array per row.
-        "image": _build_image_tensor(image_array),
-        # Per-band PSF size (FWHM in pixels) for the three bands.
-        "psf_fwhm": pa.FixedShapeTensorArray.from_numpy_ndarray(
-            np.ascontiguousarray(psfsize, dtype=np.float32)
+        # Array3DExtensionType(shape=(3, 152, 152), dtype='float32') per row.
+        "image": _build_image_column(image_array),
+        # Per-band PSF size (FWHM in pixels) as a list of 3 floats per row.
+        "psf_fwhm": pa.array(
+            [list(row) for row in psfsize.astype(np.float32)],
+            type=pa.list_(pa.float32()),
         ),
     }
     for name, arr in scalars.items():

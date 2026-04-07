@@ -42,7 +42,8 @@ All rows in a HATS parquet are flat in terms of **columns**, but the columns can
 | **Scalar photometry (per band)** | sdss, 2mass, desi | `SPECTROFLUX_U`, `SPECTROFLUX_G`, `J_m`, `H_m`, `FLUX_G`, … | `float32` | Multi-band fluxes are **unrolled into one column per band** so filtering `WHERE mag_r < 18` hits one column only. |
 | **Spectrum (1D per object)** | sdss, desi, apogee, galah, vipers, chandra | single struct `spectrum` | `struct< flux: list<f32>, ivar: list<f32>, lambda: list<f32>, lsf_sigma: list<f32>, mask: list<bool> >` | Each row has five parallel variable-length lists. Lengths can differ per row (Parquet supports it natively). |
 | **Time series** | tess, kepler (todo) | single struct `lightcurve` | `struct< time: list<f64>, flux: list<f32>, flux_err: list<f32>, quality: list<i32> >` | Variable-length lists — each TIC/sector has its true cadence count. No padding, no fake zeros. |
-| **Image (2D cutout, per band)** | ssl_legacysurvey, hsc | struct `image` with `flux: list<Array2D>` | `struct< band: list<string>, flux: list< Array2DExtensionType(H×W, f32) >, psf_fwhm: list<f32>, scale: list<f32> >` | Each row has a list of `Array2D` — one entry per band. `Array2DExtensionType` from `datasets` carries the `(H, W)` shape in the schema metadata, so readers get a real 2D numpy array back. |
+| **Image cube (multi-band per object)** | ssl_legacysurvey | `image: fixed_shape_tensor(f32, (n_bands, H, W))` + `psf_fwhm: fixed_shape_tensor(f32, (n_bands,))` | PyArrow `FixedShapeTensorType` | Each row holds one `(n_bands, H, W)` tensor directly. Shape lives in the parquet schema metadata; `chunk.to_numpy_ndarray()` gives back a real `(N, n_bands, H, W)` numpy array. This is the **native PyArrow** extension type and is hats-import-safe. |
+| **Image cube (alternative tried)** | (abandoned) | `image: struct< flux: list<Array2DExtensionType> >` | nested HF `Array2DExtensionType` | Attempted first (matches Mike's HSC transformer). **Crashes hats-import's finishing step on nested extension types** — don't use for new ports. |
 | **Image cube (fallback)** | (not currently used) | `image_array: list<f32>` + sibling `image_array_shape: list<i32>` | flat list + shape | What the deleted auto-converter used. Loses schema-level shape info; reader has to reshape on read. |
 | **IFU / complex grouped** | manga (stub only) | scalars + compound columns skipped | mixed | MaNGA raw is grouped-by-object HDF5 with compound spaxel/image/map structs. Currently we only extract the per-object metadata (ra, dec, z, spaxel_size). Full spaxel cube support is todo. |
 
@@ -69,7 +70,7 @@ Applied consistently to every `scripts/{dataset}/build_parent_sample_hats.py`:
 3. Scalar metadata → top-level columns with native dtypes.
 4. Multi-band scalars → **unrolled** into `FIELD_BAND` columns (enables per-band Parquet pushdown filters).
 5. Per-object array data (spectrum, lightcurve) → a single `struct` column containing parallel `list<T>` fields. Variable-length allowed.
-6. Per-object 2D arrays (images) → `list< Array2DExtensionType(H, W) >` inside an `image` struct, one extension-type entry per band.
+6. Per-object image cubes → `pa.fixed_shape_tensor(float32, (n_bands, H, W))` as a top-level `image` column. Per-band scalars that logically belong to the cube (e.g. `psf_fwhm`) go in a matching `fixed_shape_tensor(float32, (n_bands,))` column. **Do not** nest `Array2DExtensionType` inside a list/struct — it crashes hats-import's finishing stage.
 7. Everything else that happens to be 1-D numeric per row → pass through as a top-level list column.
 8. Bytes from FITS → decoded to Python `str` before going to Arrow. No `b'…'` in the catalog.
 
