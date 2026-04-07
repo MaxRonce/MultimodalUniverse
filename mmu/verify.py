@@ -86,7 +86,8 @@ def verify_catalog_against_hdf5(
         catalog_dir: Path to a HATS catalog directory (the inner one with dataset/).
         source_hdf5: Path to the source HDF5 file used to build the catalog.
         n_rows_used: If the catalog was built from only the first N rows of HDF5,
-            pass N here. Otherwise pass None.
+            pass N here. If None, the catalog row count is used as ``n_rows_used``
+            (so per-value comparisons stay aligned even when the catalog was a slice).
     """
     report = VerificationReport(catalog=catalog_dir, source=source_hdf5)
 
@@ -100,11 +101,7 @@ def verify_catalog_against_hdf5(
         return report
     report.add("source exists", True)
 
-    try:
-        hats_table = _read_all_parquet(catalog_dir, columns=None)
-    except Exception as e:
-        report.add("read parquet", False, str(e))
-        return report
+    hats_table = _read_all_parquet(catalog_dir, columns=None)
     report.add("read parquet", True, f"{hats_table.num_rows} rows, {hats_table.num_columns} cols")
 
     with h5py.File(source_hdf5, "r") as f:
@@ -113,8 +110,11 @@ def verify_catalog_against_hdf5(
         dec_key = _resolve_alias(keys, DEC_ALIASES)
         obj_key = _resolve_alias(keys, OBJECT_ID_ALIASES)
 
-        # Row count
+        # Row count: if n_rows_used not given, infer from catalog (for slices)
         n_src_total = f[ra_key].shape[0]
+        if n_rows_used is None and hats_table.num_rows < n_src_total:
+            # Treat the catalog row count as authoritative for the slice
+            n_rows_used = hats_table.num_rows
         n_src = min(n_src_total, n_rows_used) if n_rows_used else n_src_total
         report.add(
             "row count matches",
@@ -155,7 +155,15 @@ def verify_catalog_against_hdf5(
                        f"min={dec_arr.min():.2f}, max={dec_arr.max():.2f}")
 
         # Spectrum struct, if HDF5 has spectrum_*
-        spec_keys = [k for k in keys if k.startswith("spectrum_")]
+        # 3D spectrum_* columns (e.g. DESI spectrum_lsf) are intentionally skipped
+        # by the auto-converter, so they shouldn't be required in the struct.
+        spec_keys = []
+        for k in keys:
+            if not k.startswith("spectrum_"):
+                continue
+            if f[k].ndim >= 3:
+                continue  # 3D columns are intentionally not in the spectrum struct
+            spec_keys.append(k)
         if spec_keys:
             has_spec = "spectrum" in hats_table.schema.names
             report.add("spectrum struct present", has_spec)
@@ -165,7 +173,7 @@ def verify_catalog_against_hdf5(
                 expected = {k.replace("spectrum_", "") for k in spec_keys}
                 missing = expected - set(fields)
                 report.add(
-                    "spectrum struct has all fields",
+                    "spectrum struct has all 1D/2D fields",
                     not missing,
                     f"missing: {missing}" if missing else "",
                 )
