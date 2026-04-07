@@ -18,16 +18,32 @@ Each h5 file contains up to 1,000,000 objects with:
 
 The 3 bands are DES-G, DES-R, DES-Z.
 
-Image cubes are stored as a top-level ``Array3DExtensionType(shape=(3, 152, 152),
-dtype='float32')`` column. This matches the v1 MMU huggingface schema
-(``Array3D(shape=(3, 152, 152), dtype='float32')``) so the HATS output
-round-trips through ``datasets.load_dataset`` as a proper ``Array3D`` feature.
+The image column is stored as an ``image`` struct-of-parallel-lists matching
+Mike's v1 SSL LegacySurvey transformer:
 
-Array3DExtensionType works with hats-import's finishing stage as a top-level
-column (a known hats-import bug crashes when Array2D is nested inside an
-outer ``list<>``, which is why Mike's HSC transformer pattern of
-``list<Array2DExtensionType>`` is currently broken — we sidestep it by
-putting the full (3, 152, 152) tensor in one top-level extension column).
+    image: struct<
+        band:     list<string>,                      # 3 band names per row
+        flux:     list<list<list<float32>>>,         # (3, 152, 152) per row
+        psf_fwhm: list<float32>,                     # 3 floats per row
+        scale:    list<float32>,                     # 3 floats per row
+    >
+
+Plain nested lists — no extension type — because ``nested_pandas`` (which
+hats-import uses at the ``Catalog: Finishing`` stage to read the combined
+``_common_metadata`` schema) has two bugs that crash when HF ``datasets``
+extension types live inside a ``list<>`` or ``struct<>`` subtree:
+
+1. ``list<Array*DExtensionType>``: nested_pandas' ``autocast_list`` packs every
+   list column as a nested subframe, which round-trips through pandas → arrow
+   and trips ``arrow/array/array_nested.cc:459`` (``child_data.size() == 1``).
+2. ``struct<..., Array*DExtensionType, ...>``: nested_pandas' ``normalize_struct_list_type``
+   calls ``pa.list_(field.type.value_type)``; ``Array3DExtensionType.value_type``
+   returns the *string* ``'float32'`` (HF naming convention) rather than a
+   pyarrow ``DataType``, so ``pa.list_`` raises ``TypeError``.
+
+Plain nested lists sidestep both. ``datasets.load_dataset`` on the parquet
+output reads the struct back as a list-of-items dict; callers reconstruct the
+(3, 152, 152) cube via ``np.asarray(row['image']['flux'])``.
 """
 
 from __future__ import annotations
@@ -40,7 +56,6 @@ import sys
 import h5py
 import numpy as np
 import pyarrow as pa
-from datasets.features.features import Array3DExtensionType
 
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import to_native_endian, write_hats
@@ -52,7 +67,6 @@ IMAGE_SIZE = 152
 BANDS = ["DES-G", "DES-R", "DES-Z"]
 N_BANDS = len(BANDS)
 PIXEL_SCALE = 0.262
-IMAGE_EXT_TYPE = Array3DExtensionType(shape=(N_BANDS, IMAGE_SIZE, IMAGE_SIZE), dtype="float32")
 
 # Per-object scalar columns from each h5 chunk that we keep in the HATS catalog.
 SCALAR_COLUMNS = [
@@ -76,20 +90,48 @@ def find_raw_files(raw_root: str, max_files: int | None = None) -> list[str]:
     return files
 
 
-def _build_image_column(image_array: np.ndarray) -> pa.Array:
-    """Build an ``Array3DExtensionType(shape=(3, 152, 152), dtype='float32')``
-    column from a (N, 3, 152, 152) numpy cube.
+def _build_image_struct(image_array: np.ndarray, psfsize: np.ndarray) -> pa.StructArray:
+    """Build an ``image`` struct-of-parallel-lists column matching Mike's v1
+    SSL LegacySurvey transformer schema::
+
+        image: struct<
+            band:     list<string>,
+            flux:     list<list<list<float32>>>,
+            psf_fwhm: list<float32>,
+            scale:    list<float32>,
+        >
+
+    ``image_array`` must be (N, N_BANDS, IMAGE_SIZE, IMAGE_SIZE). ``psfsize``
+    must be (N, N_BANDS). Pixel scale is constant (``PIXEL_SCALE``) and is
+    broadcast to a list of length N_BANDS per row.
     """
     if image_array.shape[1:] != (N_BANDS, IMAGE_SIZE, IMAGE_SIZE):
         raise ValueError(
             f"image_array must be (N, {N_BANDS}, {IMAGE_SIZE}, {IMAGE_SIZE}); "
             f"got {image_array.shape}"
         )
+    if psfsize.shape[1:] != (N_BANDS,):
+        raise ValueError(
+            f"psfsize must be (N, {N_BANDS}); got {psfsize.shape}"
+        )
+    n = image_array.shape[0]
     arr = np.ascontiguousarray(image_array, dtype=np.float32)
-    # Array3DExtensionType.storage_type is list<list<list<float32>>>
-    nested = [[[list(row) for row in img[b]] for b in range(N_BANDS)] for img in arr]
-    storage = pa.array(nested, type=IMAGE_EXT_TYPE.storage_type)
-    return pa.ExtensionArray.from_storage(IMAGE_EXT_TYPE, storage)
+
+    band_arr = pa.array([BANDS] * n, type=pa.list_(pa.string()))
+    nested_flux = [[[list(row) for row in img[b]] for b in range(N_BANDS)] for img in arr]
+    flux_arr = pa.array(nested_flux, type=pa.list_(pa.list_(pa.list_(pa.float32()))))
+    psf_fwhm_arr = pa.array(
+        [list(row) for row in psfsize.astype(np.float32)],
+        type=pa.list_(pa.float32()),
+    )
+    scale_arr = pa.array(
+        [[PIXEL_SCALE] * N_BANDS] * n,
+        type=pa.list_(pa.float32()),
+    )
+    return pa.StructArray.from_arrays(
+        [band_arr, flux_arr, psf_fwhm_arr, scale_arr],
+        names=["band", "flux", "psf_fwhm", "scale"],
+    )
 
 
 def read_chunk(path: str, max_rows: int | None = None) -> pa.Table:
@@ -120,13 +162,8 @@ def read_chunk(path: str, max_rows: int | None = None) -> pa.Table:
         "ra": pa.array(to_native_endian(ra)),
         "dec": pa.array(to_native_endian(dec)),
         "object_id": pa.array([str(int(i)) for i in inds], type=pa.string()),
-        # Array3DExtensionType(shape=(3, 152, 152), dtype='float32') per row.
-        "image": _build_image_column(image_array),
-        # Per-band PSF size (FWHM in pixels) as a list of 3 floats per row.
-        "psf_fwhm": pa.array(
-            [list(row) for row in psfsize.astype(np.float32)],
-            type=pa.list_(pa.float32()),
-        ),
+        # image struct-of-parallel-lists (Mike's v1 SSL transformer schema).
+        "image": _build_image_struct(image_array, psfsize),
     }
     for name, arr in scalars.items():
         columns[name] = pa.array(to_native_endian(arr))
