@@ -5,6 +5,7 @@ with lazy column loading, spatial filtering, and cross-matching.
 """
 
 import typing as T
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import cached_property
 
@@ -15,6 +16,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+DEFAULT_MAX_CACHED_PIXELS = 4
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,11 @@ class HATSDataset(Dataset):
         catalog_path: Path to a HATS catalog directory.
         columns: Columns to load. None means all columns.
         catalog: Pre-loaded hats.Catalog (alternative to catalog_path).
+        max_cached_pixels: Maximum number of HEALPix tiles to keep in the
+            in-memory LRU cache. Each tile can be up to ``pixel_threshold``
+            rows wide so this caps memory at roughly
+            ``max_cached_pixels * pixel_threshold * row_bytes``. Defaults to
+            ``DEFAULT_MAX_CACHED_PIXELS`` (4).
         _filters: Internal — list of filter operations to apply lazily.
     """
 
@@ -64,6 +72,7 @@ class HATSDataset(Dataset):
         catalog_path: str | None = None,
         columns: list[str] | None = None,
         catalog: hats.catalog.Catalog | None = None,
+        max_cached_pixels: int = DEFAULT_MAX_CACHED_PIXELS,
         _filters: tuple = (),
     ):
         if catalog is not None:
@@ -76,8 +85,10 @@ class HATSDataset(Dataset):
             raise ValueError("Provide either catalog_path or catalog")
 
         self.columns = columns
+        self.max_cached_pixels = max_cached_pixels
         self._filters = tuple(_filters)
-        self._pixel_cache: dict[int, pa.Table] = {}
+        # OrderedDict gives us O(1) LRU eviction via move_to_end / popitem(last=False).
+        self._pixel_cache: "OrderedDict[int, pa.Table]" = OrderedDict()
 
     @cached_property
     def _pixel_paths(self) -> list:
@@ -95,11 +106,15 @@ class HATSDataset(Dataset):
         return int(self._cumulative_counts[-1])
 
     def _load_pixel(self, pixel_idx: int) -> pa.Table:
-        if pixel_idx not in self._pixel_cache:
-            self._pixel_cache[pixel_idx] = pq.read_table(
-                self._pixel_paths[pixel_idx], columns=self.columns
-            )
-        return self._pixel_cache[pixel_idx]
+        cache = self._pixel_cache
+        if pixel_idx in cache:
+            cache.move_to_end(pixel_idx)
+            return cache[pixel_idx]
+        table = pq.read_table(self._pixel_paths[pixel_idx], columns=self.columns)
+        cache[pixel_idx] = table
+        while len(cache) > self.max_cached_pixels:
+            cache.popitem(last=False)  # evict the least-recently-used pixel
+        return table
 
     def _resolve_index(self, idx: int) -> tuple[int, int]:
         """Map global index to (pixel_idx, row_within_pixel)."""
@@ -247,7 +262,14 @@ def _arrow_value_to_torch(value: pa.Scalar, arrow_type: pa.DataType) -> T.Any:
 
 
 def _python_to_torch(value: T.Any) -> T.Any:
-    """Convert a Python value to a torch tensor."""
+    """Convert a Python value to a torch tensor (or leave it as-is for str/None).
+
+    NOTE on scalars: Python ``int`` / ``float`` / ``bool`` get wrapped as 0-D
+    tensors so they batch cleanly through ``DataLoader``. This means downstream
+    code reading e.g. ``item["healpix"]`` gets a 0-D torch tensor, NOT a plain
+    int — call ``.item()`` if you want the underlying number for indexing.
+    Strings and ``None`` are passed through unchanged.
+    """
     if isinstance(value, dict):
         return {k: _python_to_torch(v) for k, v in value.items()}
     if isinstance(value, list):

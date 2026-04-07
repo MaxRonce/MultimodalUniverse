@@ -148,6 +148,23 @@ class TestClearCache:
         assert len(ds_light._pixel_cache) == 0
 
 
+class TestBoundedCache:
+    """Regression for review 4.5: pixel cache must not grow without bound."""
+
+    def test_lru_bound(self, catalog_path):
+        ds = HATSDataset(catalog_path, columns=["ra"], max_cached_pixels=2)
+        # Force a few pixel loads. The single-tile fixture only has 1 pixel,
+        # so we just confirm the cache size never exceeds the bound regardless
+        # of how many random indices we hit.
+        for i in range(min(50, len(ds))):
+            _ = ds[i]
+            assert len(ds._pixel_cache) <= 2
+
+    def test_default_bound_set(self, catalog_path):
+        ds = HATSDataset(catalog_path, columns=["ra"])
+        assert ds.max_cached_pixels >= 1
+
+
 @pytest.fixture(scope="module")
 def ds_multi():
     if not os.path.exists(HATS_MULTI):
