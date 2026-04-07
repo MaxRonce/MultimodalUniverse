@@ -49,6 +49,7 @@ viz = [
 ]
 dev = [
     "pytest",
+    "snakemake",
 ]
 
 [tool.setuptools]
