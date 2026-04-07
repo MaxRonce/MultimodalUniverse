@@ -23,6 +23,8 @@ and writes HATS output to:
 """
 
 import os
+import re
+
 from mmu.hats_configs import DATASET_CONFIGS, MMU_V1_ROOT, MMU_V2_HATS_ROOT, hdf5_path
 
 # ---- Configurable parameters ----
@@ -31,6 +33,13 @@ configfile: "snakemake_config.yaml"
 FIDUCIAL_HEALPIX = config.get("fiducial_healpix", 1177)
 N_ROWS = config.get("n_rows", 2000)
 HATS_ROOT = config.get("hats_root", MMU_V2_HATS_ROOT)
+
+
+# Constrain wildcards so e.g. `desi_dr1_main` parses as
+# dataset=desi, config=dr1_main (not desi_dr1, main).
+wildcard_constraints:
+    dataset = "|".join(re.escape(name) for name in DATASET_CONFIGS),
+    config = r"[A-Za-z0-9_.-]+",
 
 
 # ---- Build the (dataset, config) targets that exist on disk ----
