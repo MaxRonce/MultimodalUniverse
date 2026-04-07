@@ -10,20 +10,54 @@ authors = [
 description = "Large Astronomical Dataset for Foundation Models"
 readme = "README.md"
 license = {text = "MIT"}
+requires-python = ">=3.11,<3.14"
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
-dynamic = ["dependencies", "version"]
+dependencies = [
+    # Core MMU runtime
+    "astropy",
+    "datasets",
+    "h5py",
+    "pandas",
+    "tqdm",
+    # HATS conversion + loading
+    "hats>=0.9.0",
+    "hats-import>=0.9.0",
+    "lsdb>=0.9.0",
+    "pyarrow",
+    "numpy",
+    "healpy",
+    "dask[distributed]",
+    "universal_pathlib",
+]
+dynamic = ["version"]
 
-[tool.setuptools.dynamic]
-dependencies = { file = "requirements.txt" }
-optional-dependencies = {bench = { file = ["bench-requirements.txt"] }}
+[project.optional-dependencies]
+bench = [
+    "torch",
+    "torchvision",
+    "lightning",
+    "scikit-learn",
+    "spender",
+]
+viz = [
+    "matplotlib",
+]
+dev = [
+    "pytest",
+]
 
 [tool.setuptools]
-packages = ["mmu"]
+packages = ["mmu", "mmu.benchmark", "mmu.benchmark.eval", "mmu.benchmark.models", "mmu.cli"]
 
 [tool.setuptools_scm]
 write_to = "mmu/_version.py"
 
 [project.scripts]
 mmu_cli = "mmu.benchmark.trainer:trainer_cli"
+mmu_build_hats = "mmu.cli.build_hats:main"
+mmu_verify_hats = "mmu.verify:main"

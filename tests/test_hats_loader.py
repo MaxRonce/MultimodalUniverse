@@ -147,31 +147,35 @@ class TestClearCache:
         assert len(ds_light._pixel_cache) == 0
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def ds_multi():
     if not os.path.exists(HATS_MULTI):
         pytest.skip("Multi-healpix HATS test catalog not built")
     return HATSDataset(HATS_MULTI, columns=["ra", "dec", "Z", "object_id"])
 
 
-class TestCrossMatch:
-    def test_self_crossmatch(self, ds_multi):
-        result = ds_multi.crossmatch(ds_multi, radius_arcsec=1.0, suffixes=("_a", "_b"))
-        assert isinstance(result, CrossMatchedHATSDataset)
-        assert result.matched_count == len(ds_multi)
+@pytest.fixture(scope="module")
+def self_crossmatch(ds_multi):
+    """Run the self-cross-match ONCE per module and reuse for the cheap assertions."""
+    return ds_multi.crossmatch(ds_multi, radius_arcsec=1.0, suffixes=("_a", "_b"))
 
-    def test_crossmatch_distance_zero(self, ds_multi):
-        result = ds_multi.crossmatch(ds_multi, radius_arcsec=1.0, suffixes=("_a", "_b"))
-        item = result[0]
+
+class TestCrossMatch:
+    def test_self_crossmatch_type(self, ds_multi, self_crossmatch):
+        assert isinstance(self_crossmatch, CrossMatchedHATSDataset)
+        assert self_crossmatch.matched_count == len(ds_multi)
+
+    def test_crossmatch_distance_zero(self, self_crossmatch):
+        item = self_crossmatch[0]
         assert "_dist_arcsec" in item
         assert item["_dist_arcsec"] == 0.0
 
-    def test_crossmatch_dataloader(self, ds_multi):
-        result = ds_multi.crossmatch(ds_multi, radius_arcsec=1.0, suffixes=("_a", "_b"))
-        loader = torch.utils.data.DataLoader(result, batch_size=16)
+    def test_crossmatch_dataloader(self, self_crossmatch):
+        loader = torch.utils.data.DataLoader(self_crossmatch, batch_size=16)
         batch = next(iter(loader))
         assert batch["ra_a"].shape == (16,)
 
-    def test_crossmatch_tight_radius(self, ds_multi):
-        result = ds_multi.crossmatch(ds_multi, radius_arcsec=0.0001, suffixes=("_a", "_b"))
-        assert result.matched_count == len(ds_multi)
+    def test_crossmatch_distances_all_zero(self, self_crossmatch):
+        """Self cross-match: every match should have ~zero separation."""
+        dists = self_crossmatch.df["_dist_arcsec"].to_numpy()
+        assert (dists < 1e-6).all()
