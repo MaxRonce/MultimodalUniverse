@@ -10,7 +10,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mmu.hats_import import auto_arrow_table_from_hdf5
+from mmu.hats_import import (
+    auto_arrow_table_from_grouped_hdf5,
+    auto_arrow_table_from_hdf5,
+)
 
 
 def make_hdf5(columns: dict) -> h5py.File:
@@ -294,6 +297,74 @@ class TestColumnDispatchErrors:
             arr[i] = np.array([1.0, 2.0, 3.0])
         with pytest.raises(ValueError, match="object dtype with element type ndarray"):
             _column_to_pyarrow(arr, name="oddcol")
+
+
+class TestGroupedHDF5:
+    """Test the grouped HDF5 reader (MaNGA-style layout)."""
+
+    @pytest.fixture
+    def grouped_h5(self):
+        """Mimic MaNGA: top-level groups, scalar metadata inside each."""
+        bio = io.BytesIO()
+        f = h5py.File(bio, "w")
+        rng = np.random.default_rng(42)
+        for i, name in enumerate(["8154-12703", "8154-12705", "9192-3703"]):
+            g = f.create_group(name)
+            g.create_dataset("object_id", data=name.encode())
+            g.create_dataset("ra", data=float(180 + i))
+            g.create_dataset("dec", data=float(20 + i * 0.5))
+            g.create_dataset("z", data=float(0.01 + i * 0.005))
+            g.create_dataset("healpix", data=np.int64(i))
+            g.create_dataset("spaxel_size", data=0.5)
+            # Compound dataset that should be skipped
+            dt = np.dtype([("flux", "f4", (10,)), ("ivar", "f4", (10,))])
+            g.create_dataset("spaxels", data=np.zeros(5, dtype=dt))
+        return f
+
+    def test_n_rows(self, grouped_h5):
+        table = auto_arrow_table_from_grouped_hdf5(grouped_h5)
+        assert table.num_rows == 3
+
+    def test_required_columns(self, grouped_h5):
+        table = auto_arrow_table_from_grouped_hdf5(grouped_h5)
+        assert "ra" in table.schema.names
+        assert "dec" in table.schema.names
+        assert "object_id" in table.schema.names
+
+    def test_scalar_metadata_extracted(self, grouped_h5):
+        table = auto_arrow_table_from_grouped_hdf5(grouped_h5)
+        assert "z" in table.schema.names
+        assert "healpix" in table.schema.names
+        assert "spaxel_size" in table.schema.names
+
+    def test_object_id_decoded(self, grouped_h5):
+        table = auto_arrow_table_from_grouped_hdf5(grouped_h5)
+        assert table.column("object_id")[0].as_py() == "8154-12703"
+
+    def test_ra_dec_values(self, grouped_h5):
+        table = auto_arrow_table_from_grouped_hdf5(grouped_h5)
+        ra = table.column("ra").to_numpy()
+        np.testing.assert_allclose(ra, [180.0, 181.0, 182.0])
+
+    def test_compound_columns_skipped(self, grouped_h5):
+        # spaxels is a compound dataset and should be silently skipped
+        table = auto_arrow_table_from_grouped_hdf5(grouped_h5)
+        assert "spaxels" not in table.schema.names
+
+    def test_n_rows_limit(self, grouped_h5):
+        table = auto_arrow_table_from_grouped_hdf5(grouped_h5, n_rows=2)
+        assert table.num_rows == 2
+
+    def test_empty_file_raises(self):
+        bio = io.BytesIO()
+        f = h5py.File(bio, "w")
+        with pytest.raises(ValueError, match="no top-level groups"):
+            auto_arrow_table_from_grouped_hdf5(f)
+
+    def test_flat_layout_raises(self, n, coords):
+        h5 = make_hdf5(coords)
+        with pytest.raises(ValueError, match="not a Group"):
+            auto_arrow_table_from_grouped_hdf5(h5)
 
 
 class TestImageColumn4D:

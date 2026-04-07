@@ -162,9 +162,15 @@ DATASET_CONFIGS = {
         "default_config": "dr1",
     },
 
+    # --- IFU (grouped HDF5 layout) ---
+    "manga": {
+        "configs": ["manga"],
+        "modality": "ifu",
+        "default_config": "manga",
+        "grouped_layout": True,  # one HDF5 group per object
+    },
+
     # --- Skipped or missing on cluster ---
-    "manga": {"skip": True, "modality": "ifu",
-              "skip_reason": "IFU datacubes too different from rest of MMU"},
     "lamost": {"skip": True, "modality": "spectra",
                "skip_reason": "not present on cluster as of 2026-04-07"},
     "cfa": {"skip": True, "modality": "timeseries",

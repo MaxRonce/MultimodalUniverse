@@ -17,9 +17,10 @@ EXPECTED_DATASETS = {
     "plasticc", "tess", "kepler", "foundation", "snls",
     "ps1_sne_ia", "des_y3_sne_ia", "swift_sne_ia", "yse",
     "allwise", "twomass", "galex", "sages",
+    "manga",
 }
 
-SKIPPED_DATASETS = {"manga", "lamost", "cfa", "csp"}
+SKIPPED_DATASETS = {"lamost", "cfa", "csp"}
 
 
 class TestRegistry:
@@ -27,8 +28,9 @@ class TestRegistry:
         non_skipped = {n for n, c in DATASET_CONFIGS.items() if not c.get("skip")}
         assert non_skipped == EXPECTED_DATASETS
 
-    def test_manga_is_skipped(self):
-        assert DATASET_CONFIGS["manga"].get("skip") is True
+    def test_manga_uses_grouped_layout(self):
+        assert DATASET_CONFIGS["manga"].get("grouped_layout") is True
+        assert not DATASET_CONFIGS["manga"].get("skip")
 
     def test_all_skipped_datasets_present(self):
         skipped = {n for n, c in DATASET_CONFIGS.items() if c.get("skip")}
@@ -78,7 +80,7 @@ class TestHelpers:
 
     def test_get_dataset_config_skipped(self):
         with pytest.raises(ValueError, match="skipped"):
-            get_dataset_config("manga")
+            get_dataset_config("lamost")
 
     def test_get_dataset_config_returns_dict(self):
         cfg = get_dataset_config("sdss")
@@ -90,7 +92,8 @@ class TestListDatasets:
     def test_list_all(self):
         all_ds = list_datasets()
         assert "sdss" in all_ds
-        assert "manga" not in all_ds
+        assert "manga" in all_ds  # MaNGA is no longer skipped
+        assert "lamost" not in all_ds
         assert len(all_ds) == len(EXPECTED_DATASETS)
 
     def test_list_by_modality(self):

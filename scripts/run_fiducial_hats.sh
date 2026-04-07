@@ -37,6 +37,7 @@ DATASETS=(
     "tess:spoc"
     "sages:dr1"
     "chandra:spectra"
+    "manga:manga"
 )
 
 LOG="$ROOT/run.log"

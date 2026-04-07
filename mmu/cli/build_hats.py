@@ -20,7 +20,11 @@ from mmu.hats_configs import (
     hdf5_path,
     list_datasets,
 )
-from mmu.hats_import import auto_arrow_table_from_hdf5, write_hats
+from mmu.hats_import import (
+    auto_arrow_table_from_grouped_hdf5,
+    auto_arrow_table_from_hdf5,
+    write_hats,
+)
 
 
 def convert_tiles(
@@ -41,6 +45,7 @@ def convert_tiles(
         config = cfg.get("default_config")
 
     catalog_name = f"{dataset}_{config}" if config else dataset
+    grouped = bool(cfg.get("grouped_layout"))
 
     # Build PyArrow tables from each tile
     tables = []
@@ -49,15 +54,24 @@ def convert_tiles(
         if not os.path.exists(path):
             print(f"  WARN: missing tile, skipping: {path}", file=sys.stderr)
             continue
-        print(f"  Loading {path}")
+        print(f"  Loading {path}{' (grouped)' if grouped else ''}")
         with h5py.File(path, "r") as f:
-            n_obj = f[next(iter(f.keys()))].shape[0]
-            print(f"    rows: {n_obj}", end="")
-            if n_rows is not None and n_obj > n_rows:
-                print(f" (taking first {n_rows})")
+            if grouped:
+                n_obj = len(list(f.keys()))
+                print(f"    groups: {n_obj}", end="")
+                if n_rows is not None and n_obj > n_rows:
+                    print(f" (taking first {n_rows})")
+                else:
+                    print()
+                table = auto_arrow_table_from_grouped_hdf5(f, n_rows=n_rows)
             else:
-                print()
-            table = auto_arrow_table_from_hdf5(f, n_rows=n_rows)
+                n_obj = f[next(iter(f.keys()))].shape[0]
+                print(f"    rows: {n_obj}", end="")
+                if n_rows is not None and n_obj > n_rows:
+                    print(f" (taking first {n_rows})")
+                else:
+                    print()
+                table = auto_arrow_table_from_hdf5(f, n_rows=n_rows)
         tables.append(table)
 
     if not tables:

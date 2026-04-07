@@ -328,6 +328,100 @@ def auto_arrow_table_from_hdf5(
     return pa.table(columns)
 
 
+def auto_arrow_table_from_grouped_hdf5(
+    h5_file: h5py.File,
+    *,
+    n_rows: int | None = None,
+) -> pa.Table:
+    """Build a PyArrow table from a *grouped* HDF5 file (e.g. MaNGA).
+
+    In the grouped layout each top-level key is a group representing one object,
+    and scalar metadata (ra, dec, object_id, ...) lives inside the group as 0-D
+    datasets. Compound-type datasets (e.g. MaNGA's spaxels/images/maps) are
+    skipped — only scalar metadata is included for now.
+
+    Args:
+        h5_file: Open h5py.File handle whose top-level entries are groups.
+        n_rows: If set, read only the first ``n_rows`` groups.
+
+    Raises:
+        ValueError: if the file does not appear to be a grouped layout.
+    """
+    group_names = list(h5_file.keys())
+    if n_rows is not None:
+        group_names = group_names[:n_rows]
+    if not group_names:
+        raise ValueError("Grouped HDF5 file has no top-level groups")
+
+    # Sanity check the first item is a group, not a dataset
+    first = h5_file[group_names[0]]
+    if not isinstance(first, h5py.Group):
+        raise ValueError(
+            f"Expected a grouped layout but top-level key {group_names[0]!r} "
+            f"is a {type(first).__name__}, not a Group"
+        )
+
+    # Collect scalar columns by walking the first group, then verify all groups
+    # have the same scalar keys.
+    scalar_keys = []
+    for k in first.keys():
+        ds = first[k]
+        if isinstance(ds, h5py.Dataset) and ds.ndim == 0:
+            scalar_keys.append(k)
+
+    columns: dict[str, list] = {k: [] for k in scalar_keys}
+    for name in group_names:
+        group = h5_file[name]
+        for k in scalar_keys:
+            val = group[k][()]
+            if isinstance(val, bytes):
+                val = val.decode("utf-8", errors="replace")
+            columns[k].append(val)
+
+    # Normalize ra/dec/object_id aliases
+    pa_columns: dict[str, pa.Array] = {}
+    ra_key = _resolve_alias(scalar_keys, RA_ALIASES)
+    dec_key = _resolve_alias(scalar_keys, DEC_ALIASES)
+    obj_key = _resolve_alias(scalar_keys, OBJECT_ID_ALIASES)
+    if ra_key is None or dec_key is None:
+        raise ValueError(
+            f"Grouped HDF5: could not find RA/Dec in scalar keys {scalar_keys}"
+        )
+
+    pa_columns["ra"] = pa.array([float(v) for v in columns[ra_key]], type=pa.float64())
+    pa_columns["dec"] = pa.array([float(v) for v in columns[dec_key]], type=pa.float64())
+    if obj_key is not None:
+        pa_columns["object_id"] = pa.array([str(v) for v in columns[obj_key]], type=pa.string())
+    else:
+        # Fall back to using the group name itself as object_id
+        pa_columns["object_id"] = pa.array(group_names, type=pa.string())
+
+    handled = {ra_key, dec_key}
+    if obj_key is not None:
+        handled.add(obj_key)
+
+    for k in scalar_keys:
+        if k in handled:
+            continue
+        vals = columns[k]
+        first_val = vals[0]
+        if isinstance(first_val, (int, np.integer)):
+            pa_columns[k] = pa.array([int(v) for v in vals])
+        elif isinstance(first_val, (float, np.floating)):
+            pa_columns[k] = pa.array([float(v) for v in vals], type=pa.float64())
+        elif isinstance(first_val, (bool, np.bool_)):
+            pa_columns[k] = pa.array([bool(v) for v in vals])
+        elif isinstance(first_val, str):
+            pa_columns[k] = pa.array(vals, type=pa.string())
+        else:
+            LOGGER.warning(
+                "Skipping grouped scalar %r: unsupported type %s",
+                k, type(first_val).__name__,
+            )
+
+    return pa.table(pa_columns)
+
+
 class ArrowTableReader(InputReader):
     """InputReader that yields pre-built PyArrow tables by index."""
 
