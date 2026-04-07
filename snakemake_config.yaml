@@ -1,9 +1,25 @@
 # Snakemake config for the raw -> HATS pipeline.
-# Override on the command line: `snakemake --config max_files=4`
+#
+# Pick a profile with `--config profile=NAME`. Defaults to `cluster`.
+#
+#   uv run snakemake --cores 4 build_allwise                       # cluster, full
+#   uv run snakemake --cores 1 build_allwise --config profile=test # tiny smoke test
+#
+# To override paths on your own machine without committing them, drop a
+# `snakemake_config.local.yaml` next to this file (gitignored). It is loaded
+# AFTER this file and overrides any keys it sets.
 
-# Where the HATS catalogs are written. Default = the polymathic ceph mount.
-hats_root: /mnt/ceph/users/polymathic/MultimodalUniverse_v2_hats
+profile: cluster
 
-# Cap on raw shards processed per dataset (None = no cap, build everything).
-# Useful for fast smoke tests during development.
-# max_files: 2
+profiles:
+  cluster:
+    # Production: write to the shared polymathic ceph mount, build every shard.
+    hats_root: /mnt/ceph/users/polymathic/MultimodalUniverse_v2_hats
+    max_files: null
+
+  test:
+    # Smoke test: one shard per dataset, write under the repo so it's easy to
+    # inspect / clean up. Still needs the raw inputs to exist on disk
+    # (i.e. you need to be on the cluster, or have local mirrors).
+    hats_root: ./test_output/hats
+    max_files: 1

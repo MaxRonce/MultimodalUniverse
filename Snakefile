@@ -27,8 +27,22 @@ from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 
 configfile: "snakemake_config.yaml"
 
-HATS_ROOT = config.get("hats_root", MMU_V2_HATS_ROOT)
-MAX_FILES = config.get("max_files", None)  # None = build everything
+# Optional per-machine override (gitignored). See snakemake_config.local.yaml.example.
+if os.path.exists("snakemake_config.local.yaml"):
+    configfile: "snakemake_config.local.yaml"
+
+
+def _resolve(key, default=None):
+    """Look up `key` in the active profile, falling back to top-level config."""
+    profile_name = config.get("profile", "cluster")
+    profile = config.get("profiles", {}).get(profile_name, {})
+    if key in config:
+        return config[key]  # explicit --config wins
+    return profile.get(key, default)
+
+
+HATS_ROOT = _resolve("hats_root", MMU_V2_HATS_ROOT)
+MAX_FILES = _resolve("max_files", None)  # None = build everything
 
 # Datasets that have a working raw -> HATS build script under scripts/{name}/
 PORTED = [

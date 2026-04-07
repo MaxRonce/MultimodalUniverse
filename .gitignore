@@ -197,3 +197,5 @@ scripts/kepler/figs
 slurm*.out
 test_data/
 .venv/
+snakemake_config.local.yaml
+test_output/
