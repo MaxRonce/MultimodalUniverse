@@ -1,0 +1,119 @@
+"""Tests for scripts/allwise/build_parent_sample_hats.py.
+
+These tests build a tiny synthetic raw-AllWISE-shaped parquet shard, then run
+the script's helpers against it. They DO NOT call ``write_hats`` (which is slow
+because of hats-import). The end-to-end build is exercised separately as a
+slow integration test on real cluster data.
+"""
+
+import os
+import sys
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+# Make scripts/allwise importable
+SCRIPTS_ALLWISE = os.path.join(
+    os.path.dirname(__file__), "..", "scripts", "allwise"
+)
+sys.path.insert(0, SCRIPTS_ALLWISE)
+import build_parent_sample_hats as build  # noqa: E402
+
+
+def _make_fake_allwise_shard(path: str, n_rows: int = 50) -> str:
+    """Write a tiny parquet file with the columns we care about + some extras."""
+    rng = np.random.default_rng(42)
+    table = pa.table({
+        "designation": pa.array([f"J{i:08d}+000000" for i in range(n_rows)], type=pa.string()),
+        "ra": pa.array(rng.uniform(0, 360, n_rows), type=pa.float64()),
+        "dec": pa.array(rng.uniform(-90, 90, n_rows), type=pa.float64()),
+        "cntr": pa.array(np.arange(1_000_000_000, 1_000_000_000 + n_rows, dtype=np.int64)),
+        "w1mpro": pa.array(rng.uniform(8, 18, n_rows), type=pa.float32()),
+        "w1snr": pa.array(rng.uniform(0, 100, n_rows), type=pa.float32()),
+    })
+    pq.write_table(table, path)
+    return path
+
+
+@pytest.fixture
+def fake_raw_root(tmp_path):
+    raw_root = tmp_path / "allwise"
+    shard_dir = raw_root / "healpix_k0=0" / "healpix_k5=0"
+    shard_dir.mkdir(parents=True)
+    _make_fake_allwise_shard(str(shard_dir / "part0.snappy.parquet"), n_rows=20)
+
+    second_dir = raw_root / "healpix_k0=0" / "healpix_k5=1"
+    second_dir.mkdir(parents=True)
+    _make_fake_allwise_shard(str(second_dir / "part0.snappy.parquet"), n_rows=15)
+    return str(raw_root)
+
+
+class TestFindRawFiles:
+    def test_finds_all_shards(self, fake_raw_root):
+        files = build.find_raw_files(fake_raw_root)
+        assert len(files) == 2
+        assert all(f.endswith(".parquet") for f in files)
+
+    def test_max_files(self, fake_raw_root):
+        files = build.find_raw_files(fake_raw_root, max_files=1)
+        assert len(files) == 1
+
+    def test_missing_root(self, tmp_path):
+        files = build.find_raw_files(str(tmp_path / "does_not_exist"))
+        assert files == []
+
+
+class TestReadShard:
+    def test_basic_columns(self, fake_raw_root):
+        files = build.find_raw_files(fake_raw_root)
+        table = build.read_shard(files[0])
+        assert "ra" in table.schema.names
+        assert "dec" in table.schema.names
+        assert "object_id" in table.schema.names
+        assert table.num_rows == 20
+
+    def test_object_id_derived_from_cntr(self, fake_raw_root):
+        files = build.find_raw_files(fake_raw_root)
+        table = build.read_shard(files[0])
+        obj_ids = table.column("object_id").to_pylist()
+        assert obj_ids[0] == "1000000000"
+        assert table.schema.field("object_id").type == pa.string()
+
+    def test_other_columns_preserved(self, fake_raw_root):
+        files = build.find_raw_files(fake_raw_root)
+        table = build.read_shard(files[0])
+        assert "w1mpro" in table.schema.names
+        assert "designation" in table.schema.names
+
+    def test_missing_radec_raises(self, tmp_path):
+        bad = tmp_path / "bad.parquet"
+        pq.write_table(pa.table({"x": pa.array([1, 2, 3])}), bad)
+        with pytest.raises(ValueError, match="ra/dec"):
+            build.read_shard(str(bad))
+
+    def test_missing_object_id_and_cntr_raises(self, tmp_path):
+        bad = tmp_path / "bad.parquet"
+        pq.write_table(
+            pa.table({
+                "ra": pa.array([1.0, 2.0]),
+                "dec": pa.array([3.0, 4.0]),
+            }),
+            bad,
+        )
+        with pytest.raises(ValueError, match="object_id.*cntr"):
+            build.read_shard(str(bad))
+
+    def test_existing_object_id_passthrough(self, tmp_path):
+        path = tmp_path / "with_oid.parquet"
+        pq.write_table(
+            pa.table({
+                "ra": pa.array([1.0, 2.0]),
+                "dec": pa.array([3.0, 4.0]),
+                "object_id": pa.array(["a", "b"], type=pa.string()),
+            }),
+            path,
+        )
+        table = build.read_shard(str(path))
+        assert table.column("object_id").to_pylist() == ["a", "b"]

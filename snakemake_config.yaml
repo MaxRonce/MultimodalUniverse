@@ -1,0 +1,9 @@
+# Snakemake config for the raw -> HATS pipeline.
+# Override on the command line: `snakemake --config max_files=4`
+
+# Where the HATS catalogs are written. Default = the polymathic ceph mount.
+hats_root: /mnt/ceph/users/polymathic/MultimodalUniverse_v2_hats
+
+# Cap on raw shards processed per dataset (None = no cap, build everything).
+# Useful for fast smoke tests during development.
+# max_files: 2
