@@ -44,22 +44,40 @@ def detect_modality(schema_names: list[str]) -> str:
     return "tabular"
 
 
+def _resolve_x_axis(row: dict) -> tuple[np.ndarray, str]:
+    """Find an x-axis array (wavelength/energy/index) and a label."""
+    for key, label in [
+        ("lambda", "Wavelength [Å]"),
+        ("wavelength", "Wavelength [Å]"),
+        ("ene", "Energy [keV]"),
+        ("ene_center_bin", "Energy [keV]"),
+    ]:
+        if key in row:
+            return np.asarray(row[key], dtype=np.float32), label
+    # Fallback: use the index of the flux array
+    flux = np.asarray(row.get("flux", []), dtype=np.float32)
+    return np.arange(len(flux)), "Channel"
+
+
 def plot_spectra(table, axes, n_show=4):
     spec_col = table.column("spectrum")
     z_col = table.column("Z") if "Z" in table.schema.names else None
     for i in range(min(n_show, table.num_rows)):
         row = spec_col[i].as_py()
-        lam = np.asarray(row["lambda"], dtype=np.float32)
+        x, xlabel = _resolve_x_axis(row)
         flux = np.asarray(row["flux"], dtype=np.float32)
-        mask = np.asarray(row["mask"], dtype=bool) if "mask" in row else np.zeros_like(flux, dtype=bool)
-        flux_m = np.where(mask, np.nan, flux)
+        if "mask" in row:
+            mask = np.asarray(row["mask"], dtype=bool)
+            flux_m = np.where(mask, np.nan, flux)
+        else:
+            flux_m = flux
         ax = axes[i]
-        ax.plot(lam, flux_m, linewidth=0.5, color="navy")
+        ax.plot(x, flux_m, linewidth=0.5, color="navy")
         title = f"row {i}"
         if z_col is not None:
             title += f"  z={z_col[i].as_py():.4f}"
         ax.set_title(title, fontsize=9)
-        ax.set_xlabel("Wavelength")
+        ax.set_xlabel(xlabel)
         ax.set_ylabel("Flux")
 
 
