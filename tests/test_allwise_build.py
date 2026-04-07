@@ -6,20 +6,27 @@ because of hats-import). The end-to-end build is exercised separately as a
 slow integration test on real cluster data.
 """
 
+import importlib.util
 import os
-import sys
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-# Make scripts/allwise importable
-SCRIPTS_ALLWISE = os.path.join(
-    os.path.dirname(__file__), "..", "scripts", "allwise"
-)
-sys.path.insert(0, SCRIPTS_ALLWISE)
-import build_parent_sample_hats as build  # noqa: E402
+
+def _load_build_module():
+    """Load scripts/allwise/build_parent_sample_hats.py under a unique name."""
+    path = os.path.join(
+        os.path.dirname(__file__), "..", "scripts", "allwise", "build_parent_sample_hats.py"
+    )
+    spec = importlib.util.spec_from_file_location("_allwise_build", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+build = _load_build_module()
 
 
 def _make_fake_allwise_shard(path: str, n_rows: int = 50) -> str:

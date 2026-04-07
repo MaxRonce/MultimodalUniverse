@@ -5,8 +5,8 @@ under a tmp dir, so the parsing/joining/Arrow-conversion code is exercised
 without any I/O against real SDSS data.
 """
 
+import importlib.util
 import os
-import sys
 
 import numpy as np
 import pyarrow as pa
@@ -14,10 +14,18 @@ import pytest
 from astropy.io import fits
 from astropy.table import Table
 
-# Make scripts/sdss importable
-SCRIPTS_SDSS = os.path.join(os.path.dirname(__file__), "..", "scripts", "sdss")
-sys.path.insert(0, SCRIPTS_SDSS)
-import build_parent_sample_hats as build  # noqa: E402
+
+def _load_build_module():
+    path = os.path.join(
+        os.path.dirname(__file__), "..", "scripts", "sdss", "build_parent_sample_hats.py"
+    )
+    spec = importlib.util.spec_from_file_location("_sdss_build", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+build = _load_build_module()
 
 
 def _make_fake_specobj(path: str, n_objects: int = 6) -> None:

@@ -52,6 +52,7 @@ MAX_FILES = _resolve("max_files", None)  # None = build everything
 PORTED = [
     "sdss",      # scripts/sdss/build_parent_sample_hats.py (raw FITS plate files)
     "allwise",   # scripts/allwise/build_parent_sample_hats.py (raw IRSA parquet)
+    "twomass",   # scripts/twomass/build_parent_sample_hats.py (raw IRSA gzipped CSV)
 ]
 
 
@@ -89,5 +90,14 @@ rule build_sdss:
         marker = catalog_marker("sdss"),
     params:
         cmd = build_command("sdss"),
+    shell:
+        "{params.cmd}"
+
+
+rule build_twomass:
+    output:
+        marker = catalog_marker("twomass"),
+    params:
+        cmd = build_command("twomass"),
     shell:
         "{params.cmd}"
