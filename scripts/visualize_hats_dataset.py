@@ -115,11 +115,17 @@ def plot_timeseries(table, axes, n_show=4):
         flux_err = None
         if "flux_err" in table.schema.names:
             flux_err = np.asarray(table.column("flux_err")[i].as_py(), dtype=np.float32)
+        # MMU v1 stores fixed-length arrays with zero-padding at the end.
+        # Drop padding rows (where time AND flux are both 0) for plotting.
+        valid = ~((time == 0) & (flux == 0))
+        time = time[valid]
+        flux = flux[valid]
         if flux_err is not None:
+            flux_err = flux_err[valid]
             axes[i].errorbar(time, flux, yerr=flux_err, fmt=".", markersize=2, color="navy", elinewidth=0.4)
         else:
             axes[i].plot(time, flux, ".", markersize=2, color="navy")
-        axes[i].set_title(f"row {i}", fontsize=9)
+        axes[i].set_title(f"row {i}  ({len(time)} points)", fontsize=9)
         axes[i].set_xlabel("Time")
         axes[i].set_ylabel("Flux")
 

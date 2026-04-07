@@ -26,7 +26,11 @@ RA_ALIASES = ("ra", "RA", "Ra")
 DEC_ALIASES = ("dec", "DEC", "Dec", "decl", "DECL")
 
 # Possible object_id aliases.
-OBJECT_ID_ALIASES = ("object_id", "OBJECT_ID", "objid", "OBJID", "object_id_")
+OBJECT_ID_ALIASES = (
+    "object_id", "OBJECT_ID", "objid", "OBJID", "object_id_",
+    "source_id",  # Gaia
+    "TARGETID",   # DESI
+)
 
 
 def np_to_pyarrow_list(array: np.ndarray) -> pa.Array:

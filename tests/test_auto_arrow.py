@@ -201,6 +201,17 @@ class TestRADecAliases:
         assert "RA" not in table.schema.names
         assert "DEC" not in table.schema.names
 
+    def test_source_id_alias(self, n):
+        """Gaia uses source_id instead of object_id."""
+        h5 = make_hdf5({
+            "ra": np.random.rand(n).astype(np.float64) * 360,
+            "dec": np.random.rand(n).astype(np.float64) * 180 - 90,
+            "source_id": np.arange(n, dtype=np.int64),
+        })
+        table = auto_arrow_table_from_hdf5(h5)
+        assert "object_id" in table.schema.names
+        assert table.column("object_id")[0].as_py() == "0"
+
     def test_decl_alias(self, n):
         h5 = make_hdf5({
             "ra": np.random.rand(n).astype(np.float64) * 360,
