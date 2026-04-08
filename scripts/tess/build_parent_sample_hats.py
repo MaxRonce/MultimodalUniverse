@@ -27,7 +27,6 @@ import numpy as np
 import pyarrow as pa
 from astropy.io import fits
 
-from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import to_native_endian, write_hats
 
@@ -53,15 +52,16 @@ def find_raw_files(raw_root: str, max_files: int | None = None) -> list[str]:
     return files
 
 
-def read_lightcurve(
-    path: str,
-    ra_center: float | None = None,
-    dec_center: float | None = None,
-    radius: float | None = None,
-) -> dict | None:
+def read_lightcurve(path: str) -> dict | None:
     """Read one TESS SPOC FFI lightcurve. Returns a per-row dict, or None on
-    failure (file is unreadable / missing the expected columns / no TIC in name /
-    outside the cone cut if one is active).
+    failure (file is unreadable / missing the expected columns / no TIC in name).
+
+    Note: no cone-cut support. TESS filenames don't encode RA/Dec, so cone
+    filtering would require opening every one of ~160k files on disk before
+    even knowing which to process (~1-2 hours of serial I/O on ceph). This is
+    architecturally at odds with the per-script cone filter we use elsewhere.
+    For test slices, use ``--max-files=N``; for production, build the full
+    set without a cone cut.
     """
     parsed = parse_filename(path)
     if parsed is None:
@@ -77,14 +77,6 @@ def read_lightcurve(
             dec = float(hdr["dec_obj"])
         except KeyError:
             return None
-
-        # Cone cut BEFORE expensive array extraction.
-        if ra_center is not None and dec_center is not None and radius is not None:
-            if not apply_cone_filter(
-                np.array([ra]), np.array([dec]),
-                ra_center, dec_center, radius,
-            )[0]:
-                return None
 
         lc = hdul["LIGHTCURVE"].data
 
@@ -144,11 +136,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--pixel-threshold", type=int, default=8192)
-    parser.add_argument("--ra-center", type=float, default=None)
-    parser.add_argument("--dec-center", type=float, default=None)
+    # Accept but ignore cone args so tess rules still plug into the shared
+    # Snakemake cone profile. TESS filenames don't encode RA/Dec, so the cone
+    # filter is intentionally a no-op here (see read_lightcurve docstring).
+    parser.add_argument("--ra-center", type=float, default=None,
+                        help="(accepted but ignored for tess)")
+    parser.add_argument("--dec-center", type=float, default=None,
+                        help="(accepted but ignored for tess)")
     parser.add_argument("--radius", type=float, default=None,
-                        help="Cone radius in degrees; requires --ra-center/--dec-center.")
+                        help="(accepted but ignored for tess)")
     args = parser.parse_args(argv)
+    if args.ra_center is not None or args.dec_center is not None or args.radius is not None:
+        print("WARNING: tess does not support cone cuts "
+              "(filenames don't encode RA/Dec); arguments ignored.",
+              file=sys.stderr)
 
     files = find_raw_files(args.raw_root, max_files=args.max_files)
     if not files:
@@ -158,12 +159,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rows: list[dict] = []
     for i, p in enumerate(files, 1):
-        row = read_lightcurve(
-            p,
-            ra_center=args.ra_center,
-            dec_center=args.dec_center,
-            radius=args.radius,
-        )
+        row = read_lightcurve(p)
         if row is None:
             continue
         rows.append(row)

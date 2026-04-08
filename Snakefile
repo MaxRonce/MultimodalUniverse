@@ -88,14 +88,37 @@ def catalog_marker(name: str) -> str:
     return f"{HATS_ROOT}/{name}/{name}/{name}/hats.properties"
 
 
+# Datasets where the script's filenames don't encode RA/Dec, so a cone cut
+# would require opening every one of O(100k) files just to read headers.
+# For these we fall back to a ``--max-files`` cap when a cone is requested,
+# which gives a usable test slice without ~hours of header I/O. A proper
+# production build of these datasets simply doesn't set cone args.
+DATASETS_WITHOUT_CONE_SUPPORT = {"tess"}
+CONE_FALLBACK_MAX_FILES = 3
+
+
 def build_command(dataset: str) -> str:
     parts = [
         "python", "-m", f"scripts.{dataset}.build_parent_sample_hats",
         "--output-root", f"{HATS_ROOT}/{dataset}",
     ]
+
+    cone_active = (
+        RA_CENTER is not None and DEC_CENTER is not None and RADIUS is not None
+    )
+
+    if dataset in DATASETS_WITHOUT_CONE_SUPPORT and cone_active:
+        # Cap the file count so test-slice builds of cone-incompatible
+        # datasets finish quickly. The script will still write a valid HATS
+        # catalog, just against the first few input files rather than a
+        # sky-region slice.
+        effective_max = MAX_FILES if MAX_FILES is not None else CONE_FALLBACK_MAX_FILES
+        parts += ["--max-files", str(effective_max)]
+        return " ".join(parts)
+
     if MAX_FILES is not None:
         parts += ["--max-files", str(MAX_FILES)]
-    if RA_CENTER is not None and DEC_CENTER is not None and RADIUS is not None:
+    if cone_active:
         parts += [
             "--ra-center", str(RA_CENTER),
             "--dec-center", str(DEC_CENTER),
