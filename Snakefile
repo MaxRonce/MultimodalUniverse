@@ -207,7 +207,12 @@ SHARDED_DATASETS = {
         build_runtime_min=360,    # 6h per shard
         ingest_mem_mb=900_000,
         ingest_runtime_min=240,
-        ingest_workers=96,
+        # desi rows are big (7781-wavelength spectrum struct per row), so
+        # dask ingest workers need to be few-and-fat rather than many-and-
+        # small. With 96 workers the hats-import splitting stage crashed
+        # on `30605 split stages did not complete successfully` from dask
+        # OOM thrashing on the per-worker 5 GB default.
+        ingest_workers=8,
     ),
     "gaia": dict(
         num_shards=8,
@@ -223,9 +228,14 @@ SHARDED_DATASETS = {
         num_processes=32,   # per-worker holds one IFU cube ~500 MB
         build_mem_mb=500_000,
         build_runtime_min=240,
-        ingest_mem_mb=500_000,
-        ingest_runtime_min=120,
-        ingest_workers=96,
+        ingest_mem_mb=900_000,
+        ingest_runtime_min=240,
+        # manga rows are ~500 MB each (9216×4563 spaxel cube + griz images
+        # + DAP maps), so dask ingest workers need to be fat. 96 workers
+        # at the default 5 GB per-worker limit OOM-thrash in the splitting
+        # stage — the first manga gather attempt crawled to 2% in 1h43m
+        # with constant worker restarts. 8 workers × ~100 GB each fits.
+        ingest_workers=8,
     ),
 }
 
