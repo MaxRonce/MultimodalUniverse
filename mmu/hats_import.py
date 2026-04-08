@@ -16,6 +16,7 @@ build their own PyArrow tables from the survey-native raw inputs and call
 """
 
 import contextlib
+import glob
 import logging
 import os
 import shutil
@@ -211,7 +212,20 @@ def write_hats_from_parquet_dir(
     """
     if not os.path.isdir(parquet_dir):
         raise FileNotFoundError(f"parquet_dir does not exist: {parquet_dir}")
-    glob_pattern = os.path.join(parquet_dir, "**", "*.parquet")
+
+    # Enumerate parquet files explicitly. We pass them via input_file_list
+    # rather than relying on hats-import's input_path glob, because the
+    # latter calls find_files_matching_path(input_path, "**/*.*") which uses
+    # rglob with a `**/*.*` pattern that doesn't reliably match files at the
+    # top of the directory across different filesystem backends.
+    parquet_files = sorted(
+        glob.glob(os.path.join(parquet_dir, "**", "*.parquet"), recursive=True)
+    )
+    if not parquet_files:
+        raise FileNotFoundError(
+            f"no *.parquet files under {parquet_dir} (recursive search)"
+        )
+
     tmp_dir = tempfile.mkdtemp(prefix=f"hats_import_{catalog_name}_")
     try:
         import_args = (
@@ -221,7 +235,7 @@ def write_hats_from_parquet_dir(
                 tmp_dir=tmp_dir,
             )
             .catalog(
-                input_path=glob_pattern,
+                input_file_list=parquet_files,
                 file_reader=ParquetPyarrowReader(chunksize=chunksize),
                 ra_column="ra",
                 dec_column="dec",
