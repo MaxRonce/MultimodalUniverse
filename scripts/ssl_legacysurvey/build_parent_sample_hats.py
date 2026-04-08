@@ -164,10 +164,10 @@ def read_chunk(
         n_total = f["ra"].shape[0]
         n = min(n_total, max_rows) if max_rows else n_total
 
+        # Read ra/dec first — this is cheap (a few MB per chunk).
         ra = np.asarray(f["ra"][:n], dtype=np.float64)
         dec = np.asarray(f["dec"][:n], dtype=np.float64)
 
-        # Cone cut BEFORE the expensive image array read.
         if ra_center is not None and dec_center is not None and radius is not None:
             cone_mask = apply_cone_filter(ra, dec, ra_center, dec_center, radius)
             keep = np.where(cone_mask)[0]
@@ -175,26 +175,41 @@ def read_chunk(
                 return None
             ra = ra[keep]
             dec = dec[keep]
+            use_fancy = True
         else:
-            keep = np.arange(n)
+            keep = None
+            use_fancy = False
+
+        def _load(name: str, dtype=None):
+            """Load a dataset with h5py fancy indexing when a cone cut is
+            active, or a bulk slice otherwise.
+
+            Without fancy indexing (`f[name][keep]`), the previous version
+            read the entire chunk into memory (~277 MB for the ``images``
+            cube) and then sliced in numpy — which is *orders of magnitude*
+            slower than h5py's native selection against the underlying
+            HDF5 chunks, especially over Ceph.
+            """
+            arr = f[name][keep] if use_fancy else f[name][:n]
+            if dtype is not None:
+                arr = np.asarray(arr, dtype=dtype)
+            return arr
 
         # ssl_legacysurvey uses `inds` as the unique source ID.
-        inds = np.asarray(f["inds"][:n])[keep]
+        inds = _load("inds")
 
-        # h5py accepts ndarray indices (fancy indexing); use keep for all
-        # expensive arrays so we only load what the cone cut passed.
-        image_array = np.asarray(f["images"][:n], dtype=np.float32)[keep]
-        psfsize = np.asarray(f["psfsize"][:n], dtype=np.float32)[keep]
+        image_array = _load("images", dtype=np.float32)
+        psfsize = _load("psfsize", dtype=np.float32)
 
         scalars: dict[str, np.ndarray] = {}
         for c in SCALAR_COLUMNS:
             if c in f:
-                scalars[c] = np.asarray(f[c][:n], dtype=np.float32)[keep]
+                scalars[c] = _load(c, dtype=np.float32)
 
         per_band: dict[str, np.ndarray] = {}
         for c in PER_BAND_COLUMNS:
             if c in f:
-                per_band[c] = np.asarray(f[c][:n], dtype=np.float32)[keep]
+                per_band[c] = _load(c, dtype=np.float32)
 
     columns: dict[str, pa.Array] = {
         "ra": pa.array(to_native_endian(ra)),
