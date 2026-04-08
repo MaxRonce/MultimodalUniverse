@@ -84,8 +84,20 @@ PER_BAND_SUFFIXES = ["g", "r", "z"]
 
 
 def find_raw_files(raw_root: str, max_files: int | None = None) -> list[str]:
-    """Find Stein-et-al image chunk h5 files under ``raw_root``."""
+    """Find Stein-et-al image chunk h5 files under ``raw_root``.
+
+    Accepts either (a) a raw root directly containing ``images_npix152_*.h5``
+    files, or (b) the Stein-et-al top-level directory containing ``north/``
+    and/or ``south/`` subdirectories. In case (b) we recurse into both and
+    concatenate the shard lists, so cone cuts can pick up the COSMOS field
+    (Dec=+2) which lives in DECaLS south, not north.
+    """
     files = sorted(glob.glob(os.path.join(raw_root, "images_npix152_*.h5")))
+    if not files:
+        for sub in ("north", "south"):
+            sub_path = os.path.join(raw_root, sub)
+            if os.path.isdir(sub_path):
+                files.extend(sorted(glob.glob(os.path.join(sub_path, "images_npix152_*.h5"))))
     if max_files is not None:
         files = files[:max_files]
     return files
@@ -202,7 +214,9 @@ def read_chunk(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--raw-root", default=os.path.join(DATASETS[CATALOG_NAME].raw_path, "north"))
+    parser.add_argument("--raw-root", default=DATASETS[CATALOG_NAME].raw_path,
+                        help="Stein-et-al top-level dir (contains north/ and south/), "
+                             "or a specific subdir.")
     parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
     parser.add_argument("--max-files", type=int, default=None,
                         help="Cap on number of image chunks (each chunk is ~1M objects).")
