@@ -135,13 +135,19 @@ def _read_source_columns(source_path: str, columns: list[str]) -> dict[str, np.n
 
 
 def _struct(cols: dict[str, np.ndarray], names: list[str]) -> pa.StructArray:
-    """Build a PyArrow StructArray from a dict of 1D numpy arrays."""
+    """Build a PyArrow StructArray from a dict of 1D numpy arrays.
+
+    Every field is cast to ``float32`` to guarantee a stable schema across
+    shards. Without the cast, a column that is missing in one shard (filled
+    by :func:`_read_source_columns` with float32 NaN) and present as native
+    int64 in another shard would produce parquet files with inconsistent
+    schemas, and the gather step would reject them at concat time.
+    This mirrors the dtype handling in gaia_xp's `_struct`.
+    """
     arrays = []
     for name in names:
-        arr = cols[name]
-        # Floats stay float32, object_id stays int64, everything else just
-        # gets its natural numpy dtype coerced through pa.array.
-        arrays.append(pa.array(arr))
+        arr = np.asarray(cols[name], dtype=np.float32)
+        arrays.append(pa.array(arr, type=pa.float32()))
     return pa.StructArray.from_arrays(arrays, names=names)
 
 
