@@ -49,7 +49,7 @@ DATASETS: dict[str, DatasetConfig] = {
     "desi_provabgs": DatasetConfig("desi_provabgs", "tabular", "DESI_PROVABGS"),
 
     # --- Images ---
-    "legacysurvey":     DatasetConfig("legacysurvey", "image", "legacysurvey/dr10"),
+    "legacysurvey":     DatasetConfig("legacysurvey", "image", "legacysurvey"),
     "ssl_legacysurvey": DatasetConfig("ssl_legacysurvey", "image", "DECALS_Stein_et_al"),
     "hsc":              DatasetConfig("hsc", "image", "hsc/pdr3_dud"),
     "jwst":             DatasetConfig("jwst", "image", "JWST"),
