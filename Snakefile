@@ -81,6 +81,7 @@ PORTED = [
     "ssl_legacysurvey",  # raw Stein-et-al DECaLS image chunks (h5 per 1M objects)
     "gaia",      # raw Gaia DR3 (GaiaSource + XpContinuousMeanSpectrum joined on source_id)
     "legacysurvey",  # raw DECaLS DR10 south sweeps + brick coadds (image cutouts + nearby catalog)
+    "manga",     # raw SDSS-IV MaNGA IFU LOGCUBE + DAP MAPS files (spaxels + griz images + analysis maps)
 ]
 
 
@@ -219,5 +220,14 @@ rule build_legacysurvey:
         marker = catalog_marker("legacysurvey"),
     params:
         cmd = build_command("legacysurvey"),
+    shell:
+        "{params.cmd}"
+
+
+rule build_manga:
+    output:
+        marker = catalog_marker("manga"),
+    params:
+        cmd = build_command("manga"),
     shell:
         "{params.cmd}"
