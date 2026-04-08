@@ -9,12 +9,15 @@ EXPECTED_NON_SKIPPED = {
     "sdss", "desi", "vipers", "galah", "apogee", "chandra",
     "gaia", "desi_provabgs",
     "legacysurvey", "ssl_legacysurvey", "hsc", "jwst", "btsbot", "gz10",
-    "tess", "kepler", "foundation", "snls",
+    "tess", "foundation", "snls",
     "ps1_sne_ia", "des_y3_sne_ia", "swift_sne_ia",
     "allwise", "twomass", "galex", "sages",
     "manga",
 }
-EXPECTED_SKIPPED = {"plasticc"}  # raw dir empty on cluster
+EXPECTED_SKIPPED = {
+    "plasticc",  # raw dir empty on cluster
+    "kepler",    # raw FITS not on cluster; only v1 HDF5 exists
+}
 VALID_MODALITIES = {"spectra", "image", "timeseries", "tabular", "ifu"}
 
 
