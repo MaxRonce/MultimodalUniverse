@@ -529,6 +529,16 @@ def process_brick(
     return out_records
 
 
+def _as_array(a: pa.Array | pa.ChunkedArray) -> pa.Array:
+    """pa.array(...) on a large nested Python list can return a ChunkedArray,
+    which pa.StructArray.from_arrays rejects with 'Expected Array, got
+    ChunkedArray'. Force it to a contiguous Array via combine_chunks().
+    """
+    if isinstance(a, pa.ChunkedArray):
+        return a.combine_chunks()
+    return a
+
+
 def _build_image_struct(records: list[dict]) -> pa.StructArray:
     band_arr = pa.array([r["image_band"] for r in records], type=pa.list_(pa.string()))
 
@@ -560,7 +570,8 @@ def _build_image_struct(records: list[dict]) -> pa.StructArray:
         [list(r["image_scale"]) for r in records], type=pa.list_(pa.float32())
     )
     return pa.StructArray.from_arrays(
-        [band_arr, flux_arr, ivar_arr, mask_arr, psf_arr, scale_arr],
+        [_as_array(a) for a in
+         (band_arr, flux_arr, ivar_arr, mask_arr, psf_arr, scale_arr)],
         names=["band", "flux", "ivar", "mask", "psf_fwhm", "scale"],
     )
 
@@ -584,9 +595,11 @@ def _build_nearby_catalog_struct(records: list[dict]) -> pa.StructArray:
     names = []
     for key in CATALOG_FEATURES:
         arrays.append(
-            pa.array(
-                [r["nearby_catalog"][key] for r in records],
-                type=pa.list_(pa.float32()),
+            _as_array(
+                pa.array(
+                    [r["nearby_catalog"][key] for r in records],
+                    type=pa.list_(pa.float32()),
+                )
             )
         )
         names.append(key)
