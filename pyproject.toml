@@ -41,6 +41,7 @@ dependencies = [
     "scikit-image>=0.26.0",
     "pillow>=12.2.0",
     "filelock>=3.25.2",
+    "snakemake-executor-plugin-slurm>=2.6.0",
 ]
 dynamic = ["version"]
 

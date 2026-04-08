@@ -129,6 +129,27 @@ def build_command(dataset: str) -> str:
     return " ".join(parts)
 
 
+# --------------------------------------------------------------------------- #
+#                          PER-RULE SLURM RESOURCES                            #
+# --------------------------------------------------------------------------- #
+# When invoked with `snakemake --executor slurm`, each rule below is submitted
+# as one sbatch job with the resources declared in its `resources:` block.
+# Memory budgets are deliberately fat — we trust the CCM partition to have
+# the headroom — and reflect rough scale of the dataset:
+#
+#   tabular (single-pass) :  ~200 GB RAM, 1 core, 8h walltime
+#   spectra (desi, sdss)  :  ~500 GB RAM, 8 cores (desispec coadd_cameras),
+#                            24h walltime
+#   gaia (XP join)        :  ~750 GB RAM (228-col GaiaSource shards), 24h
+#   image  (ssl, legacy)  :  ~750 GB RAM, 24h, lots of I/O
+#   ifu    (manga)        :  ~500 GB RAM, 24h
+#
+# Adjust if rules OOM. The slurm partition is set to ``ccm`` because that's
+# where the user has allocation headroom.
+
+SLURM_PARTITION = "ccm"
+
+
 rule all:
     input:
         [catalog_marker(name) for name in PORTED],
@@ -139,6 +160,11 @@ rule build_allwise:
         marker = catalog_marker("allwise"),
     params:
         cmd = build_command("allwise"),
+    resources:
+        mem_mb = 200_000,
+        runtime = 480,            # minutes (8h)
+        cpus_per_task = 1,
+        slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
 
@@ -148,6 +174,11 @@ rule build_sdss:
         marker = catalog_marker("sdss"),
     params:
         cmd = build_command("sdss"),
+    resources:
+        mem_mb = 500_000,
+        runtime = 1440,           # 24h
+        cpus_per_task = 8,
+        slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
 
@@ -157,6 +188,11 @@ rule build_twomass:
         marker = catalog_marker("twomass"),
     params:
         cmd = build_command("twomass"),
+    resources:
+        mem_mb = 200_000,
+        runtime = 480,
+        cpus_per_task = 1,
+        slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
 
@@ -166,6 +202,11 @@ rule build_sages:
         marker = catalog_marker("sages"),
     params:
         cmd = build_command("sages"),
+    resources:
+        mem_mb = 100_000,
+        runtime = 240,            # 4h
+        cpus_per_task = 1,
+        slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
 
@@ -175,6 +216,11 @@ rule build_galex:
         marker = catalog_marker("galex"),
     params:
         cmd = build_command("galex"),
+    resources:
+        mem_mb = 200_000,
+        runtime = 480,
+        cpus_per_task = 1,
+        slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
 
@@ -184,6 +230,11 @@ rule build_desi:
         marker = catalog_marker("desi"),
     params:
         cmd = build_command("desi"),
+    resources:
+        mem_mb = 750_000,
+        runtime = 2880,           # 48h — desispec.coadd_cameras × 32k coadds
+        cpus_per_task = 8,
+        slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
 
@@ -193,6 +244,11 @@ rule build_tess:
         marker = catalog_marker("tess"),
     params:
         cmd = build_command("tess"),
+    resources:
+        mem_mb = 100_000,
+        runtime = 1440,           # 24h — opens 160k single-LC FITS serially
+        cpus_per_task = 1,
+        slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
 
@@ -202,6 +258,11 @@ rule build_ssl_legacysurvey:
         marker = catalog_marker("ssl_legacysurvey"),
     params:
         cmd = build_command("ssl_legacysurvey"),
+    resources:
+        mem_mb = 750_000,
+        runtime = 2880,           # 48h — ~10 TB image cube I/O
+        cpus_per_task = 4,
+        slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
 
@@ -211,6 +272,11 @@ rule build_gaia:
         marker = catalog_marker("gaia"),
     params:
         cmd = build_command("gaia"),
+    resources:
+        mem_mb = 750_000,
+        runtime = 1440,           # 24h — 800 (GaiaSource, XP) shard pairs
+        cpus_per_task = 4,
+        slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
 
@@ -220,6 +286,11 @@ rule build_legacysurvey:
         marker = catalog_marker("legacysurvey"),
     params:
         cmd = build_command("legacysurvey"),
+    resources:
+        mem_mb = 750_000,
+        runtime = 2880,           # 48h — 1436 sweep files + brick image cutouts
+        cpus_per_task = 8,
+        slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
 
@@ -229,5 +300,10 @@ rule build_manga:
         marker = catalog_marker("manga"),
     params:
         cmd = build_command("manga"),
+    resources:
+        mem_mb = 500_000,
+        runtime = 1440,           # 24h — ~13k cube + maps file pairs
+        cpus_per_task = 4,
+        slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
