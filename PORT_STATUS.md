@@ -19,7 +19,7 @@ Live tracker for the raw → HATS port of v1 MMU. Every non-skipped dataset in `
 | Dataset | Rows | Size | Sky frac | Notes |
 |---|---:|---:|---:|---|
 | sdss | 4,254,830 | 193 GB | 0.35 | DR17 spectra, full run |
-| gaia (XP subset) | 219,197,643 | 293 GB | 1.00 | GaiaSource × XpContinuousMeanSpectrum join. See TODO below — user wants `gaia` renamed to `gaia_xp` and a NEW `gaia` containing all ~1.8B DR3 sources. |
+| gaia_xp | 219,197,643 | 293 GB | 1.00 | Renamed from `gaia`. GaiaSource × XpContinuousMeanSpectrum join, full 20-field astrometry + BP/RP spectrum + photometry + RV + gspphot. |
 | galex | 82,992,062 | 18 GB | 0.82 | GUVCat AIS |
 | tess | 159,994 | 17 GB | 0.06 | SPOC FFI lightcurves |
 | sages | 29,332,961 | 1.5 GB | 0.26 | DR1 u/v photometry |
@@ -33,7 +33,7 @@ Live tracker for the raw → HATS port of v1 MMU. Every non-skipped dataset in `
 - [~] **legacysurvey** — 128-shard preempt scatter running. Previous run had a ChunkedArray bug that silently dropped 135 large sweeps; fix landed in commit `a81eae9`, skip-if-exists optimization in `a880b99` lets the rerun reuse the 211 good parquets already on disk.
 - [~] **desi** — scatter complete (16/16 markers exist), gather rerun pending with `ingest_workers=8` after the first attempt crashed in the hats-import splitting stage with too-many-dask-workers OOM.
 - [~] **manga** — scatter complete (8/8 markers), gather rerun pending with `ingest_workers=8` (same reason as desi; first attempt crawled to 2% in 1h43m with constant dask worker restarts).
-- [~] **foundation / snls / ps1_sne_ia / des_y3_sne_ia / swift_sne_ia** — all 5 SN-Ia scripts queued in the current snakemake master, tiny datasets (100–400 SNe each), expected ~1 min wall each.
+- [~] **gaia (full DR3)** — new build, 16 preempt shards for ~1.8B sources across 3386 GaiaSource HDF5 shards. Running in the parallel `mmu_hats_snia` workdir to avoid locking the legacysurvey master. No XP join; just GaiaSource columns.
 
 ## Ported + tests passing (baseline)
 
@@ -70,10 +70,7 @@ Live tracker for the raw → HATS port of v1 MMU. Every non-skipped dataset in `
 
 ## Follow-up work
 
-- [ ] **gaia restructure**: split the current 220M XP-joined `gaia` catalog into
-  - `gaia` — ALL ~1.8B Gaia DR3 sources from `GaiaSource_*.hdf5`, no XP filter. New build script.
-  - `gaia_xp` — the current 220M XP-joined catalog, renamed from `gaia`.
-  Means moving the existing catalog and adding a second entry in `mmu/hats_configs.py`. Queued for after the current production run settles.
+- [x] **gaia restructure** — done. Current 220M catalog renamed on ceph from `gaia/` to `gaia_xp/`. `mmu/hats_configs.py` now has two entries. `scripts/gaia/` rewritten for the full 1.8B DR3 build; old script copied to `scripts/gaia_xp/`. 16 new tests green for the full-DR3 helpers. 16-shard build launched in parallel workdir.
 - [ ] **ssl_legacysurvey full-sky production**: ~42 TB expected output, crosses the Flatiron ceph "let us know if you'll generate >10 TB" courtesy threshold. Need to email scicomp before launching.
 
 ## Skipped (out of scope)
