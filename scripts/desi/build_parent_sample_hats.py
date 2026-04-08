@@ -66,7 +66,13 @@ from desispec import coaddition
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import to_native_endian, write_hats
+from mmu.hats_import import (
+    np_to_pyarrow_list,
+    to_native_endian,
+    write_hats,
+    write_hats_from_parquet_dir,
+)
+import pyarrow.parquet as pq
 
 
 CATALOG_NAME = "desi"
@@ -238,70 +244,42 @@ def _group_catalog(catalog: Table) -> list[tuple[str, str, int, np.ndarray, np.n
     return groups
 
 
-def build_table(
-    catalog: Table,
-    raw_root: str,
-    max_groups: int | None = None,
+def _build_group_table(
+    catalog_subset: Table,
+    spectrum_arrays: dict[str, np.ndarray],
 ) -> pa.Table:
-    """Process the catalog (after selection_fn) into a PyArrow table matching
-    v1 MMU's HuggingFace DESI schema.
+    """Build the per-group PyArrow table from one coadd-file's spectra +
+    matching catalog rows. Used by both ``build_table`` (in-memory path)
+    and ``build_to_parquet_dir`` (streaming path).
     """
-    groups = _group_catalog(catalog)
-    if max_groups is not None:
-        groups = groups[:max_groups]
-
-    spectrum_rows: list[dict[str, np.ndarray]] = []
-    kept_row_indices: list[int] = []
-    for i, (survey, program, healpix, target_ids, row_idx) in enumerate(groups, 1):
-        path = coadd_file_path(raw_root, survey, program, healpix)
-        if not os.path.exists(path):
-            print(
-                f"  [{i}/{len(groups)}] MISSING {os.path.basename(path)}"
-                f" ({len(target_ids)} fibers skipped)",
-                file=sys.stderr,
-            )
-            continue
-        result = process_coadd(path, target_ids)
-        spectrum_rows.append(result)
-        kept_row_indices.extend(row_idx.tolist())
-        print(
-            f"  [{i}/{len(groups)}] {os.path.basename(path)}: {len(target_ids)} fibers"
-        )
-
-    if not spectrum_rows:
-        raise RuntimeError("No spectra produced — all groups had missing coadd files.")
-
-    # Concatenate per-file arrays (each row = one fiber).
-    flux = np.concatenate([r["flux"] for r in spectrum_rows], axis=0)
-    ivar = np.concatenate([r["ivar"] for r in spectrum_rows], axis=0)
-    lam = np.concatenate([r["lambda"] for r in spectrum_rows], axis=0)
-    lsf_sigma = np.concatenate([r["lsf_sigma"] for r in spectrum_rows], axis=0)
-    mask = np.concatenate([r["mask"] for r in spectrum_rows], axis=0)
-    target_ids_ordered = np.concatenate([r["TARGETID"] for r in spectrum_rows], axis=0)
-
-    # Reorder the surviving scalar rows to match the spectrum order.
-    # kept_row_indices already gives the order in which scalar rows were
-    # processed (same order as spectrum_rows), so we use them as-is.
-    catalog_subset = catalog[np.asarray(kept_row_indices)]
-
-    # Sanity check: catalog target ids must match concatenated spectrum target ids.
+    target_ids_ordered = spectrum_arrays["TARGETID"]
     cat_tids = np.asarray(catalog_subset["TARGETID"])
     if not np.array_equal(cat_tids, target_ids_ordered):
         raise RuntimeError(
             "TARGETID ordering mismatch between catalog subset and processed spectra. "
             f"catalog[:5]={cat_tids[:5]}, spectra[:5]={target_ids_ordered[:5]}"
         )
-
     ra = np.asarray(catalog_subset["TARGET_RA"], dtype=np.float64)
     dec = np.asarray(catalog_subset["TARGET_DEC"], dtype=np.float64)
 
-    # Build the spectrum struct (plain nested lists, no extension types).
-    n = len(target_ids_ordered)
-    flux_arr = pa.array([list(row) for row in flux], type=pa.list_(pa.float32()))
-    ivar_arr = pa.array([list(row) for row in ivar], type=pa.list_(pa.float32()))
-    lsf_arr = pa.array([list(row) for row in lsf_sigma], type=pa.list_(pa.float32()))
-    lam_arr = pa.array([list(row) for row in lam], type=pa.list_(pa.float32()))
-    mask_arr = pa.array([list(row) for row in mask], type=pa.list_(pa.bool_()))
+    # Build the spectrum struct using fast offset-based ListArrays (avoid
+    # Python list-of-list materialization which doubles memory).
+    flux = spectrum_arrays["flux"]
+    ivar = spectrum_arrays["ivar"]
+    lam = spectrum_arrays["lambda"]
+    lsf = spectrum_arrays["lsf_sigma"]
+    bad_mask = spectrum_arrays["mask"]
+
+    flux_arr = np_to_pyarrow_list(flux.astype(np.float32))
+    ivar_arr = np_to_pyarrow_list(ivar.astype(np.float32))
+    lsf_arr = np_to_pyarrow_list(lsf.astype(np.float32))
+    lam_arr = np_to_pyarrow_list(lam.astype(np.float32))
+    # ListArray.from_arrays requires a values array; build via offsets too.
+    nrows, length = bad_mask.shape
+    mask_values = pa.array(bad_mask.reshape(-1).astype(bool))
+    mask_offsets = np.arange(0, (nrows + 1) * length, length, dtype=np.int32)
+    mask_arr = pa.ListArray.from_arrays(values=mask_values, offsets=mask_offsets)
+
     spectrum_struct = pa.StructArray.from_arrays(
         [flux_arr, ivar_arr, lsf_arr, lam_arr, mask_arr],
         names=["flux", "ivar", "lsf_sigma", "lambda", "mask"],
@@ -319,9 +297,94 @@ def build_table(
     for f in BOOL_FEATURES:
         arr = np.asarray(catalog_subset[f]).astype(bool)
         columns[f] = pa.array(arr)
-
-    assert len(columns["ra"]) == n
     return pa.table(columns)
+
+
+def build_table(
+    catalog: Table,
+    raw_root: str,
+    max_groups: int | None = None,
+) -> pa.Table:
+    """Small/test path: process all groups and concatenate into ONE PyArrow
+    table held in memory. Used for the cosmos test slice and for legacy
+    in-memory builds. Don't use for full production — see
+    :func:`build_to_parquet_dir` for the streaming alternative.
+    """
+    groups = _group_catalog(catalog)
+    if max_groups is not None:
+        groups = groups[:max_groups]
+
+    per_group_tables: list[pa.Table] = []
+    for i, (survey, program, healpix, target_ids, row_idx) in enumerate(groups, 1):
+        path = coadd_file_path(raw_root, survey, program, healpix)
+        if not os.path.exists(path):
+            print(
+                f"  [{i}/{len(groups)}] MISSING {os.path.basename(path)}"
+                f" ({len(target_ids)} fibers skipped)",
+                file=sys.stderr,
+            )
+            continue
+        result = process_coadd(path, target_ids)
+        catalog_subset = catalog[row_idx]
+        per_group_tables.append(_build_group_table(catalog_subset, result))
+        print(
+            f"  [{i}/{len(groups)}] {os.path.basename(path)}: {len(target_ids)} fibers"
+        )
+
+    if not per_group_tables:
+        raise RuntimeError("No spectra produced — all groups had missing coadd files.")
+    return pa.concat_tables(per_group_tables, promote_options="default")
+
+
+def build_to_parquet_dir(
+    catalog: Table,
+    raw_root: str,
+    parquet_dir: str,
+    max_groups: int | None = None,
+) -> int:
+    """Streaming path: process each (survey, program, healpix) group, build
+    its per-group PyArrow table, write it as one parquet file under
+    ``parquet_dir``, and free the memory before moving on. Returns the
+    number of parquet files written.
+
+    This is the production-scale path — peak memory is bounded by ONE
+    coadd-file group (~500 fibers × 7781 wavelengths × 5 arrays ~= ~80 MB)
+    rather than the full DR1 (~3 TB). Caller passes the resulting
+    ``parquet_dir`` to :func:`mmu.hats_import.write_hats_from_parquet_dir`.
+    """
+    os.makedirs(parquet_dir, exist_ok=True)
+    groups = _group_catalog(catalog)
+    if max_groups is not None:
+        groups = groups[:max_groups]
+
+    n_written = 0
+    for i, (survey, program, healpix, target_ids, row_idx) in enumerate(groups, 1):
+        path = coadd_file_path(raw_root, survey, program, healpix)
+        if not os.path.exists(path):
+            print(
+                f"  [{i}/{len(groups)}] MISSING {os.path.basename(path)}"
+                f" ({len(target_ids)} fibers skipped)",
+                file=sys.stderr,
+            )
+            continue
+        result = process_coadd(path, target_ids)
+        catalog_subset = catalog[row_idx]
+        table = _build_group_table(catalog_subset, result)
+        out_path = os.path.join(
+            parquet_dir, f"part-{survey}-{program}-{healpix:08d}.parquet"
+        )
+        pq.write_table(table, out_path)
+        n_written += 1
+        print(
+            f"  [{i}/{len(groups)}] {os.path.basename(path)}: "
+            f"{table.num_rows} fibers → {os.path.basename(out_path)}"
+        )
+        # Drop refs so the per-group buffers can be GC'd before the next iter.
+        del result, catalog_subset, table
+
+    if n_written == 0:
+        raise RuntimeError("No spectra produced — all groups had missing coadd files.")
+    return n_written
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -346,6 +409,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Cone-cut center Dec in degrees; requires --ra-center/--radius.")
     parser.add_argument("--radius", type=float, default=None,
                         help="Cone-cut radius in degrees; requires --ra-center/--dec-center.")
+    parser.add_argument("--in-memory", action="store_true",
+                        help="Use the legacy in-memory build (only safe for the cosmos test "
+                             "slice; full-DR1 builds OOM single nodes — default streams via "
+                             "per-group parquet files in --scratch-dir).")
+    parser.add_argument("--scratch-dir", default=None,
+                        help="Scratch directory for per-group parquet files (default: "
+                             "/tmp/desi_parquet_<pid>).")
     args = parser.parse_args(argv)
 
     zcat_path = args.zcatalog or os.path.join(args.raw_root, "zall-pix-iron.fits")
@@ -377,14 +447,33 @@ def main(argv: list[str] | None = None) -> int:
             print("  WARNING: cone cut left zero rows; no catalog to build.", file=sys.stderr)
             return 1
 
-    table = build_table(catalog, args.raw_root, max_groups=args.max_groups)
-    print(f"\nWriting HATS catalog: {table.num_rows} rows")
-    catalog_dir = write_hats(
-        [table],
-        output_path=args.output_root,
-        catalog_name=CATALOG_NAME,
-        pixel_threshold=args.pixel_threshold,
-    )
+    if args.in_memory:
+        table = build_table(catalog, args.raw_root, max_groups=args.max_groups)
+        print(f"\nWriting HATS catalog (in-memory): {table.num_rows} rows")
+        catalog_dir = write_hats(
+            [table],
+            output_path=args.output_root,
+            catalog_name=CATALOG_NAME,
+            pixel_threshold=args.pixel_threshold,
+        )
+    else:
+        scratch = args.scratch_dir or f"/tmp/desi_parquet_{os.getpid()}"
+        try:
+            n = build_to_parquet_dir(
+                catalog, args.raw_root, scratch, max_groups=args.max_groups
+            )
+            print(f"\nWriting HATS catalog from {n} parquet files in {scratch}")
+            catalog_dir = write_hats_from_parquet_dir(
+                scratch,
+                output_path=args.output_root,
+                catalog_name=CATALOG_NAME,
+                pixel_threshold=args.pixel_threshold,
+            )
+        finally:
+            # Clean up scratch unless caller pinned a specific dir.
+            if args.scratch_dir is None:
+                import shutil
+                shutil.rmtree(scratch, ignore_errors=True)
     print(f"Done: {catalog_dir}")
     return 0
 

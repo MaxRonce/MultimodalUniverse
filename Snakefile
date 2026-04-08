@@ -163,7 +163,7 @@ rule build_allwise:
     resources:
         mem_mb = 200_000,
         runtime = 480,            # minutes (8h)
-        cpus_per_task = 1,
+        cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
@@ -177,7 +177,7 @@ rule build_sdss:
     resources:
         mem_mb = 500_000,
         runtime = 1440,           # 24h
-        cpus_per_task = 8,
+        cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
@@ -191,7 +191,7 @@ rule build_twomass:
     resources:
         mem_mb = 200_000,
         runtime = 480,
-        cpus_per_task = 1,
+        cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
@@ -205,7 +205,7 @@ rule build_sages:
     resources:
         mem_mb = 100_000,
         runtime = 240,            # 4h
-        cpus_per_task = 1,
+        cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
@@ -219,7 +219,7 @@ rule build_galex:
     resources:
         mem_mb = 200_000,
         runtime = 480,
-        cpus_per_task = 1,
+        cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
@@ -233,7 +233,7 @@ rule build_desi:
     resources:
         mem_mb = 750_000,
         runtime = 2880,           # 48h — desispec.coadd_cameras × 32k coadds
-        cpus_per_task = 8,
+        cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
@@ -247,7 +247,7 @@ rule build_tess:
     resources:
         mem_mb = 100_000,
         runtime = 1440,           # 24h — opens 160k single-LC FITS serially
-        cpus_per_task = 1,
+        cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
@@ -261,7 +261,7 @@ rule build_ssl_legacysurvey:
     resources:
         mem_mb = 750_000,
         runtime = 2880,           # 48h — ~10 TB image cube I/O
-        cpus_per_task = 4,
+        cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
@@ -275,7 +275,7 @@ rule build_gaia:
     resources:
         mem_mb = 750_000,
         runtime = 1440,           # 24h — 800 (GaiaSource, XP) shard pairs
-        cpus_per_task = 4,
+        cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
@@ -289,7 +289,7 @@ rule build_legacysurvey:
     resources:
         mem_mb = 750_000,
         runtime = 2880,           # 48h — 1436 sweep files + brick image cutouts
-        cpus_per_task = 8,
+        cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
@@ -303,7 +303,7 @@ rule build_manga:
     resources:
         mem_mb = 500_000,
         runtime = 1440,           # 24h — ~13k cube + maps file pairs
-        cpus_per_task = 4,
+        cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"

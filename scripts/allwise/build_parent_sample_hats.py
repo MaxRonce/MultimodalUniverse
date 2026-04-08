@@ -33,7 +33,7 @@ import pyarrow.parquet as pq
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import write_hats
+from mmu.hats_import import write_hats, write_hats_from_parquet_dir
 
 
 # IRSA's AllWISE bulk download is partitioned by healpix at two levels,
@@ -127,6 +127,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dec-center", type=float, default=None)
     parser.add_argument("--radius", type=float, default=None,
                         help="Cone radius in degrees; requires --ra-center/--dec-center.")
+    parser.add_argument("--in-memory", action="store_true",
+                        help="Use the legacy in-memory build (only safe for the cosmos test "
+                             "slice; full AllWISE builds OOM single nodes — default streams "
+                             "via per-shard parquet files in --scratch-dir).")
+    parser.add_argument("--scratch-dir", default=None,
+                        help="Scratch directory for per-shard parquet files (default: "
+                             "/tmp/allwise_parquet_<pid>).")
     args = parser.parse_args(argv)
 
     cone_active = (
@@ -147,9 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"Found {len(files)} raw shard(s)")
 
-    tables = []
-    total_rows = 0
-    for i, path in enumerate(files, 1):
+    def _process_one(path: str) -> pa.Table | None:
         table = read_shard(path)
         if cone_active:
             ra = table.column("ra").to_numpy()
@@ -157,22 +162,66 @@ def main(argv: list[str] | None = None) -> int:
             mask = apply_cone_filter(ra, dec, args.ra_center, args.dec_center, args.radius)
             table = table.filter(pa.array(mask))
             if table.num_rows == 0:
+                return None
+        return table
+
+    if args.in_memory:
+        tables = []
+        total_rows = 0
+        for i, path in enumerate(files, 1):
+            table = _process_one(path)
+            if table is None:
                 continue
-        tables.append(table)
-        total_rows += table.num_rows
-        print(f"  [{i}/{len(files)}] {os.path.basename(os.path.dirname(path))}: {table.num_rows} rows")
+            tables.append(table)
+            total_rows += table.num_rows
+            print(f"  [{i}/{len(files)}] {os.path.basename(os.path.dirname(path))}: {table.num_rows} rows")
+        if not tables:
+            print("ERROR: no rows survived the cone cut", file=sys.stderr)
+            return 1
+        print(f"\nWriting HATS catalog (in-memory): {total_rows} rows from {len(tables)} shards")
+        catalog_dir = write_hats(
+            tables,
+            output_path=args.output_root,
+            catalog_name=CATALOG_NAME,
+            pixel_threshold=args.pixel_threshold,
+        )
+        print(f"Done: {catalog_dir}")
+        return 0
 
-    if not tables:
-        print("ERROR: no rows survived the cone cut", file=sys.stderr)
-        return 1
-
-    print(f"\nWriting HATS catalog: {total_rows} rows from {len(tables)} shards")
-    catalog_dir = write_hats(
-        tables,
-        output_path=args.output_root,
-        catalog_name=CATALOG_NAME,
-        pixel_threshold=args.pixel_threshold,
-    )
+    # Streaming path: per-shard parquet → write_hats_from_parquet_dir.
+    scratch = args.scratch_dir or f"/tmp/allwise_parquet_{os.getpid()}"
+    os.makedirs(scratch, exist_ok=True)
+    n_written = 0
+    total_rows = 0
+    try:
+        for i, path in enumerate(files, 1):
+            table = _process_one(path)
+            if table is None:
+                continue
+            # Use the parent dir name (healpix_k5=NNN) as part of the parquet filename
+            # so they're sortable + traceable.
+            parent = os.path.basename(os.path.dirname(path))
+            part_name = f"part-{parent}-{i:05d}.parquet"
+            out_path = os.path.join(scratch, part_name)
+            pq.write_table(table, out_path)
+            n_written += 1
+            total_rows += table.num_rows
+            print(f"  [{i}/{len(files)}] {parent}: {table.num_rows} rows → {part_name}")
+            del table
+        if n_written == 0:
+            print("ERROR: no rows survived the cone cut", file=sys.stderr)
+            return 1
+        print(f"\nWriting HATS catalog from {n_written} parquet files in {scratch} ({total_rows} total rows)")
+        catalog_dir = write_hats_from_parquet_dir(
+            scratch,
+            output_path=args.output_root,
+            catalog_name=CATALOG_NAME,
+            pixel_threshold=args.pixel_threshold,
+        )
+    finally:
+        if args.scratch_dir is None:
+            import shutil
+            shutil.rmtree(scratch, ignore_errors=True)
     print(f"Done: {catalog_dir}")
     return 0
 
