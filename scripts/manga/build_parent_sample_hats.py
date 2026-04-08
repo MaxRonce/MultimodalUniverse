@@ -39,16 +39,19 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
+from multiprocessing import Pool
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 from astropy.io import fits
 from astropy.table import Table, join
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import np_to_pyarrow_list, write_hats
+from mmu.hats_import import default_scratch_dir, np_to_pyarrow_list, write_hats_from_parquet_dir
 
 
 CATALOG_NAME = "manga"
@@ -466,6 +469,36 @@ def build_table(records: list[dict], catalog: Table) -> pa.Table:
     return pa.table(columns)
 
 
+def _process_cube_to_parquet(args: tuple) -> tuple[str, int, str | None]:
+    """Pool worker: read one MaNGA cube+MAPS pair, build a 1-row pa.Table,
+    and write it as ``part-<plateifu>.parquet`` under ``scratch``.
+
+    Input tuple: ``(plateifu, cube_file, map_file, row_dict, scratch)``
+    where ``row_dict`` is a dict of the catalog row fields build_table needs.
+
+    Returns ``(plateifu, n_maps_written, err)``. ``err`` is ``None`` on
+    success, a string on failure. All exceptions are converted to string
+    errors (not raised) so one bad cube doesn't kill the pool.
+
+    Must be module-level (not nested) for multiprocessing.Pool to pickle it.
+    """
+    plateifu, cube_file, map_file, row_dict, scratch = args
+    try:
+        rec = process_cube(plateifu, cube_file, map_file)
+        if rec is None:
+            return plateifu, 0, "missing cube or map file"
+        # Reconstruct a single-row astropy Table from the dict for build_table.
+        row_table = Table({k: [v] for k, v in row_dict.items()})
+        table = build_table([rec], row_table)
+        out_path = os.path.join(scratch, f"part-{plateifu}.parquet")
+        pq.write_table(table, out_path)
+        n_maps = len(rec["maps"])
+        del rec, table, row_table
+        return plateifu, n_maps, None
+    except BaseException as exc:  # noqa: BLE001
+        return plateifu, 0, f"{type(exc).__name__}: {exc}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-root", default=DATASETS[CATALOG_NAME].raw_path)
@@ -473,68 +506,137 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-files", type=int, default=None,
                         help="Cap on number of plate-ifus to process.")
     parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--num-processes", type=int, default=32,
+                        help="Per-shard multiprocessing.Pool size. Default 32 "
+                             "(not 96) because each worker holds a full IFU cube ~500 MB.")
+    parser.add_argument("--scratch-dir", default=None,
+                        help="Shared ceph scratch directory for per-plate-ifu parquet "
+                             "files. REQUIRED in sharded mode (--num-shards>1 / "
+                             "--skip-ingest / --only-ingest). Single-job mode auto-"
+                             "generates a pid-namespaced dir that's wiped on exit.")
+    parser.add_argument("--shard-idx", type=int, default=0,
+                        help="This shard's stride offset (0..num-shards-1).")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Total number of shards.")
+    parser.add_argument("--skip-ingest", action="store_true",
+                        help="Only write per-plate-ifu parquet shards.")
+    parser.add_argument("--only-ingest", action="store_true",
+                        help="Skip build phase; run only write_hats_from_parquet_dir.")
+    parser.add_argument("--ingest-workers", type=int, default=96,
+                        help="Dask workers for the ingest step.")
     parser.add_argument("--ra-center", type=float, default=None)
     parser.add_argument("--dec-center", type=float, default=None)
     parser.add_argument("--radius", type=float, default=None,
                         help="Cone radius in degrees; requires --ra-center/--dec-center.")
     args = parser.parse_args(argv)
 
-    print(f"Loading drpall + dapall from {args.raw_root}")
-    catalog = load_catalog(args.raw_root)
-    print(f"  {len(catalog)} plate-ifus after DAPDONE join")
+    if args.skip_ingest and args.only_ingest:
+        print("ERROR: --skip-ingest and --only-ingest are mutually exclusive",
+              file=sys.stderr)
+        return 2
+    if args.shard_idx < 0 or args.shard_idx >= args.num_shards:
+        print(f"ERROR: shard-idx {args.shard_idx} outside [0, {args.num_shards})",
+              file=sys.stderr)
+        return 2
 
-    if args.ra_center is not None and args.dec_center is not None and args.radius is not None:
-        mask = apply_cone_filter(
-            np.asarray(catalog["ifura"], dtype=np.float64),
-            np.asarray(catalog["ifudec"], dtype=np.float64),
-            args.ra_center, args.dec_center, args.radius,
+    sharded_mode = args.num_shards > 1 or args.skip_ingest or args.only_ingest
+    if sharded_mode and args.scratch_dir is None:
+        print("ERROR: --scratch-dir is required in sharded mode", file=sys.stderr)
+        return 2
+
+    scratch = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
+    os.makedirs(scratch, exist_ok=True)
+
+    try:
+        # ----------------------------------------------------------------- #
+        # Build phase: write per-plate-ifu parquet shards.
+        # ----------------------------------------------------------------- #
+        if not args.only_ingest:
+            print(f"[shard {args.shard_idx}/{args.num_shards}] "
+                  f"Loading drpall + dapall from {args.raw_root}", flush=True)
+            catalog = load_catalog(args.raw_root)
+            print(f"  {len(catalog)} plate-ifus after DAPDONE join", flush=True)
+
+            if args.ra_center is not None and args.dec_center is not None and args.radius is not None:
+                mask = apply_cone_filter(
+                    np.asarray(catalog["ifura"], dtype=np.float64),
+                    np.asarray(catalog["ifudec"], dtype=np.float64),
+                    args.ra_center, args.dec_center, args.radius,
+                )
+                catalog = catalog[mask]
+                print(f"  {len(catalog)} plate-ifus after cone cut", flush=True)
+                if len(catalog) == 0:
+                    print("  no MaNGA targets in cone — nothing to write", file=sys.stderr)
+                    return 1
+
+            if args.max_files is not None:
+                catalog = catalog[:args.max_files]
+                print(f"  capped to {len(catalog)} plate-ifus via --max-files", flush=True)
+
+            if args.num_shards > 1:
+                # Stride-slice the catalog for this shard.
+                keep_idx = np.arange(args.shard_idx, len(catalog), args.num_shards)
+                catalog = catalog[keep_idx]
+                print(f"[shard {args.shard_idx}] my stride: {len(catalog)} plate-ifus",
+                      flush=True)
+
+            print(f"[shard {args.shard_idx}] streaming per-plate-ifu parquet to {scratch}",
+                  flush=True)
+
+            n_written = 0
+            work = []
+            for row in catalog:
+                plateifu = _b2s(row["plateifu"])
+                cube_file = cube_path(args.raw_root, plateifu)
+                map_file = maps_path(args.raw_root, plateifu)
+                row_dict = {col: row[col] for col in catalog.colnames}
+                work.append((plateifu, cube_file, map_file, row_dict, scratch))
+
+            if args.num_processes > 1 and len(work) > 1:
+                with Pool(args.num_processes) as pool:
+                    for i, (plateifu, n_maps, err) in enumerate(
+                        pool.imap_unordered(_process_cube_to_parquet, work), 1
+                    ):
+                        if err:
+                            print(f"[shard {args.shard_idx}] [{i}/{len(work)}] "
+                                  f"{plateifu}: SKIPPED {err}", file=sys.stderr, flush=True)
+                            continue
+                        n_written += 1
+                        if n_written % 20 == 0 or n_written == len(work):
+                            print(f"[shard {args.shard_idx}] [{i}/{len(work)}] "
+                                  f"{plateifu}: {n_maps} maps", flush=True)
+            else:
+                for i, item in enumerate(work, 1):
+                    plateifu, n_maps, err = _process_cube_to_parquet(item)
+                    if err:
+                        print(f"[shard {args.shard_idx}] [{i}/{len(work)}] "
+                              f"{plateifu}: SKIPPED {err}", file=sys.stderr, flush=True)
+                        continue
+                    n_written += 1
+
+            print(f"[shard {args.shard_idx}] BUILD DONE: {n_written} plate-ifus",
+                  flush=True)
+
+        # ----------------------------------------------------------------- #
+        # Ingest phase.
+        # ----------------------------------------------------------------- #
+        if args.skip_ingest:
+            return 0
+
+        print(f"Ingesting {scratch} → HATS catalog (workers={args.ingest_workers})",
+              flush=True)
+        catalog_dir = write_hats_from_parquet_dir(
+            scratch,
+            output_path=args.output_root,
+            catalog_name=CATALOG_NAME,
+            pixel_threshold=args.pixel_threshold,
+            n_workers=args.ingest_workers,
+            debug=False,
         )
-        catalog = catalog[mask]
-        print(
-            f"  {len(catalog)} plate-ifus after cone cut "
-            f"(ra={args.ra_center}, dec={args.dec_center}, radius={args.radius})"
-        )
-        if len(catalog) == 0:
-            print("  no MaNGA targets in cone — nothing to write", file=sys.stderr)
-            return 1
-
-    if args.max_files is not None:
-        catalog = catalog[:args.max_files]
-        print(f"  capped to {len(catalog)} plate-ifus via --max-files")
-
-    records: list[dict] = []
-    for i, row in enumerate(catalog, 1):
-        plateifu = _b2s(row["plateifu"])
-        cube_file = cube_path(args.raw_root, plateifu)
-        map_file = maps_path(args.raw_root, plateifu)
-        try:
-            rec = process_cube(plateifu, cube_file, map_file)
-        except (FileNotFoundError, OSError, KeyError, ValueError) as exc:
-            print(f"  [{i}/{len(catalog)}] {plateifu}: {type(exc).__name__}: {exc}",
-                  file=sys.stderr)
-            continue
-        if rec is None:
-            print(f"  [{i}/{len(catalog)}] {plateifu}: missing cube or map file",
-                  file=sys.stderr)
-            continue
-        records.append(rec)
-        n_maps = len(rec["maps"])
-        print(f"  [{i}/{len(catalog)}] {plateifu}: {n_maps} maps")
-
-    if not records:
-        print("ERROR: no plate-ifus successfully processed", file=sys.stderr)
-        return 1
-
-    print(f"\nBuilding HATS table with {len(records)} records")
-    table = build_table(records, catalog)
-    print(f"Writing HATS catalog: {table.num_rows} rows")
-    catalog_dir = write_hats(
-        [table],
-        output_path=args.output_root,
-        catalog_name=CATALOG_NAME,
-        pixel_threshold=args.pixel_threshold,
-    )
-    print(f"Done: {catalog_dir}")
+        print(f"Done: {catalog_dir}", flush=True)
+    finally:
+        if args.scratch_dir is None and not sharded_mode:
+            shutil.rmtree(scratch, ignore_errors=True)
     return 0
 
 

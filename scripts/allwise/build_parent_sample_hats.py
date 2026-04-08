@@ -24,7 +24,9 @@ import argparse
 import glob
 import os
 import re
+import shutil
 import sys
+from multiprocessing import Pool
 
 import healpy as hp
 import numpy as np
@@ -33,7 +35,7 @@ import pyarrow.parquet as pq
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import write_hats, write_hats_from_parquet_dir
+from mmu.hats_import import default_scratch_dir, write_hats, write_hats_from_parquet_dir
 
 
 # IRSA's AllWISE bulk download is partitioned by healpix at two levels,
@@ -99,6 +101,34 @@ def read_shard(path: str) -> pa.Table:
     return table
 
 
+def _process_shard_to_parquet(args: tuple) -> tuple[str, int, str | None]:
+    """Pool worker: read one AllWISE parquet shard, optionally cone-filter,
+    write it out to ``scratch`` as ``part-<parent>-<seq>.parquet``.
+
+    Input tuple: ``(path, scratch, seq, ra_center, dec_center, radius)``.
+    Returns ``(parent, n_rows_written, err)``. Module-level so the pool
+    can pickle it.
+    """
+    path, scratch, seq, ra_center, dec_center, radius = args
+    parent = os.path.basename(os.path.dirname(path))
+    try:
+        table = read_shard(path)
+        if ra_center is not None and dec_center is not None and radius is not None:
+            ra = table.column("ra").to_numpy()
+            dec = table.column("dec").to_numpy()
+            mask = apply_cone_filter(ra, dec, ra_center, dec_center, radius)
+            table = table.filter(pa.array(mask))
+        if table.num_rows == 0:
+            return parent, 0, None
+        part_name = f"part-{parent}-{seq:05d}.parquet"
+        pq.write_table(table, os.path.join(scratch, part_name))
+        n = table.num_rows
+        del table
+        return parent, n, None
+    except BaseException as exc:  # noqa: BLE001
+        return parent, 0, f"{type(exc).__name__}: {exc}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -133,7 +163,9 @@ def main(argv: list[str] | None = None) -> int:
                              "via per-shard parquet files in --scratch-dir).")
     parser.add_argument("--scratch-dir", default=None,
                         help="Scratch directory for per-shard parquet files (default: "
-                             "/tmp/allwise_parquet_<pid>).")
+                             "ceph MultimodalUniverse_v2_hats_scratch/allwise_<pid>).")
+    parser.add_argument("--num-processes", type=int, default=96,
+                        help="multiprocessing.Pool size for parallel per-shard reads.")
     args = parser.parse_args(argv)
 
     cone_active = (
@@ -188,30 +220,48 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Done: {catalog_dir}")
         return 0
 
-    # Streaming path: per-shard parquet → write_hats_from_parquet_dir.
-    scratch = args.scratch_dir or f"/tmp/allwise_parquet_{os.getpid()}"
+    # Streaming + parallel path: per-shard parquet → write_hats_from_parquet_dir.
+    scratch = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
     os.makedirs(scratch, exist_ok=True)
+    print(f"Streaming per-shard parquet to {scratch} (pool={args.num_processes})")
+    work = [
+        (path, scratch, i, args.ra_center, args.dec_center, args.radius)
+        for i, path in enumerate(files, 1)
+    ]
     n_written = 0
     total_rows = 0
     try:
-        for i, path in enumerate(files, 1):
-            table = _process_one(path)
-            if table is None:
-                continue
-            # Use the parent dir name (healpix_k5=NNN) as part of the parquet filename
-            # so they're sortable + traceable.
-            parent = os.path.basename(os.path.dirname(path))
-            part_name = f"part-{parent}-{i:05d}.parquet"
-            out_path = os.path.join(scratch, part_name)
-            pq.write_table(table, out_path)
-            n_written += 1
-            total_rows += table.num_rows
-            print(f"  [{i}/{len(files)}] {parent}: {table.num_rows} rows → {part_name}")
-            del table
+        if args.num_processes > 1 and len(work) > 1:
+            with Pool(args.num_processes) as pool:
+                for i, (parent, n, err) in enumerate(
+                    pool.imap_unordered(_process_shard_to_parquet, work), 1
+                ):
+                    if err:
+                        print(f"  [{i}/{len(files)}] {parent}: SKIPPED {err}",
+                              file=sys.stderr)
+                        continue
+                    if n == 0:
+                        continue
+                    n_written += 1
+                    total_rows += n
+                    print(f"  [{i}/{len(files)}] {parent}: {n} rows")
+        else:
+            for i, item in enumerate(work, 1):
+                parent, n, err = _process_shard_to_parquet(item)
+                if err:
+                    print(f"  [{i}/{len(files)}] {parent}: SKIPPED {err}",
+                          file=sys.stderr)
+                    continue
+                if n == 0:
+                    continue
+                n_written += 1
+                total_rows += n
+                print(f"  [{i}/{len(files)}] {parent}: {n} rows")
         if n_written == 0:
             print("ERROR: no rows survived the cone cut", file=sys.stderr)
             return 1
-        print(f"\nWriting HATS catalog from {n_written} parquet files in {scratch} ({total_rows} total rows)")
+        print(f"\nWriting HATS catalog from {n_written} parquet files in {scratch} "
+              f"({total_rows} total rows)")
         catalog_dir = write_hats_from_parquet_dir(
             scratch,
             output_path=args.output_root,
@@ -220,7 +270,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     finally:
         if args.scratch_dir is None:
-            import shutil
             shutil.rmtree(scratch, ignore_errors=True)
     print(f"Done: {catalog_dir}")
     return 0

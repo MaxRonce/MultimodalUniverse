@@ -21,14 +21,22 @@ import argparse
 import glob
 import os
 import re
+import shutil
 import sys
+from multiprocessing import Pool
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 from astropy.io import fits
 
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import to_native_endian, write_hats
+from mmu.hats_import import (
+    default_scratch_dir,
+    to_native_endian,
+    write_hats,
+    write_hats_from_parquet_dir,
+)
 
 
 CATALOG_NAME = "tess"
@@ -104,6 +112,17 @@ def read_lightcurve(path: str) -> dict | None:
     }
 
 
+def _read_lightcurve_safe(path: str) -> dict | None:
+    """Pool-worker wrapper around :func:`read_lightcurve` that catches EVERY
+    exception and returns ``None`` so one corrupt SPOC file can't kill the
+    whole pool (see analogous safety note in legacysurvey._process_sweep...).
+    """
+    try:
+        return read_lightcurve(path)
+    except BaseException:  # noqa: BLE001
+        return None
+
+
 def build_table(rows: list[dict]) -> pa.Table:
     """Stack per-lightcurve dicts into a single PyArrow table.
 
@@ -136,6 +155,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--num-processes", type=int, default=96,
+                        help="multiprocessing.Pool size for parallel FITS reads.")
+    parser.add_argument("--batch-size", type=int, default=1000,
+                        help="Number of lightcurves per output parquet shard.")
+    parser.add_argument("--scratch-dir", default=None,
+                        help="Scratch dir for per-batch parquet files.")
+    parser.add_argument("--in-memory", action="store_true",
+                        help="Legacy in-memory build (only safe for small slices).")
     # Accept but ignore cone args so tess rules still plug into the shared
     # Snakemake cone profile. TESS filenames don't encode RA/Dec, so the cone
     # filter is intentionally a no-op here (see read_lightcurve docstring).
@@ -157,27 +184,93 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"Found {len(files)} TESS SPOC file(s)")
 
-    rows: list[dict] = []
-    for i, p in enumerate(files, 1):
-        row = read_lightcurve(p)
-        if row is None:
-            continue
-        rows.append(row)
-        print(f"  [{i}/{len(files)}] TIC {row['tic_id']} s{row['sector']:04d}: {len(row['time'])} cadences")
+    if args.in_memory:
+        # Legacy single-process in-memory path for tests and small slices.
+        rows: list[dict] = []
+        for i, p in enumerate(files, 1):
+            row = read_lightcurve(p)
+            if row is None:
+                continue
+            rows.append(row)
+            print(f"  [{i}/{len(files)}] TIC {row['tic_id']} s{row['sector']:04d}: "
+                  f"{len(row['time'])} cadences")
+        if not rows:
+            print("ERROR: no readable lightcurves", file=sys.stderr)
+            return 1
+        table = build_table(rows)
+        print(f"\nWriting HATS catalog: {table.num_rows} lightcurves")
+        catalog_dir = write_hats(
+            [table],
+            output_path=args.output_root,
+            catalog_name=CATALOG_NAME,
+            pixel_threshold=args.pixel_threshold,
+        )
+        print(f"Done: {catalog_dir}")
+        return 0
 
-    if not rows:
-        print("ERROR: no readable lightcurves", file=sys.stderr)
-        return 1
+    # Streaming + parallel path. Workers read one SPOC FITS file each; the
+    # main process batches their return values into chunks of ``batch_size``
+    # and writes one parquet shard per chunk under ``scratch``. This keeps
+    # peak RAM to ~batch_size lightcurves (~20 MB) regardless of total count.
+    scratch = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
+    os.makedirs(scratch, exist_ok=True)
+    print(f"Streaming per-batch parquet to {scratch} (pool={args.num_processes}, "
+          f"batch={args.batch_size})")
 
-    table = build_table(rows)
-    print(f"\nWriting HATS catalog: {table.num_rows} lightcurves")
-    catalog_dir = write_hats(
-        [table],
-        output_path=args.output_root,
-        catalog_name=CATALOG_NAME,
-        pixel_threshold=args.pixel_threshold,
-    )
-    print(f"Done: {catalog_dir}")
+    try:
+        total = 0
+        n_written = 0
+        buffer: list[dict] = []
+
+        def _flush():
+            nonlocal n_written, total, buffer
+            if not buffer:
+                return
+            table = build_table(buffer)
+            out_path = os.path.join(scratch, f"part-{n_written:06d}.parquet")
+            pq.write_table(table, out_path)
+            total += table.num_rows
+            n_written += 1
+            print(f"  wrote {out_path.split('/')[-1]}: {table.num_rows} LCs "
+                  f"(running total: {total})")
+            buffer = []
+
+        if args.num_processes > 1 and len(files) > 1:
+            with Pool(args.num_processes) as pool:
+                for i, row in enumerate(
+                    pool.imap_unordered(_read_lightcurve_safe, files, chunksize=32),
+                    1,
+                ):
+                    if row is None:
+                        continue
+                    buffer.append(row)
+                    if len(buffer) >= args.batch_size:
+                        _flush()
+        else:
+            for p in files:
+                row = _read_lightcurve_safe(p)
+                if row is None:
+                    continue
+                buffer.append(row)
+                if len(buffer) >= args.batch_size:
+                    _flush()
+        _flush()
+
+        if n_written == 0:
+            print("ERROR: no readable lightcurves", file=sys.stderr)
+            return 1
+
+        print(f"\nIngesting {n_written} batch(es), {total} lightcurves → HATS catalog")
+        catalog_dir = write_hats_from_parquet_dir(
+            scratch,
+            output_path=args.output_root,
+            catalog_name=CATALOG_NAME,
+            pixel_threshold=args.pixel_threshold,
+        )
+        print(f"Done: {catalog_dir}")
+    finally:
+        if args.scratch_dir is None:
+            shutil.rmtree(scratch, ignore_errors=True)
     return 0
 
 
