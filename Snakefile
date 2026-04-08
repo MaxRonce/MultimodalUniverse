@@ -82,12 +82,21 @@ PORTED = [
     "gaia",      # raw Gaia DR3 (GaiaSource + XpContinuousMeanSpectrum joined on source_id)
     "legacysurvey",  # raw DECaLS DR10 south sweeps + brick coadds (image cutouts + nearby catalog)
     "manga",     # raw SDSS-IV MaNGA IFU LOGCUBE + DAP MAPS files (spaxels + griz images + analysis maps)
+    "foundation",  # Foundation DR1 SNe Ia (SNANA ASCII lightcurves, ~180 SNe)
 ]
 
 
 def catalog_marker(name: str) -> str:
     """Path to the inner-catalog `hats.properties` file (the per-dataset target)."""
     return f"{HATS_ROOT}/{name}/{name}/{name}/hats.properties"
+
+
+def build_script(name: str) -> str:
+    """Path to the per-dataset build script. Declaring this as a rule input
+    means any edit to the script bumps its mtime and Snakemake automatically
+    re-runs the rule on the next invocation — no manual --forceall or
+    cleanup-metadata needed."""
+    return f"scripts/{name}/build_parent_sample_hats.py"
 
 
 # Datasets where the script's filenames don't encode RA/Dec, so a cone cut
@@ -147,7 +156,167 @@ def build_command(dataset: str) -> str:
 # Adjust if rules OOM. The slurm partition is set to ``ccm`` because that's
 # where the user has allocation headroom.
 
-SLURM_PARTITION = "ccm"
+SLURM_PARTITION = _resolve("slurm_partition", "ccm")
+SHARDED_SLURM_PARTITION = _resolve("sharded_slurm_partition", SLURM_PARTITION)
+
+
+# --------------------------------------------------------------------------- #
+#                         SCATTER/GATHER SHARDED BUILDS                        #
+# --------------------------------------------------------------------------- #
+# For datasets where a single-node build would run past its walltime, we
+# scatter the work across N independent sbatch jobs ("shards"), each of
+# which writes per-unit parquet files into a shared ceph scratch dir. A
+# single "gather" job then runs ``write_hats_from_parquet_dir`` against
+# that scratch to produce the final HATS catalog.
+#
+# Snakemake natively manages this via two rules per sharded dataset:
+#   1. ``build_<name>_shard`` — one sbatch job per shard_idx, writes
+#      ``{scratch}/.shard_<idx>.done`` markers as Snakemake-visible outputs.
+#   2. ``build_<name>`` — gather rule whose inputs are all shard markers.
+#      When all scatter tasks have their markers, Snakemake submits this
+#      gather job; it runs the --only-ingest path.
+#
+# Adding a new sharded dataset = one entry in SHARDED_DATASETS below.
+# No bespoke shell launchers, no /tmp/*.sh files, no manual dependency
+# chaining — pure Snakemake DAG-driven execution.
+#
+# Per-dataset build scripts need to honor these args:
+#   --scratch-dir <shared path>    (shared across all shards; REQUIRED)
+#   --num-shards N  --shard-idx I  (stride assignment)
+#   --skip-ingest                  (shard tasks: write parquets only)
+#   --only-ingest                  (gather task: run ingest only)
+#   --num-processes P              (Pool size inside one shard)
+#   --ingest-workers W             (dask workers for the gather step)
+
+SHARDED_SCRATCH_ROOT = f"{HATS_ROOT}_scratch"
+
+SHARDED_DATASETS = {
+    "legacysurvey": dict(
+        num_shards=128,
+        num_processes=32,   # per-worker RSS ~25 GB → 32 × 25 ≈ 800 GB
+        build_mem_mb=900_000,
+        build_runtime_min=180,    # 3h per shard — ~12 sweeps at ~15 min each / 32 workers
+        ingest_mem_mb=900_000,
+        ingest_runtime_min=240,
+        ingest_workers=96,
+    ),
+    "desi": dict(
+        num_shards=16,
+        num_processes=96,   # desispec.coadd_cameras workers, per-group ~1 GB
+        build_mem_mb=750_000,
+        build_runtime_min=360,    # 6h per shard
+        ingest_mem_mb=900_000,
+        ingest_runtime_min=240,
+        ingest_workers=96,
+    ),
+    "gaia": dict(
+        num_shards=8,
+        num_processes=96,   # per-worker reads one (source, xp) HDF5 pair
+        build_mem_mb=900_000,
+        build_runtime_min=240,
+        ingest_mem_mb=900_000,
+        ingest_runtime_min=240,
+        ingest_workers=96,
+    ),
+    "manga": dict(
+        num_shards=8,
+        num_processes=32,   # per-worker holds one IFU cube ~500 MB
+        build_mem_mb=500_000,
+        build_runtime_min=240,
+        ingest_mem_mb=500_000,
+        ingest_runtime_min=120,
+        ingest_workers=96,
+    ),
+}
+
+
+def shard_done_file(name: str, idx: int) -> str:
+    return f"{SHARDED_SCRATCH_ROOT}/{name}_sharded/.shard_{int(idx):03d}.done"
+
+
+def sharded_scratch_dir(name: str) -> str:
+    return f"{SHARDED_SCRATCH_ROOT}/{name}_sharded"
+
+
+# Wildcard constraints keep the generic shard rule from accidentally
+# matching paths for non-sharded datasets. Updated automatically when a
+# dataset is added to SHARDED_DATASETS.
+wildcard_constraints:
+    shard_name = "|".join(SHARDED_DATASETS.keys()) if SHARDED_DATASETS else "_never_",
+    shard_idx = r"\d{3}",
+
+
+rule build_sharded_shard:
+    """Generic scatter task: process ONE stride slice of a sharded dataset.
+
+    Matches for any dataset listed in :data:`SHARDED_DATASETS`. Each sbatch
+    job runs the per-dataset build script with ``--skip-ingest``, writes
+    per-unit parquets to the shared scratch dir, and `touch`es the
+    marker file that the gather rule waits on.
+    """
+    output:
+        done = SHARDED_SCRATCH_ROOT + "/{shard_name}_sharded/.shard_{shard_idx}.done",
+    input:
+        script = lambda w: build_script(w.shard_name),
+    params:
+        scratch = lambda w: sharded_scratch_dir(w.shard_name),
+        output_root = lambda w: f"{HATS_ROOT}/{w.shard_name}",
+        num_shards = lambda w: SHARDED_DATASETS[w.shard_name]["num_shards"],
+        num_processes = lambda w: SHARDED_DATASETS[w.shard_name]["num_processes"],
+    resources:
+        mem_mb = lambda w: SHARDED_DATASETS[w.shard_name]["build_mem_mb"],
+        runtime = lambda w: SHARDED_DATASETS[w.shard_name]["build_runtime_min"],
+        cpus_per_task = 96,
+        slurm_partition = SHARDED_SLURM_PARTITION,
+        qos = "preempt" if SHARDED_SLURM_PARTITION == "preempt" else None,
+    shell:
+        "mkdir -p {params.scratch} && "
+        "python -u -m scripts.{wildcards.shard_name}.build_parent_sample_hats "
+        "--scratch-dir {params.scratch} "
+        "--output-root {params.output_root} "
+        "--num-shards {params.num_shards} "
+        "--shard-idx {wildcards.shard_idx} "
+        "--num-processes {params.num_processes} "
+        "--skip-ingest && "
+        "touch {output.done}"
+
+
+# For each sharded dataset we generate one gather rule. We have to
+# generate these individually (rather than a single wildcard gather rule)
+# because the gather's ``input:`` list needs to know N shards at DAG-build
+# time. The loop captures the dataset name + cfg via default args so all
+# generated rules don't share a stale loop variable.
+for _name, _cfg in SHARDED_DATASETS.items():
+
+    rule:
+        name: f"build_{_name}"
+        input:
+            shards = lambda w, _n=_name, _c=_cfg: [
+                shard_done_file(_n, i) for i in range(_c["num_shards"])
+            ],
+            script = build_script(_name),
+        output:
+            marker = catalog_marker(_name),
+        params:
+            scratch = sharded_scratch_dir(_name),
+            output_root = f"{HATS_ROOT}/{_name}",
+            ingest_workers = _cfg["ingest_workers"],
+            num_shards = _cfg["num_shards"],
+            name = _name,
+        resources:
+            mem_mb = _cfg["ingest_mem_mb"],
+            runtime = _cfg["ingest_runtime_min"],
+            cpus_per_task = 96,
+            slurm_partition = SHARDED_SLURM_PARTITION,
+            qos = "preempt" if SHARDED_SLURM_PARTITION == "preempt" else None,
+        shell:
+            "python -u -m scripts.{params.name}.build_parent_sample_hats "
+            "--scratch-dir {params.scratch} "
+            "--output-root {params.output_root} "
+            "--num-shards {params.num_shards} "
+            "--shard-idx 0 "
+            "--only-ingest "
+            "--ingest-workers {params.ingest_workers}"
 
 
 rule all:
@@ -158,6 +327,8 @@ rule all:
 rule build_allwise:
     output:
         marker = catalog_marker("allwise"),
+    input:
+        script = build_script("allwise"),
     params:
         cmd = build_command("allwise"),
     resources:
@@ -172,6 +343,8 @@ rule build_allwise:
 rule build_sdss:
     output:
         marker = catalog_marker("sdss"),
+    input:
+        script = build_script("sdss"),
     params:
         cmd = build_command("sdss"),
     resources:
@@ -186,6 +359,8 @@ rule build_sdss:
 rule build_twomass:
     output:
         marker = catalog_marker("twomass"),
+    input:
+        script = build_script("twomass"),
     params:
         cmd = build_command("twomass"),
     resources:
@@ -200,6 +375,8 @@ rule build_twomass:
 rule build_sages:
     output:
         marker = catalog_marker("sages"),
+    input:
+        script = build_script("sages"),
     params:
         cmd = build_command("sages"),
     resources:
@@ -214,6 +391,8 @@ rule build_sages:
 rule build_galex:
     output:
         marker = catalog_marker("galex"),
+    input:
+        script = build_script("galex"),
     params:
         cmd = build_command("galex"),
     resources:
@@ -225,23 +404,11 @@ rule build_galex:
         "{params.cmd}"
 
 
-rule build_desi:
-    output:
-        marker = catalog_marker("desi"),
-    params:
-        cmd = build_command("desi"),
-    resources:
-        mem_mb = 750_000,
-        runtime = 2880,           # 48h — desispec.coadd_cameras × 32k coadds
-        cpus_per_task = 96,
-        slurm_partition = SLURM_PARTITION,
-    shell:
-        "{params.cmd}"
-
-
 rule build_tess:
     output:
         marker = catalog_marker("tess"),
+    input:
+        script = build_script("tess"),
     params:
         cmd = build_command("tess"),
     resources:
@@ -256,6 +423,8 @@ rule build_tess:
 rule build_ssl_legacysurvey:
     output:
         marker = catalog_marker("ssl_legacysurvey"),
+    input:
+        script = build_script("ssl_legacysurvey"),
     params:
         cmd = build_command("ssl_legacysurvey"),
     resources:
@@ -267,43 +436,19 @@ rule build_ssl_legacysurvey:
         "{params.cmd}"
 
 
-rule build_gaia:
+rule build_foundation:
     output:
-        marker = catalog_marker("gaia"),
+        marker = catalog_marker("foundation"),
+    input:
+        script = build_script("foundation"),
     params:
-        cmd = build_command("gaia"),
+        cmd = build_command("foundation"),
     resources:
-        mem_mb = 750_000,
-        runtime = 1440,           # 24h — 800 (GaiaSource, XP) shard pairs
+        mem_mb = 50_000,
+        runtime = 60,             # 1h — only ~180 SNANA ASCII files
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
 
 
-rule build_legacysurvey:
-    output:
-        marker = catalog_marker("legacysurvey"),
-    params:
-        cmd = build_command("legacysurvey"),
-    resources:
-        mem_mb = 750_000,
-        runtime = 2880,           # 48h — 1436 sweep files + brick image cutouts
-        cpus_per_task = 96,
-        slurm_partition = SLURM_PARTITION,
-    shell:
-        "{params.cmd}"
-
-
-rule build_manga:
-    output:
-        marker = catalog_marker("manga"),
-    params:
-        cmd = build_command("manga"),
-    resources:
-        mem_mb = 500_000,
-        runtime = 1440,           # 24h — ~13k cube + maps file pairs
-        cpus_per_task = 96,
-        slurm_partition = SLURM_PARTITION,
-    shell:
-        "{params.cmd}"
