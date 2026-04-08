@@ -80,6 +80,7 @@ PORTED = [
     "tess",      # raw TESS-SPOC FFI lightcurves (one file per TIC, sector)
     "ssl_legacysurvey",  # raw Stein-et-al DECaLS image chunks (h5 per 1M objects)
     "gaia",      # raw Gaia DR3 (GaiaSource + XpContinuousMeanSpectrum joined on source_id)
+    "legacysurvey",  # raw DECaLS DR10 south sweeps + brick coadds (image cutouts + nearby catalog)
 ]
 
 
@@ -209,5 +210,14 @@ rule build_gaia:
         marker = catalog_marker("gaia"),
     params:
         cmd = build_command("gaia"),
+    shell:
+        "{params.cmd}"
+
+
+rule build_legacysurvey:
+    output:
+        marker = catalog_marker("legacysurvey"),
+    params:
+        cmd = build_command("legacysurvey"),
     shell:
         "{params.cmd}"

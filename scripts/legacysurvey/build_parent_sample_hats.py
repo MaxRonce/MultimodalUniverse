@@ -1,0 +1,682 @@
+"""Convert raw DECaLS DR10 South into a HATS catalog.
+
+Matches v1 MMU's ``scripts/legacysurvey/build_parent_sample.py`` exactly,
+with HATS output instead of HDF5:
+
+    1. Read the sweep catalogs (``dr10/south/sweep/10.1/sweep-*.fits``).
+       Each filename encodes its RA/Dec bounding box, so when a cone cut is
+       active we can skip every sweep that doesn't intersect the cone.
+    2. Apply v1 ``select_observations``: z-mag < 21, NOBS_{G,R,I,Z} > 0,
+       TYPE != "PSF", clean MASKBITS bits.
+    3. (If a cone cut is active) trim the catalog to the cone.
+    4. For each surviving object, group by BRICKNAME, open the brick coadd
+       FITS files (image-{g,r,i,z}, invvar-{g,r,i,z}, maskbits) and the
+       blobmodel/RGB JPEGs, and extract a 160×160 cutout per object via WCS.
+    5. For each cutout, also build:
+         - the brightest-N nearby-object catalog within the cutout
+         - the elliptical object mask painted from those nearby objects
+         - the cleaned binary mask from MASKBITS
+    6. Bundle each per-object record into a row of a single PyArrow table
+       matching v1's HuggingFace `Features(...)` declaration:
+
+           image: struct<
+               band:     list<string>,
+               flux:     list<list<list<float32>>>,   # (4, 160, 160)
+               ivar:     list<list<list<float32>>>,
+               mask:     list<list<list<bool>>>,
+               psf_fwhm: list<float32>,
+               scale:    list<float32>,
+           >
+           blobmodel:   list<list<list<uint8>>>     # (3, 160, 160) JPEG cutout
+           rgb:         list<list<list<uint8>>>     # (3, 160, 160) JPEG cutout
+           object_mask: list<list<uint8>>           # (160, 160) painted mask
+           catalog: struct<
+               FLUX_G/R/I/Z, TYPE, SHAPE_R/E1/E2, X, Y: list<float32>
+           >
+           ra, dec, object_id (= BRICKNAME-OBJID), + 12 photometric scalars
+
+       Plain nested lists (no extension types anywhere) — see
+       ``project_image_storage`` memory for why nested_pandas crashes
+       when HF ``datasets`` extension types live inside list/struct.
+    7. Write the HATS catalog via ``mmu.hats_import.write_hats``.
+
+Cluster layout::
+
+    /mnt/ceph/users/polymathic/external_data/astro/legacysurvey/dr10/south/
+        sweep/10.1/sweep-{ra1}{p|m}{dec1}-{ra2}{p|m}{dec2}.fits
+        coadd/{brick3}/{brickname}/legacysurvey-{brickname}-image-{g,r,i,z}.fits.fz
+                                  /legacysurvey-{brickname}-invvar-{g,r,i,z}.fits.fz
+                                  /legacysurvey-{brickname}-maskbits.fits.fz
+                                  /legacysurvey-{brickname}-image.jpg
+                                  /legacysurvey-{brickname}-blobmodel.jpg
+
+The sweep filename format is ``sweep-RRRsDDD-RRRsDDD.fits`` where ``RRR`` is
+RA in degrees zero-padded to 3 digits, ``s`` is ``p`` (positive) or ``m``
+(negative), and ``DDD`` is ``|Dec|`` in degrees zero-padded to 3 digits.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import sys
+
+import numpy as np
+import pyarrow as pa
+import skimage
+from astropy.coordinates import SkyCoord
+from astropy.io import fits
+from astropy.nddata import Cutout2D
+from astropy.table import Table
+from astropy.wcs import WCS
+from PIL import Image, ImageOps
+
+from mmu.cone import apply_cone_filter
+from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
+from mmu.hats_import import write_hats
+
+
+CATALOG_NAME = "legacysurvey"
+
+ARCSEC_PER_PIXEL = 0.262
+IMAGE_SIZE = 160
+N_BANDS = 4
+BANDS = ["DES-G", "DES-R", "DES-I", "DES-Z"]
+PSF_KEYS = ["PSFSIZE_G", "PSFSIZE_R", "PSFSIZE_I", "PSFSIZE_Z"]
+NEARBY_CATALOG_N = 20  # cap on # of nearby-object rows kept per cutout
+
+# v1 maskbit cleanup, both for the catalog selection and the per-pixel mask.
+SELECTION_MASKBITS = [0, 1, 2, 3, 4, 5, 6, 7, 11, 14, 15]
+
+# Top-level scalar columns from the sweep catalog (v1 HF schema).
+FLOAT_FEATURES = [
+    "EBV",
+    "FLUX_G", "FLUX_R", "FLUX_I", "FLUX_Z",
+    "FLUX_W1", "FLUX_W2", "FLUX_W3", "FLUX_W4",
+    "SHAPE_R", "SHAPE_E1", "SHAPE_E2",
+]
+
+# Per-cutout nearby-object catalog (v1 HF schema, in the order v1 stores them).
+CATALOG_FEATURES = [
+    "FLUX_G", "FLUX_R", "FLUX_I", "FLUX_Z",
+    "TYPE",
+    "SHAPE_R", "SHAPE_E1", "SHAPE_E2",
+    "X", "Y",
+]
+
+# v1 OBJECT_TYPE_COLOR maps morphological TYPE strings to small integers; we
+# use the same mapping so the painted-object-mask values are comparable.
+OBJECT_TYPE_COLOR = {
+    name: i for i, name in enumerate(["PSF", "REX", "EXP", "DEV", "SER", "DUP"], start=1)
+}
+
+# Sweep filename: e.g. sweep-150p000-155p005.fits → ra (150,155), dec (+0,+5).
+SWEEP_RE = re.compile(
+    r"sweep-(\d{3})([pm])(\d{3})-(\d{3})([pm])(\d{3})\.fits$"
+)
+
+
+def parse_sweep_bbox(filename: str) -> tuple[float, float, float, float] | None:
+    """Return ``(ra_min, ra_max, dec_min, dec_max)`` parsed from a sweep filename.
+
+    Returns ``None`` if the filename doesn't match the standard pattern.
+    """
+    m = SWEEP_RE.search(os.path.basename(filename))
+    if not m:
+        return None
+    ra_min = float(m.group(1))
+    dec_min = float(m.group(3)) * (1 if m.group(2) == "p" else -1)
+    ra_max = float(m.group(4))
+    dec_max = float(m.group(6)) * (1 if m.group(5) == "p" else -1)
+    return ra_min, ra_max, dec_min, dec_max
+
+
+def _bbox_intersects_cone(
+    bbox: tuple[float, float, float, float],
+    ra_center: float,
+    dec_center: float,
+    radius: float,
+) -> bool:
+    """Return True if a (ra_min, ra_max, dec_min, dec_max) sweep bbox could
+    contain any source within ``radius`` degrees of the cone center."""
+    ra_min, ra_max, dec_min, dec_max = bbox
+    # Pad by radius/cos(dec) in RA to be conservative near the box edges.
+    cos_d = max(np.cos(np.deg2rad(max(abs(dec_min), abs(dec_max)))), 1e-3)
+    if dec_center < dec_min - radius:
+        return False
+    if dec_center > dec_max + radius:
+        return False
+    if ra_center < ra_min - radius / cos_d:
+        return False
+    if ra_center > ra_max + radius / cos_d:
+        return False
+    return True
+
+
+def find_sweep_files(
+    raw_root: str,
+    max_files: int | None = None,
+    ra_center: float | None = None,
+    dec_center: float | None = None,
+    radius: float | None = None,
+) -> list[str]:
+    """Glob ``dr10/south/sweep/10.1/sweep-*.fits`` and (optionally) skip any
+    file whose RA/Dec bounding box doesn't intersect a cone cut."""
+    sweep_dir = os.path.join(raw_root, "dr10", "south", "sweep", "10.1")
+    files = sorted(glob.glob(os.path.join(sweep_dir, "sweep-*.fits")))
+    cone_active = (
+        ra_center is not None and dec_center is not None and radius is not None
+    )
+    if cone_active:
+        keep: list[str] = []
+        for f in files:
+            bbox = parse_sweep_bbox(f)
+            if bbox is None:
+                continue
+            if _bbox_intersects_cone(bbox, ra_center, dec_center, radius):
+                keep.append(f)
+        files = keep
+    if max_files is not None:
+        files = files[:max_files]
+    return files
+
+
+def select_observations(catalog: Table, zmag_cut: float = 21.0) -> np.ndarray:
+    """v1 selection: zmag < 21, all 4 bands observed, non-PSF, clean maskbits."""
+    flux_z = np.asarray(catalog["FLUX_Z"], dtype=np.float64)
+    mw_z = np.asarray(catalog["MW_TRANSMISSION_Z"], dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        zmag = 22.5 - 2.5 * np.log10(flux_z / mw_z)
+    mask_mag = zmag < zmag_cut
+
+    nobs = np.array([np.asarray(catalog[f"NOBS_{b}"]) for b in ("G", "R", "I", "Z")]).T
+    mask_obs = ~np.any(nobs == 0, axis=1)
+
+    type_col = np.array([
+        s.decode().strip() if isinstance(s, (bytes, np.bytes_)) else str(s).strip()
+        for s in catalog["TYPE"]
+    ])
+    mask_type = type_col != "PSF"
+
+    mb = np.asarray(catalog["MASKBITS"], dtype=np.int64)
+    mask_clean = np.ones(len(catalog), dtype=bool)
+    for bit in SELECTION_MASKBITS:
+        mask_clean &= (mb & (1 << bit)) == 0
+
+    return mask_mag & mask_obs & mask_type & mask_clean
+
+
+def read_sweep(
+    path: str,
+    ra_center: float | None = None,
+    dec_center: float | None = None,
+    radius: float | None = None,
+) -> Table | None:
+    """Read one sweep FITS, apply v1 selection, then optionally cone cut.
+
+    Returns ``None`` if no rows survive.
+    """
+    catalog = Table.read(path)
+    catalog = catalog[select_observations(catalog)]
+    if len(catalog) == 0:
+        return None
+    if ra_center is not None and dec_center is not None and radius is not None:
+        mask = apply_cone_filter(
+            np.asarray(catalog["RA"], dtype=np.float64),
+            np.asarray(catalog["DEC"], dtype=np.float64),
+            ra_center, dec_center, radius,
+        )
+        catalog = catalog[mask]
+    if len(catalog) == 0:
+        return None
+    return catalog
+
+
+def _clean_maskbits(data: np.ndarray) -> np.ndarray:
+    """v1 mask cleanup: 0 → masked-bad, 1 → good. Same bit set as selection."""
+    out = np.ones_like(data, dtype=bool)
+    for bit in SELECTION_MASKBITS:
+        out &= (data & (1 << bit)) == 0
+    return out
+
+
+def _load_brick_images(brick_path: str, brick_name: str) -> dict | None:
+    """Load all per-band image/invvar HDUs and the maskbits HDU for one brick.
+
+    Returns None if any required file is missing.
+    """
+    images: dict[str, fits.ImageHDU] = {}
+    for kind in ("image", "invvar"):
+        for b in ("g", "r", "i", "z"):
+            fname = os.path.join(
+                brick_path, f"legacysurvey-{brick_name}-{kind}-{b}.fits.fz"
+            )
+            if not os.path.exists(fname):
+                return None
+            with fits.open(fname) as hdul:
+                images[f"{kind}-{b}"] = hdul[1].copy()
+    mb_path = os.path.join(brick_path, f"legacysurvey-{brick_name}-maskbits.fits.fz")
+    if not os.path.exists(mb_path):
+        return None
+    with fits.open(mb_path) as hdul:
+        mb_hdu = hdul[1].copy()
+    mb_hdu.data = _clean_maskbits(mb_hdu.data).astype(mb_hdu.data.dtype)
+    images["maskbits"] = mb_hdu
+    return images
+
+
+def _load_brick_jpeg(path: str) -> np.ndarray | None:
+    """Load a brick-level JPEG (rgb or blobmodel) and return as (C, H, W) uint8."""
+    if not os.path.exists(path):
+        return None
+    img = Image.open(path)
+    img = ImageOps.flip(img)
+    arr = np.asarray(img, dtype=np.uint8)
+    return np.moveaxis(arr, -1, 0)  # (H, W, C) → (C, H, W)
+
+
+def _build_nearby_catalog(
+    brick_catalog: Table,
+    cutout: Cutout2D,
+    n_objects: int = NEARBY_CATALOG_N,
+) -> dict[str, list[float]]:
+    """Build a CATALOG_FEATURES dict of the brightest nearby objects in the
+    cutout, padded to ``n_objects`` rows. Mirrors v1 ``CatalogSelector``.
+    """
+    catalog_coords = SkyCoord(
+        ra=brick_catalog["RA"], dec=brick_catalog["DEC"], unit="deg",
+    )
+    cutout_world_center = cutout.wcs.wcs_pix2world(*cutout.input_position_cutout, 1)
+    cutout_center = SkyCoord(
+        ra=float(cutout_world_center[0]),
+        dec=float(cutout_world_center[1]),
+        unit="deg",
+    )
+
+    # First filter by sky separation roughly equal to the cutout half-diagonal.
+    separations = cutout_center.separation(catalog_coords).degree
+    pixel_separations = separations * 3600.0 / ARCSEC_PER_PIXEL
+    radius_pix = np.sqrt(2.0) * np.linalg.norm(cutout.shape) / 2
+    close_mask = pixel_separations < radius_pix
+    if not close_mask.any():
+        # Fall back to empty record padded with zeros.
+        return {key: [0.0] * n_objects for key in CATALOG_FEATURES}
+    close_catalog = brick_catalog[close_mask]
+    close_coords = catalog_coords[close_mask]
+
+    # Then keep only those whose pixel coordinates fall inside the cutout.
+    pixel_i, pixel_j = cutout.wcs.world_to_array_index(close_coords)
+    bbox = cutout.bbox_cutout
+    in_cutout = (
+        (pixel_j >= bbox[1][0]) & (pixel_j < bbox[1][1])
+        & (pixel_i >= bbox[0][0]) & (pixel_i < bbox[0][1])
+    )
+    in_cutout_catalog = close_catalog[in_cutout]
+    in_cutout_coords = close_coords[in_cutout]
+    if len(in_cutout_catalog) == 0:
+        return {key: [0.0] * n_objects for key in CATALOG_FEATURES}
+
+    # Sort brightest first by FLUX_I (descending — largest flux = brightest).
+    flux_i = np.asarray(in_cutout_catalog["FLUX_I"], dtype=np.float64)
+    order = np.argsort(-flux_i)
+    in_cutout_catalog = in_cutout_catalog[order][:n_objects]
+    in_cutout_coords = in_cutout_coords[order][:n_objects]
+
+    out: dict[str, list[float]] = {key: [] for key in CATALOG_FEATURES}
+    for obj, coord in zip(in_cutout_catalog, in_cutout_coords):
+        x_pix_i, y_pix_i = cutout.wcs.world_to_array_index(coord)
+        for key in CATALOG_FEATURES:
+            if key == "TYPE":
+                t = obj["TYPE"]
+                if isinstance(t, (bytes, np.bytes_)):
+                    t = t.decode()
+                out[key].append(float(OBJECT_TYPE_COLOR.get(str(t).strip(), 0)))
+            elif key == "X":
+                out[key].append(float(y_pix_i))
+            elif key == "Y":
+                out[key].append(float(x_pix_i))
+            else:
+                out[key].append(float(obj[key]))
+
+    # Pad to n_objects with zeros.
+    for key in CATALOG_FEATURES:
+        while len(out[key]) < n_objects:
+            out[key].append(0.0)
+    return out
+
+
+def _build_object_mask(
+    nearby_catalog: dict[str, list[float]],
+    cutout_shape: tuple[int, int],
+) -> np.ndarray:
+    """Paint elliptical apertures of the nearby objects into a uint8 mask.
+
+    Pixel value = OBJECT_TYPE_COLOR[type]. Mirrors v1 ``get_object_mask``.
+    """
+    mask = np.zeros(cutout_shape, dtype=np.uint8)
+    for i in range(NEARBY_CATALOG_N):
+        x = nearby_catalog["X"][i]
+        y = nearby_catalog["Y"][i]
+        type_color = nearby_catalog["TYPE"][i]
+        if type_color == 0:
+            continue  # padding row
+        radius = nearby_catalog["SHAPE_R"][i] / ARCSEC_PER_PIXEL
+        e1 = nearby_catalog["SHAPE_E1"][i]
+        e2 = nearby_catalog["SHAPE_E2"][i]
+        e_mag = np.sqrt(e1 * e1 + e2 * e2)
+        if e_mag > 0.999:
+            continue  # degenerate ellipse
+        angle = 0.5 * np.arctan2(e2, e1)
+        q = (1 - e_mag) / (1 + e_mag)
+        height = max(2 * radius, 1)
+        width = max(2 * radius * q, 1)
+        rr, cc = skimage.draw.ellipse(
+            int(x), int(y), width, height, shape=cutout_shape, rotation=angle,
+        )
+        mask[cc, rr] = int(type_color)
+    return mask
+
+
+def process_brick(
+    brick_catalog: Table,
+    raw_root: str,
+) -> list[dict] | None:
+    """Open all brick files for one brick group of the catalog and emit one
+    record per surviving object."""
+    brick_name = (
+        brick_catalog["BRICKNAME"][0].decode().strip()
+        if isinstance(brick_catalog["BRICKNAME"][0], (bytes, np.bytes_))
+        else str(brick_catalog["BRICKNAME"][0]).strip()
+    )
+    brick_group = brick_name[:3]
+    brick_path = os.path.join(raw_root, "dr10", "south", "coadd", brick_group, brick_name)
+    if not os.path.isdir(brick_path):
+        return None
+
+    images = _load_brick_images(brick_path, brick_name)
+    if images is None:
+        return None
+
+    rgb = _load_brick_jpeg(
+        os.path.join(brick_path, f"legacysurvey-{brick_name}-image.jpg")
+    )
+    blob = _load_brick_jpeg(
+        os.path.join(brick_path, f"legacysurvey-{brick_name}-blobmodel.jpg")
+    )
+    if rgb is None or blob is None:
+        return None
+
+    wcs_g = WCS(images["image-g"].header)
+
+    out_records: list[dict] = []
+    for obj in brick_catalog:
+        ra = float(obj["RA"])
+        dec = float(obj["DEC"])
+        x, y = wcs_g.all_world2pix(ra, dec, 1)
+        position = (x, y)
+        size = (IMAGE_SIZE, IMAGE_SIZE)
+
+        try:
+            cutout_g = Cutout2D(images["image-g"].data, position, size, wcs=wcs_g)
+        except Exception:
+            continue
+        if cutout_g.data.shape != size:
+            continue
+
+        flux_cube = []
+        for b in ("g", "r", "i", "z"):
+            try:
+                c = Cutout2D(images[f"image-{b}"].data, position, size, wcs=wcs_g)
+            except Exception:
+                c = None
+            if c is None or c.data.shape != size:
+                flux_cube = None
+                break
+            flux_cube.append(c.data)
+        if flux_cube is None:
+            continue
+
+        ivar_cube = []
+        for b in ("g", "r", "i", "z"):
+            try:
+                c = Cutout2D(images[f"invvar-{b}"].data, position, size, wcs=wcs_g)
+            except Exception:
+                c = None
+            if c is None or c.data.shape != size:
+                ivar_cube = None
+                break
+            ivar_cube.append(c.data)
+        if ivar_cube is None:
+            continue
+
+        try:
+            mb_cutout = Cutout2D(images["maskbits"].data, position, size, wcs=wcs_g).data
+        except Exception:
+            continue
+        if mb_cutout.shape != size:
+            continue
+
+        # Per-band stack into (4, 160, 160). The maskbits coadd is single-band,
+        # but v1 stores it as a 2D bool with no per-band dimension. We replicate
+        # to 4 bands so the schema mirrors flux/ivar shape exactly.
+        mask_cube = np.broadcast_to(mb_cutout.astype(bool), (N_BANDS, *size)).copy()
+
+        # Three-channel JPEG cutouts (blobmodel + RGB), each (3, 160, 160).
+        rgb_cutout_channels = []
+        blob_cutout_channels = []
+        for ch in range(rgb.shape[0]):
+            try:
+                rgb_cutout_channels.append(
+                    Cutout2D(rgb[ch], position, size, wcs=wcs_g).data
+                )
+            except Exception:
+                rgb_cutout_channels = None
+                break
+        if rgb_cutout_channels is None or len(rgb_cutout_channels) == 0:
+            continue
+        for ch in range(blob.shape[0]):
+            try:
+                blob_cutout_channels.append(
+                    Cutout2D(blob[ch], position, size, wcs=wcs_g).data
+                )
+            except Exception:
+                blob_cutout_channels = None
+                break
+        if blob_cutout_channels is None or len(blob_cutout_channels) == 0:
+            continue
+        rgb_cutout = np.stack(rgb_cutout_channels).astype(np.uint8)
+        blob_cutout = np.stack(blob_cutout_channels).astype(np.uint8)
+        if rgb_cutout.shape[1:] != size or blob_cutout.shape[1:] != size:
+            continue
+
+        # Nearby-object catalog + painted object mask.
+        nearby = _build_nearby_catalog(brick_catalog, cutout_g)
+        object_mask = _build_object_mask(nearby, size)
+
+        psf_fwhm = np.array([float(obj[k]) for k in PSF_KEYS], dtype=np.float32)
+        scale = np.array([ARCSEC_PER_PIXEL] * N_BANDS, dtype=np.float32)
+
+        try:
+            obj_id = obj["OBJID"]
+            if isinstance(obj_id, (bytes, np.bytes_)):
+                obj_id = obj_id.decode()
+            object_id = f"{brick_name}-{int(obj_id)}"
+        except Exception:
+            continue
+
+        out_records.append({
+            "ra": ra,
+            "dec": dec,
+            "object_id": object_id,
+            "image_band": list(BANDS),
+            "image_flux": np.stack(flux_cube).astype(np.float32),
+            "image_ivar": np.stack(ivar_cube).astype(np.float32),
+            "image_mask": mask_cube,
+            "image_psf_fwhm": psf_fwhm,
+            "image_scale": scale,
+            "rgb": rgb_cutout,
+            "blobmodel": blob_cutout,
+            "object_mask": object_mask,
+            "nearby_catalog": nearby,
+            "scalars": {f: float(obj[f]) for f in FLOAT_FEATURES},
+        })
+
+    return out_records
+
+
+def _build_image_struct(records: list[dict]) -> pa.StructArray:
+    band_arr = pa.array([r["image_band"] for r in records], type=pa.list_(pa.string()))
+
+    def nest_4d(arrs: list[np.ndarray]) -> list:
+        return [
+            [[list(row) for row in band_img] for band_img in cube]
+            for cube in arrs
+        ]
+
+    flux_arr = pa.array(
+        nest_4d([r["image_flux"] for r in records]),
+        type=pa.list_(pa.list_(pa.list_(pa.float32()))),
+    )
+    ivar_arr = pa.array(
+        nest_4d([r["image_ivar"] for r in records]),
+        type=pa.list_(pa.list_(pa.list_(pa.float32()))),
+    )
+    mask_arr = pa.array(
+        [
+            [[list(row) for row in band_img] for band_img in r["image_mask"]]
+            for r in records
+        ],
+        type=pa.list_(pa.list_(pa.list_(pa.bool_()))),
+    )
+    psf_arr = pa.array(
+        [list(r["image_psf_fwhm"]) for r in records], type=pa.list_(pa.float32())
+    )
+    scale_arr = pa.array(
+        [list(r["image_scale"]) for r in records], type=pa.list_(pa.float32())
+    )
+    return pa.StructArray.from_arrays(
+        [band_arr, flux_arr, ivar_arr, mask_arr, psf_arr, scale_arr],
+        names=["band", "flux", "ivar", "mask", "psf_fwhm", "scale"],
+    )
+
+
+def _build_jpeg_column(records: list[dict], key: str) -> pa.Array:
+    """Build a list<list<list<uint8>>> column for a JPEG cutout (3, H, W)."""
+    nested = [
+        [[list(row) for row in channel] for channel in r[key]]
+        for r in records
+    ]
+    return pa.array(nested, type=pa.list_(pa.list_(pa.list_(pa.uint8()))))
+
+
+def _build_object_mask_column(records: list[dict]) -> pa.Array:
+    nested = [[list(row) for row in r["object_mask"]] for r in records]
+    return pa.array(nested, type=pa.list_(pa.list_(pa.uint8())))
+
+
+def _build_nearby_catalog_struct(records: list[dict]) -> pa.StructArray:
+    arrays = []
+    names = []
+    for key in CATALOG_FEATURES:
+        arrays.append(
+            pa.array(
+                [r["nearby_catalog"][key] for r in records],
+                type=pa.list_(pa.float32()),
+            )
+        )
+        names.append(key)
+    return pa.StructArray.from_arrays(arrays, names=names)
+
+
+def build_table(records: list[dict]) -> pa.Table:
+    columns: dict[str, pa.Array] = {
+        "ra": pa.array([r["ra"] for r in records], type=pa.float64()),
+        "dec": pa.array([r["dec"] for r in records], type=pa.float64()),
+        "object_id": pa.array([r["object_id"] for r in records], type=pa.string()),
+        "image": _build_image_struct(records),
+        "rgb": _build_jpeg_column(records, "rgb"),
+        "blobmodel": _build_jpeg_column(records, "blobmodel"),
+        "object_mask": _build_object_mask_column(records),
+        "catalog": _build_nearby_catalog_struct(records),
+    }
+    for f in FLOAT_FEATURES:
+        columns[f] = pa.array(
+            [r["scalars"][f] for r in records], type=pa.float32()
+        )
+    return pa.table(columns)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--raw-root", default=DATASETS[CATALOG_NAME].raw_path)
+    parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
+    parser.add_argument("--max-files", type=int, default=None,
+                        help="Cap on number of sweep files to process.")
+    parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--ra-center", type=float, default=None)
+    parser.add_argument("--dec-center", type=float, default=None)
+    parser.add_argument("--radius", type=float, default=None,
+                        help="Cone radius in degrees; requires --ra-center/--dec-center.")
+    args = parser.parse_args(argv)
+
+    sweeps = find_sweep_files(
+        args.raw_root,
+        max_files=args.max_files,
+        ra_center=args.ra_center,
+        dec_center=args.dec_center,
+        radius=args.radius,
+    )
+    if not sweeps:
+        print(f"ERROR: no sweep files match under {args.raw_root}", file=sys.stderr)
+        return 1
+    print(f"Found {len(sweeps)} sweep file(s)")
+
+    all_records: list[dict] = []
+    for i, sw in enumerate(sweeps, 1):
+        cat = read_sweep(
+            sw,
+            ra_center=args.ra_center,
+            dec_center=args.dec_center,
+            radius=args.radius,
+        )
+        if cat is None:
+            print(f"  [{i}/{len(sweeps)}] {os.path.basename(sw)}: no surviving rows")
+            continue
+        # Group by brick and process.
+        brickname_col = np.array([
+            s.decode().strip() if isinstance(s, (bytes, np.bytes_)) else str(s).strip()
+            for s in cat["BRICKNAME"]
+        ])
+        unique_bricks = np.unique(brickname_col)
+        sweep_records: list[dict] = []
+        for brick in unique_bricks:
+            brick_cat = cat[brickname_col == brick]
+            recs = process_brick(brick_cat, args.raw_root)
+            if recs:
+                sweep_records.extend(recs)
+        all_records.extend(sweep_records)
+        print(
+            f"  [{i}/{len(sweeps)}] {os.path.basename(sw)}: "
+            f"{len(cat)} catalog rows → {len(sweep_records)} cutouts"
+        )
+
+    if not all_records:
+        print("ERROR: no cutouts produced", file=sys.stderr)
+        return 1
+
+    print(f"\nWriting HATS catalog: {len(all_records)} cutouts")
+    table = build_table(all_records)
+    catalog_dir = write_hats(
+        [table],
+        output_path=args.output_root,
+        catalog_name=CATALOG_NAME,
+        pixel_threshold=args.pixel_threshold,
+    )
+    print(f"Done: {catalog_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -38,6 +38,9 @@ dependencies = [
     "desispec>=0.70.0",
     # Orchestration: every cluster run goes through Snakemake. Not optional.
     "snakemake",
+    "scikit-image>=0.26.0",
+    "pillow>=12.2.0",
+    "filelock>=3.25.2",
 ]
 dynamic = ["version"]
 
