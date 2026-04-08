@@ -61,10 +61,13 @@ import argparse
 import glob
 import os
 import re
+import shutil
 import sys
+from multiprocessing import Pool
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 import skimage
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
@@ -75,7 +78,7 @@ from PIL import Image, ImageOps
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import write_hats
+from mmu.hats_import import default_scratch_dir, write_hats_from_parquet_dir
 
 
 CATALOG_NAME = "legacysurvey"
@@ -608,43 +611,33 @@ def build_table(records: list[dict]) -> pa.Table:
     return pa.table(columns)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--raw-root", default=DATASETS[CATALOG_NAME].raw_path)
-    parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
-    parser.add_argument("--max-files", type=int, default=None,
-                        help="Cap on number of sweep files to process.")
-    parser.add_argument("--pixel-threshold", type=int, default=8192)
-    parser.add_argument("--ra-center", type=float, default=None)
-    parser.add_argument("--dec-center", type=float, default=None)
-    parser.add_argument("--radius", type=float, default=None,
-                        help="Cone radius in degrees; requires --ra-center/--dec-center.")
-    args = parser.parse_args(argv)
+def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
+    """Pool worker: process ONE sweep file into ONE parquet shard under ``scratch``.
 
-    sweeps = find_sweep_files(
-        args.raw_root,
-        max_files=args.max_files,
-        ra_center=args.ra_center,
-        dec_center=args.dec_center,
-        radius=args.radius,
-    )
-    if not sweeps:
-        print(f"ERROR: no sweep files match under {args.raw_root}", file=sys.stderr)
-        return 1
-    print(f"Found {len(sweeps)} sweep file(s)")
+    Input tuple: ``(sweep_path, raw_root, scratch, ra_center, dec_center, radius)``
+    Returns ``(sweep_basename, n_catalog_rows, n_cutouts_written, err)`` where
+    ``err`` is ``None`` on success or a stringified error on failure.
 
-    all_records: list[dict] = []
-    for i, sw in enumerate(sweeps, 1):
+    ALL exceptions are caught and converted to string error messages so the
+    pool worker always returns a picklable value. Some exception types raised
+    deep in astropy/cfitsio are dynamically generated and CANNOT be pickled;
+    letting them propagate crashes the whole Pool, which is how an earlier
+    run of this job died on one corrupted brick FITS file.
+
+    Must be module-level (not nested) so multiprocessing.Pool can pickle it.
+    """
+    sweep_path, raw_root, scratch, ra_center, dec_center, radius = args
+    basename = os.path.basename(sweep_path)
+    try:
         cat = read_sweep(
-            sw,
-            ra_center=args.ra_center,
-            dec_center=args.dec_center,
-            radius=args.radius,
+            sweep_path,
+            ra_center=ra_center,
+            dec_center=dec_center,
+            radius=radius,
         )
         if cat is None:
-            print(f"  [{i}/{len(sweeps)}] {os.path.basename(sw)}: no surviving rows")
-            continue
-        # Group by brick and process.
+            return basename, 0, 0, None
+
         brickname_col = np.array([
             s.decode().strip() if isinstance(s, (bytes, np.bytes_)) else str(s).strip()
             for s in cat["BRICKNAME"]
@@ -653,28 +646,193 @@ def main(argv: list[str] | None = None) -> int:
         sweep_records: list[dict] = []
         for brick in unique_bricks:
             brick_cat = cat[brickname_col == brick]
-            recs = process_brick(brick_cat, args.raw_root)
+            try:
+                recs = process_brick(brick_cat, raw_root)
+            except BaseException as exc:  # noqa: BLE001
+                # Any per-brick failure (corrupted FITS, missing image file,
+                # cfitsio error, numpy weirdness) should skip the brick not
+                # kill the whole sweep.
+                return (
+                    basename, len(cat), 0,
+                    f"brick {brick}: {type(exc).__name__}: {exc}",
+                )
             if recs:
                 sweep_records.extend(recs)
-        all_records.extend(sweep_records)
-        print(
-            f"  [{i}/{len(sweeps)}] {os.path.basename(sw)}: "
-            f"{len(cat)} catalog rows → {len(sweep_records)} cutouts"
+
+        if not sweep_records:
+            return basename, len(cat), 0, None
+
+        table = build_table(sweep_records)
+        out_path = os.path.join(scratch, f"part-{basename}.parquet")
+        pq.write_table(table, out_path)
+        n_cutouts = table.num_rows
+        n_cat = len(cat)
+        del sweep_records, table, cat
+        return basename, n_cat, n_cutouts, None
+    except BaseException as exc:  # noqa: BLE001
+        return basename, 0, 0, f"{type(exc).__name__}: {exc}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    import time
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--raw-root", default=DATASETS[CATALOG_NAME].raw_path)
+    parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
+    parser.add_argument("--max-files", type=int, default=None,
+                        help="Cap on number of sweep files to process.")
+    parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--num-processes", type=int, default=96,
+                        help="Per-shard multiprocessing.Pool size. On a 96-core "
+                             "CCM node, default=96 gives one pool worker per core.")
+    parser.add_argument("--scratch-dir", default=None,
+                        help="Shared ceph scratch directory for per-sweep parquet "
+                             "shards. REQUIRED when running sharded — all shard "
+                             "jobs write here and the ingest job reads from here. "
+                             "When unset (single-job mode), defaults to a "
+                             "pid-namespaced dir that's wiped on exit.")
+    parser.add_argument("--shard-idx", type=int, default=0,
+                        help="This shard's stride offset (0..num-shards-1). Sweeps "
+                             "are assigned via sweeps[shard_idx::num_shards].")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Total number of shards (matches the number of "
+                             "independent sbatch jobs in the sharded launcher).")
+    parser.add_argument("--skip-ingest", action="store_true",
+                        help="Only write per-sweep parquet shards; do NOT run "
+                             "write_hats_from_parquet_dir. Used by shard jobs.")
+    parser.add_argument("--only-ingest", action="store_true",
+                        help="Skip the sweep-processing phase; run ONLY "
+                             "write_hats_from_parquet_dir against --scratch-dir. "
+                             "Used by the dependent ingest job.")
+    parser.add_argument("--ingest-workers", type=int, default=96,
+                        help="Dask workers for the ingest step (used with "
+                             "--only-ingest and the single-job fallback).")
+    parser.add_argument("--ra-center", type=float, default=None)
+    parser.add_argument("--dec-center", type=float, default=None)
+    parser.add_argument("--radius", type=float, default=None,
+                        help="Cone radius in degrees; requires --ra-center/--dec-center.")
+    args = parser.parse_args(argv)
+
+    if args.skip_ingest and args.only_ingest:
+        print("ERROR: --skip-ingest and --only-ingest are mutually exclusive",
+              file=sys.stderr)
+        return 2
+    if args.shard_idx < 0 or args.shard_idx >= args.num_shards:
+        print(f"ERROR: shard-idx {args.shard_idx} outside [0, {args.num_shards})",
+              file=sys.stderr)
+        return 2
+
+    # Single-job mode: auto-generate a pid-namespaced scratch dir and clean
+    # it up on exit. Sharded mode: caller MUST provide --scratch-dir (shared
+    # across all shard jobs); we never delete a caller-provided scratch dir.
+    sharded_mode = args.num_shards > 1 or args.skip_ingest or args.only_ingest
+    if sharded_mode and args.scratch_dir is None:
+        print("ERROR: --scratch-dir is required in sharded mode "
+              "(--num-shards>1 / --skip-ingest / --only-ingest)",
+              file=sys.stderr)
+        return 2
+
+    scratch = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
+    os.makedirs(scratch, exist_ok=True)
+
+    try:
+        # ----------------------------------------------------------------- #
+        # Build phase: write per-sweep parquet shards to the shared scratch.
+        # ----------------------------------------------------------------- #
+        if not args.only_ingest:
+            t0 = time.time()
+            sweeps = find_sweep_files(
+                args.raw_root,
+                max_files=args.max_files,
+                ra_center=args.ra_center,
+                dec_center=args.dec_center,
+                radius=args.radius,
+            )
+            if not sweeps:
+                print(f"ERROR: no sweep files match under {args.raw_root}",
+                      file=sys.stderr)
+                return 1
+            print(f"[shard {args.shard_idx}/{args.num_shards}] "
+                  f"Found {len(sweeps)} total sweep file(s)", flush=True)
+
+            if args.num_shards > 1:
+                sweeps = sweeps[args.shard_idx::args.num_shards]
+                print(f"[shard {args.shard_idx}] my stride: {len(sweeps)} sweep(s)",
+                      flush=True)
+
+            print(f"[shard {args.shard_idx}] streaming per-sweep parquet to {scratch}",
+                  flush=True)
+
+            work = [
+                (sw, args.raw_root, scratch, args.ra_center, args.dec_center, args.radius)
+                for sw in sweeps
+            ]
+            total = 0
+            n_written = 0
+            n_total = len(work)
+
+            def _report(i: int, result: tuple) -> None:
+                basename, n_cat, n_cut, err = result
+                if err:
+                    print(f"[shard {args.shard_idx}] [{i}/{n_total}] {basename}: "
+                          f"SKIPPED {err}", file=sys.stderr, flush=True)
+                    return
+                if n_cut == 0:
+                    # Quiet: many DR10 sweeps are full rejects (no i-band).
+                    return
+                print(f"[shard {args.shard_idx}] [{i}/{n_total}] {basename}: "
+                      f"{n_cat} cat rows → {n_cut} cutouts", flush=True)
+
+            if args.num_processes > 1 and n_total > 1:
+                with Pool(args.num_processes) as pool:
+                    for i, result in enumerate(
+                        pool.imap_unordered(_process_sweep_to_parquet, work), 1
+                    ):
+                        _report(i, result)
+                        _, _, n_cut, _ = result
+                        if n_cut > 0:
+                            n_written += 1
+                            total += n_cut
+            else:
+                for i, item in enumerate(work, 1):
+                    result = _process_sweep_to_parquet(item)
+                    _report(i, result)
+                    _, _, n_cut, _ = result
+                    if n_cut > 0:
+                        n_written += 1
+                        total += n_cut
+
+            dt = time.time() - t0
+            print(
+                f"[shard {args.shard_idx}] BUILD DONE: {n_written} sweeps with "
+                f"cutouts, {total} total cutouts in {dt:.1f}s "
+                f"({n_written / dt:.2f} sweeps/s)",
+                flush=True,
+            )
+
+        # ----------------------------------------------------------------- #
+        # Ingest phase: read the shared scratch and write the final HATS.
+        # ----------------------------------------------------------------- #
+        if args.skip_ingest:
+            return 0
+
+        print(f"Ingesting scratch dir {scratch} → HATS catalog "
+              f"(dask workers={args.ingest_workers})", flush=True)
+        catalog_dir = write_hats_from_parquet_dir(
+            scratch,
+            output_path=args.output_root,
+            catalog_name=CATALOG_NAME,
+            pixel_threshold=args.pixel_threshold,
+            n_workers=args.ingest_workers,
+            debug=False,
         )
-
-    if not all_records:
-        print("ERROR: no cutouts produced", file=sys.stderr)
-        return 1
-
-    print(f"\nWriting HATS catalog: {len(all_records)} cutouts")
-    table = build_table(all_records)
-    catalog_dir = write_hats(
-        [table],
-        output_path=args.output_root,
-        catalog_name=CATALOG_NAME,
-        pixel_threshold=args.pixel_threshold,
-    )
-    print(f"Done: {catalog_dir}")
+        print(f"Done: {catalog_dir}", flush=True)
+    finally:
+        # Only wipe auto-generated single-job scratch dirs. Never touch a
+        # caller-provided shared scratch (the other shard jobs / the ingest
+        # job may still need it).
+        if args.scratch_dir is None and not sharded_mode:
+            shutil.rmtree(scratch, ignore_errors=True)
     return 0
 
 

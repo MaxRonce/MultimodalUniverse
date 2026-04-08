@@ -52,7 +52,9 @@ import argparse
 import glob
 import os
 import re
+import shutil
 import sys
+from multiprocessing import Pool
 
 import h5py
 import numpy as np
@@ -62,7 +64,7 @@ import pyarrow.parquet as pq
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import write_hats, write_hats_from_parquet_dir
+from mmu.hats_import import default_scratch_dir, write_hats, write_hats_from_parquet_dir
 
 
 CATALOG_NAME = "gaia"
@@ -305,6 +307,32 @@ def process_shard(
     return pa.table(columns)
 
 
+def _process_shard_pair_to_parquet(args: tuple) -> tuple[str, int, str | None]:
+    """Pool worker: read one (GaiaSource, XP) shard pair, optionally cone-filter,
+    write out ``part-<xp basename>.parquet`` under ``scratch``.
+
+    Input tuple: ``(source_path, xp_path, scratch, ra_center, dec_center, radius)``
+    Returns ``(xp_basename, n_rows, err)``. All exceptions converted to string
+    errors so one bad shard can't kill the pool.
+    """
+    source_path, xp_path, scratch, ra_center, dec_center, radius = args
+    name = os.path.basename(xp_path)
+    try:
+        t = process_shard(
+            source_path, xp_path,
+            ra_center=ra_center, dec_center=dec_center, radius=radius,
+        )
+        if t is None:
+            return name, 0, None
+        part_name = name.replace(".hdf5", ".parquet")
+        pq.write_table(t, os.path.join(scratch, part_name))
+        n = t.num_rows
+        del t
+        return name, n, None
+    except BaseException as exc:  # noqa: BLE001
+        return name, 0, f"{type(exc).__name__}: {exc}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-root", default=DATASETS[CATALOG_NAME].raw_path)
@@ -321,9 +349,35 @@ def main(argv: list[str] | None = None) -> int:
                              "slice; full Gaia DR3 builds OOM single nodes — default streams "
                              "via per-shard parquet files in --scratch-dir).")
     parser.add_argument("--scratch-dir", default=None,
-                        help="Scratch directory for per-shard parquet files (default: "
-                             "/tmp/gaia_parquet_<pid>).")
+                        help="Shared ceph scratch directory for per-shard-pair parquet "
+                             "files. REQUIRED in sharded mode.")
+    parser.add_argument("--num-processes", type=int, default=96,
+                        help="Per-shard multiprocessing.Pool size.")
+    parser.add_argument("--shard-idx", type=int, default=0,
+                        help="This shard's stride offset (0..num-shards-1).")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Total number of shards.")
+    parser.add_argument("--skip-ingest", action="store_true",
+                        help="Only write per-shard-pair parquet shards.")
+    parser.add_argument("--only-ingest", action="store_true",
+                        help="Skip build phase; run only write_hats_from_parquet_dir.")
+    parser.add_argument("--ingest-workers", type=int, default=96,
+                        help="Dask workers for the ingest step.")
     args = parser.parse_args(argv)
+
+    if args.skip_ingest and args.only_ingest:
+        print("ERROR: --skip-ingest and --only-ingest are mutually exclusive",
+              file=sys.stderr)
+        return 2
+    if args.shard_idx < 0 or args.shard_idx >= args.num_shards:
+        print(f"ERROR: shard-idx {args.shard_idx} outside [0, {args.num_shards})",
+              file=sys.stderr)
+        return 2
+
+    sharded_mode = args.num_shards > 1 or args.skip_ingest or args.only_ingest
+    if sharded_mode and args.scratch_dir is None:
+        print("ERROR: --scratch-dir is required in sharded mode", file=sys.stderr)
+        return 2
 
     pairs = find_shard_pairs(args.raw_root)
     if args.max_files is not None:
@@ -331,7 +385,14 @@ def main(argv: list[str] | None = None) -> int:
     if not pairs:
         print(f"ERROR: no GaiaSource/XP shard pairs under {args.raw_root}", file=sys.stderr)
         return 1
-    print(f"Found {len(pairs)} (source, xp) shard pair(s)")
+    print(f"[shard {args.shard_idx}/{args.num_shards}] Found {len(pairs)} "
+          f"(source, xp) shard pair(s)", flush=True)
+
+    # Apply stride slicing for sharded mode.
+    if args.num_shards > 1:
+        pairs = pairs[args.shard_idx::args.num_shards]
+        print(f"[shard {args.shard_idx}] my stride: {len(pairs)} shard pair(s)",
+              flush=True)
 
     if args.in_memory:
         tables: list[pa.Table] = []
@@ -361,41 +422,66 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Done: {catalog_dir}")
         return 0
 
-    # Streaming path: per-shard-pair parquet → write_hats_from_parquet_dir.
-    scratch = args.scratch_dir or f"/tmp/gaia_parquet_{os.getpid()}"
+    # Streaming + parallel path: per-shard-pair parquet → write_hats_from_parquet_dir.
+    scratch = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
     os.makedirs(scratch, exist_ok=True)
+    print(f"[shard {args.shard_idx}] Streaming per-shard-pair parquet to {scratch} "
+          f"(pool={args.num_processes})", flush=True)
+    work = [
+        (source_path, xp_path, scratch, args.ra_center, args.dec_center, args.radius)
+        for source_path, xp_path in pairs
+    ]
     n_written = 0
     total = 0
     try:
-        for i, (source_path, xp_path) in enumerate(pairs, 1):
-            t = process_shard(
-                source_path, xp_path,
-                ra_center=args.ra_center,
-                dec_center=args.dec_center,
-                radius=args.radius,
-            )
-            if t is None:
-                continue
-            part_name = os.path.basename(xp_path).replace(".hdf5", ".parquet")
-            out_path = os.path.join(scratch, part_name)
-            pq.write_table(t, out_path)
-            n_written += 1
-            total += t.num_rows
-            print(f"  [{i}/{len(pairs)}] {os.path.basename(xp_path)}: {t.num_rows} rows → {part_name}")
-            del t  # free per-shard buffers before next iter
-        if n_written == 0:
-            print("ERROR: no rows survived the cone cut", file=sys.stderr)
-            return 1
-        print(f"\nWriting HATS catalog from {n_written} parquet files in {scratch} ({total} total rows)")
+        if not args.only_ingest:
+            if args.num_processes > 1 and len(work) > 1:
+                with Pool(args.num_processes) as pool:
+                    for i, (name, n, err) in enumerate(
+                        pool.imap_unordered(_process_shard_pair_to_parquet, work), 1
+                    ):
+                        if err:
+                            print(f"[shard {args.shard_idx}] [{i}/{len(pairs)}] "
+                                  f"{name}: SKIPPED {err}", file=sys.stderr, flush=True)
+                            continue
+                        if n == 0:
+                            continue
+                        n_written += 1
+                        total += n
+                        if n_written % 20 == 0:
+                            print(f"[shard {args.shard_idx}] [{i}/{len(pairs)}] "
+                                  f"{name}: {n} rows (running total {total})",
+                                  flush=True)
+            else:
+                for i, item in enumerate(work, 1):
+                    name, n, err = _process_shard_pair_to_parquet(item)
+                    if err:
+                        print(f"[shard {args.shard_idx}] [{i}/{len(pairs)}] "
+                              f"{name}: SKIPPED {err}", file=sys.stderr, flush=True)
+                        continue
+                    if n == 0:
+                        continue
+                    n_written += 1
+                    total += n
+
+            print(f"[shard {args.shard_idx}] BUILD DONE: {n_written} shards, "
+                  f"{total} rows", flush=True)
+
+        if args.skip_ingest:
+            return 0
+
+        print(f"Ingesting {scratch} → HATS catalog (workers={args.ingest_workers})",
+              flush=True)
         catalog_dir = write_hats_from_parquet_dir(
             scratch,
             output_path=args.output_root,
             catalog_name=CATALOG_NAME,
+            n_workers=args.ingest_workers,
+            debug=False,
             pixel_threshold=args.pixel_threshold,
         )
     finally:
-        if args.scratch_dir is None:
-            import shutil
+        if args.scratch_dir is None and not sharded_mode:
             shutil.rmtree(scratch, ignore_errors=True)
     print(f"Done: {catalog_dir}")
     return 0

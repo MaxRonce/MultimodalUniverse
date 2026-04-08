@@ -52,7 +52,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
+from multiprocessing import Pool
 
 import numpy as np
 import pyarrow as pa
@@ -67,6 +69,7 @@ from desispec import coaddition
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import (
+    default_scratch_dir,
     np_to_pyarrow_list,
     to_native_endian,
     write_hats,
@@ -336,51 +339,119 @@ def build_table(
     return pa.concat_tables(per_group_tables, promote_options="default")
 
 
+# Module-level globals populated by :func:`_worker_init` in each pool child.
+# Under Linux fork semantics, the full catalog and config are inherited via
+# copy-on-write from the parent process with zero pickling cost, so workers
+# can index into a 20M-row Table without the main process having to dehydrate
+# per-group dicts (which is O(n) Python-loop slow and blew up memory during
+# an earlier run).
+_WORKER_CATALOG: Table | None = None
+_WORKER_RAW_ROOT: str | None = None
+_WORKER_PARQUET_DIR: str | None = None
+
+
+def _worker_init(catalog: Table, raw_root: str, parquet_dir: str) -> None:
+    global _WORKER_CATALOG, _WORKER_RAW_ROOT, _WORKER_PARQUET_DIR
+    _WORKER_CATALOG = catalog
+    _WORKER_RAW_ROOT = raw_root
+    _WORKER_PARQUET_DIR = parquet_dir
+
+
+def _process_group_to_parquet(args: tuple) -> tuple[str, int, str | None]:
+    """Pool worker: process ONE (survey, program, healpix) group.
+
+    Input tuple: ``(survey, program, healpix, target_ids, row_idx)``. The
+    catalog, raw_root, and parquet_dir come from the module-level globals
+    populated by :func:`_worker_init`.
+
+    Returns ``(out_basename, n_fibers, err)``. All exceptions are
+    converted to string errors so one bad coadd file can't kill the pool.
+    """
+    survey, program, healpix, target_ids, row_idx = args
+    assert _WORKER_CATALOG is not None  # initializer runs before first task
+    assert _WORKER_RAW_ROOT is not None
+    assert _WORKER_PARQUET_DIR is not None
+    path = coadd_file_path(_WORKER_RAW_ROOT, survey, program, healpix)
+    try:
+        if not os.path.exists(path):
+            return (
+                os.path.basename(path),
+                0,
+                f"MISSING {os.path.basename(path)} ({len(target_ids)} fibers skipped)",
+            )
+        result = process_coadd(path, target_ids)
+        catalog_subset = _WORKER_CATALOG[row_idx]
+        table = _build_group_table(catalog_subset, result)
+        out_name = f"part-{survey}-{program}-{healpix:08d}.parquet"
+        pq.write_table(table, os.path.join(_WORKER_PARQUET_DIR, out_name))
+        n = table.num_rows
+        del result, catalog_subset, table
+        return out_name, n, None
+    except BaseException as exc:  # noqa: BLE001
+        return os.path.basename(path), 0, f"{type(exc).__name__}: {exc}"
+
+
 def build_to_parquet_dir(
     catalog: Table,
     raw_root: str,
     parquet_dir: str,
     max_groups: int | None = None,
+    num_processes: int = 1,
+    shard_idx: int = 0,
+    num_shards: int = 1,
 ) -> int:
     """Streaming path: process each (survey, program, healpix) group, build
     its per-group PyArrow table, write it as one parquet file under
     ``parquet_dir``, and free the memory before moving on. Returns the
     number of parquet files written.
 
-    This is the production-scale path — peak memory is bounded by ONE
-    coadd-file group (~500 fibers × 7781 wavelengths × 5 arrays ~= ~80 MB)
-    rather than the full DR1 (~3 TB). Caller passes the resulting
-    ``parquet_dir`` to :func:`mmu.hats_import.write_hats_from_parquet_dir`.
+    Peak RAM is bounded by ``num_processes`` simultaneously-in-flight
+    coadd-file groups (~80 MB each) rather than the full DR1 (~3 TB).
+    ``num_processes > 1`` fans out the per-group work across a
+    ``multiprocessing.Pool`` — essential for full-scale builds where
+    serial single-core processing would take >24 h.
     """
     os.makedirs(parquet_dir, exist_ok=True)
     groups = _group_catalog(catalog)
     if max_groups is not None:
         groups = groups[:max_groups]
 
+    # Stride-slice for sharded mode.
+    if num_shards > 1:
+        groups = groups[shard_idx::num_shards]
+        print(f"[shard {shard_idx}] my stride: {len(groups)} groups", flush=True)
+
     n_written = 0
-    for i, (survey, program, healpix, target_ids, row_idx) in enumerate(groups, 1):
-        path = coadd_file_path(raw_root, survey, program, healpix)
-        if not os.path.exists(path):
-            print(
-                f"  [{i}/{len(groups)}] MISSING {os.path.basename(path)}"
-                f" ({len(target_ids)} fibers skipped)",
-                file=sys.stderr,
-            )
-            continue
-        result = process_coadd(path, target_ids)
-        catalog_subset = catalog[row_idx]
-        table = _build_group_table(catalog_subset, result)
-        out_path = os.path.join(
-            parquet_dir, f"part-{survey}-{program}-{healpix:08d}.parquet"
-        )
-        pq.write_table(table, out_path)
-        n_written += 1
-        print(
-            f"  [{i}/{len(groups)}] {os.path.basename(path)}: "
-            f"{table.num_rows} fibers → {os.path.basename(out_path)}"
-        )
-        # Drop refs so the per-group buffers can be GC'd before the next iter.
-        del result, catalog_subset, table
+    if num_processes > 1 and len(groups) > 1:
+        # Use a Pool initializer to share the catalog with workers via fork
+        # COW instead of pickling per-group dicts (the latter is O(n)
+        # Python-loop slow and blew memory on an earlier run). For this to
+        # be meaningful the start method must be 'fork' — the default on
+        # Linux.
+        with Pool(
+            num_processes,
+            initializer=_worker_init,
+            initargs=(catalog, raw_root, parquet_dir),
+        ) as pool:
+            for i, (out_name, n, err) in enumerate(
+                pool.imap_unordered(_process_group_to_parquet, groups, chunksize=16),
+                1,
+            ):
+                if err:
+                    print(f"  [{i}/{len(groups)}] SKIPPED: {err}", file=sys.stderr)
+                    continue
+                n_written += 1
+                print(f"  [{i}/{len(groups)}] {out_name}: {n} fibers")
+    else:
+        # Serial fallback — still need the worker globals set.
+        _worker_init(catalog, raw_root, parquet_dir)
+        for i, item in enumerate(groups, 1):
+            out_name, n, err = _process_group_to_parquet(item)
+            if err:
+                print(f"  [{i}/{len(groups)}] SKIPPED: {err}", file=sys.stderr)
+                continue
+            n_written += 1
+            print(f"  [{i}/{len(groups)}] {out_name}: {n} fibers")
 
     if n_written == 0:
         raise RuntimeError("No spectra produced — all groups had missing coadd files.")
@@ -414,9 +485,34 @@ def main(argv: list[str] | None = None) -> int:
                              "slice; full-DR1 builds OOM single nodes — default streams via "
                              "per-group parquet files in --scratch-dir).")
     parser.add_argument("--scratch-dir", default=None,
-                        help="Scratch directory for per-group parquet files (default: "
-                             "/tmp/desi_parquet_<pid>).")
+                        help="Shared ceph scratch directory. REQUIRED in sharded mode.")
+    parser.add_argument("--num-processes", type=int, default=96,
+                        help="Per-shard multiprocessing.Pool size.")
+    parser.add_argument("--shard-idx", type=int, default=0,
+                        help="This shard's stride offset (0..num-shards-1).")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Total number of shards.")
+    parser.add_argument("--skip-ingest", action="store_true",
+                        help="Only write per-group parquet shards.")
+    parser.add_argument("--only-ingest", action="store_true",
+                        help="Skip build phase; run only write_hats_from_parquet_dir.")
+    parser.add_argument("--ingest-workers", type=int, default=96,
+                        help="Dask workers for the ingest step.")
     args = parser.parse_args(argv)
+
+    if args.skip_ingest and args.only_ingest:
+        print("ERROR: --skip-ingest and --only-ingest are mutually exclusive",
+              file=sys.stderr)
+        return 2
+    if args.shard_idx < 0 or args.shard_idx >= args.num_shards:
+        print(f"ERROR: shard-idx {args.shard_idx} outside [0, {args.num_shards})",
+              file=sys.stderr)
+        return 2
+
+    sharded_mode = args.num_shards > 1 or args.skip_ingest or args.only_ingest
+    if sharded_mode and args.scratch_dir is None:
+        print("ERROR: --scratch-dir is required in sharded mode", file=sys.stderr)
+        return 2
 
     zcat_path = args.zcatalog or os.path.join(args.raw_root, "zall-pix-iron.fits")
     if not os.path.exists(zcat_path):
@@ -457,22 +553,37 @@ def main(argv: list[str] | None = None) -> int:
             pixel_threshold=args.pixel_threshold,
         )
     else:
-        scratch = args.scratch_dir or f"/tmp/desi_parquet_{os.getpid()}"
+        scratch = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
+        os.makedirs(scratch, exist_ok=True)
+        print(f"[shard {args.shard_idx}/{args.num_shards}] streaming per-group "
+              f"parquet to {scratch} (pool={args.num_processes})", flush=True)
         try:
-            n = build_to_parquet_dir(
-                catalog, args.raw_root, scratch, max_groups=args.max_groups
-            )
-            print(f"\nWriting HATS catalog from {n} parquet files in {scratch}")
+            if not args.only_ingest:
+                n = build_to_parquet_dir(
+                    catalog, args.raw_root, scratch,
+                    max_groups=args.max_groups,
+                    num_processes=args.num_processes,
+                    shard_idx=args.shard_idx,
+                    num_shards=args.num_shards,
+                )
+                print(f"[shard {args.shard_idx}] BUILD DONE: {n} groups", flush=True)
+            if args.skip_ingest:
+                return 0
+            print(f"Ingesting {scratch} → HATS catalog "
+                  f"(workers={args.ingest_workers})", flush=True)
             catalog_dir = write_hats_from_parquet_dir(
                 scratch,
                 output_path=args.output_root,
                 catalog_name=CATALOG_NAME,
                 pixel_threshold=args.pixel_threshold,
+                n_workers=args.ingest_workers,
+                debug=False,
             )
         finally:
-            # Clean up scratch unless caller pinned a specific dir.
-            if args.scratch_dir is None:
-                import shutil
+            # Clean up auto-generated single-job scratch dirs. Never touch a
+            # caller-provided shared scratch (other shard jobs / ingest job
+            # may still need it).
+            if args.scratch_dir is None and not sharded_mode:
                 shutil.rmtree(scratch, ignore_errors=True)
     print(f"Done: {catalog_dir}")
     return 0
