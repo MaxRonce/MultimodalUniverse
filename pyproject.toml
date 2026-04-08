@@ -42,6 +42,7 @@ dependencies = [
     "pillow>=12.2.0",
     "filelock>=3.25.2",
     "snakemake-executor-plugin-slurm>=2.6.0",
+    "sncosmo>=2.12.1",
 ]
 dynamic = ["version"]
 
