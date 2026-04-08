@@ -50,9 +50,13 @@ LOG=/tmp/production_slurm.log
     git -C "$REPO_ROOT" log --oneline -1 || true
     uv sync --quiet 2>&1 | tail -3 || true
     echo
+    # --jobs 20 = up to 20 sbatch jobs in flight at once. Each rule = 1 sbatch
+    # job per dataset; with only 10 datasets in $RULES we'll never submit more
+    # than 10, but the headroom matches what the CCM partition can absorb
+    # without hitting per-user core limits.
     uv run snakemake \
         --executor slurm \
-        --jobs 11 \
+        --jobs 20 \
         --workflow-profile=none \
         --config profile=cluster \
         --keep-going \
