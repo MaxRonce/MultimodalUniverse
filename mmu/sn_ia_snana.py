@@ -1,8 +1,8 @@
 """Shared HATS build logic for SN-Ia lightcurve datasets stored as SNANA ASCII.
 
 Foundation DR1, SNLS, PS1 SN-Ia, DES Y3 SN-Ia, and Swift SN-Ia all ship as
-directories of SNANA-format ASCII files (one file per SN) parseable with
-``sncosmo.read_snana_ascii``. Their v1 HF schemas are identical:
+directories of SNANA-format ASCII files (one file per SN). Their v1 HF
+schemas are identical:
 
     lightcurve : struct<band, flux, flux_err, time>
     redshift, host_log_mass : float32
@@ -18,6 +18,13 @@ Output matches v1's flattened HF form: each object's lightcurve has parallel
 ``band`` / ``time`` / ``flux`` / ``flux_err`` lists of length
 ``n_bands * max_length_per_object`` (padded with MJD=-99, flux=0 so padding
 samples are identifiable on readback).
+
+The SNANA ASCII parser is inline (below) rather than delegated to
+``sncosmo.read_snana_ascii`` because sncosmo doesn't have a Linux wheel
+on PyPI and builds from source against Python.h, which the Flatiron
+compute nodes don't have installed. The format is trivial:
+``KEY: value [...]`` metadata lines, then a ``VARLIST: ...`` header,
+then ``OBS: <values...>`` rows. Comments start with ``#``.
 """
 
 from __future__ import annotations
@@ -29,11 +36,47 @@ import sys
 
 import numpy as np
 import pyarrow as pa
-import sncosmo
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import MMU_V2_HATS_ROOT
 from mmu.hats_import import write_hats
+
+
+def _parse_snana_ascii(path: str) -> tuple[dict[str, str], list[str], list[list[str]]]:
+    """Parse a SNANA ASCII lightcurve file.
+
+    Returns ``(meta, varlist, obs_rows)`` where:
+    - ``meta`` maps header key → first-token value (ignores the rest of the line
+      so e.g. ``RA: 150.1 deg`` becomes ``meta["RA"] = "150.1"``).
+    - ``varlist`` is the column names of the obs table.
+    - ``obs_rows`` is a list of per-obs lists of strings (one row per ``OBS:`` line).
+    """
+    meta: dict[str, str] = {}
+    varlist: list[str] = []
+    obs_rows: list[list[str]] = []
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("OBS:"):
+                parts = line.split()
+                obs_rows.append(parts[1 : 1 + len(varlist)])
+                continue
+            if line.startswith("VARLIST:"):
+                varlist = line.split()[1:]
+                continue
+            if line.startswith("END:") or line.startswith("END_PHOTOMETRY:"):
+                continue
+            # A metadata line like "RA: 150.1 deg" or "REDSHIFT_HELIO: 0.05 +- 0.001".
+            # Take the first whitespace-separated token after the colon as the value;
+            # SNANA files are inconsistent about trailing units / errors.
+            if ":" in line:
+                key, _, rest = line.partition(":")
+                tokens = rest.strip().split()
+                if tokens:
+                    meta[key.strip()] = tokens[0]
+    return meta, varlist, obs_rows
 
 
 def read_snana_file(path: str, object_id_prefix: str = "") -> dict | None:
@@ -44,8 +87,7 @@ def read_snana_file(path: str, object_id_prefix: str = "") -> dict | None:
 
     ``object_id_prefix`` is prepended to the raw ``SNID`` (e.g. ``"PS1_"``).
     """
-    meta, tables = sncosmo.read_snana_ascii(path, default_tablename="OBS")
-    obs = tables["OBS"]
+    meta, varlist, obs_rows = _parse_snana_ascii(path)
 
     try:
         ra = float(meta["RA"])
@@ -57,7 +99,7 @@ def read_snana_file(path: str, object_id_prefix: str = "") -> dict | None:
     redshift = None
     for k in ("REDSHIFT_FINAL", "REDSHIFT_CMB", "REDSHIFT_HELIO"):
         if k in meta:
-            redshift = float(str(meta[k]).split()[0])
+            redshift = float(meta[k])
             break
     if redshift is None:
         return None
@@ -65,13 +107,26 @@ def read_snana_file(path: str, object_id_prefix: str = "") -> dict | None:
     host_log_mass = float("nan")
     for k in ("HOST_LOGMASS", "HOSTGAL_LOGMASS"):
         if k in meta:
-            host_log_mass = float(str(meta[k]).split()[0])
+            host_log_mass = float(meta[k])
             break
 
-    flt = np.asarray(obs["FLT"], dtype=str)
-    mjd = np.asarray(obs["MJD"], dtype=np.float32)
-    fluxcal = np.asarray(obs["FLUXCAL"], dtype=np.float32)
-    fluxcalerr = np.asarray(obs["FLUXCALERR"], dtype=np.float32)
+    # Index the obs columns we need. Different surveys label the filter
+    # column as FLT or BAND; the others are consistent.
+    try:
+        flt_col = varlist.index("FLT") if "FLT" in varlist else varlist.index("BAND")
+        mjd_col = varlist.index("MJD")
+        fluxcal_col = varlist.index("FLUXCAL")
+        fluxcalerr_col = varlist.index("FLUXCALERR")
+    except ValueError:
+        return None
+
+    if not obs_rows:
+        return None
+
+    flt = np.array([row[flt_col] for row in obs_rows], dtype=str)
+    mjd = np.array([float(row[mjd_col]) for row in obs_rows], dtype=np.float32)
+    fluxcal = np.array([float(row[fluxcal_col]) for row in obs_rows], dtype=np.float32)
+    fluxcalerr = np.array([float(row[fluxcalerr_col]) for row in obs_rows], dtype=np.float32)
 
     return {
         "object_id": f"{object_id_prefix}{snid}",
