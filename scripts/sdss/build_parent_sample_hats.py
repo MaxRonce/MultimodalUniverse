@@ -29,19 +29,21 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from multiprocessing import Pool
 
 import healpy as hp
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 from astropy.io import fits
 from astropy.table import Table, join
 from tqdm import tqdm
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import np_to_pyarrow_list, write_hats
+from mmu.hats_import import default_scratch_dir, np_to_pyarrow_list, write_hats_from_parquet_dir
 
 
 CATALOG_NAME = "sdss"
@@ -222,6 +224,18 @@ def process_plate(args) -> Table:
     return joined
 
 
+def _process_plate_to_table(group):
+    """Module-level pool worker: process one plate group into a (plate_path, pa.Table)
+    tuple, or None if the plate produced no spectra. Module-level (not nested)
+    so it's picklable for multiprocessing.Pool.
+    """
+    plate_path, _ = group
+    joined = process_plate(group)
+    if len(joined) == 0:
+        return None
+    return plate_path, _build_arrow_table(joined)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -252,6 +266,9 @@ def main(argv: list[str] | None = None) -> int:
         default=8192,
         help="Max rows per HATS partition.",
     )
+    parser.add_argument("--scratch-dir", default=None,
+                        help="Scratch dir for per-plate parquet files (default: ceph "
+                             "MultimodalUniverse_v2_hats_scratch/sdss_<pid>).")
     parser.add_argument("--ra-center", type=float, default=None)
     parser.add_argument("--dec-center", type=float, default=None)
     parser.add_argument("--radius", type=float, default=None,
@@ -271,36 +288,59 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"Processing {len(groups)} plate(s)")
 
-    if args.num_processes > 1 and len(groups) > 1:
-        with Pool(args.num_processes) as pool:
-            joined_tables = list(tqdm(pool.imap(process_plate, groups), total=len(groups)))
-    else:
-        joined_tables = [process_plate(g) for g in tqdm(groups)]
+    scratch = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
+    os.makedirs(scratch, exist_ok=True)
+    print(f"Streaming per-plate parquet to {scratch}")
 
-    # Pad spectra to common length, then concatenate into one big astropy table.
-    padded = _pad_to_max_length([
-        {k: np.asarray(t[k]) for k in (
-            "spectrum_flux", "spectrum_ivar", "spectrum_lambda",
-            "spectrum_lsf_sigma", "spectrum_mask")}
-        for t in joined_tables
-    ])
-    # Stitch the padded spectra back into a single combined catalog.
-    combined = Table()
-    for col in joined_tables[0].colnames:
-        if col.startswith("spectrum_"):
-            combined[col] = padded[col]
+    # Stream: process each plate, write a single-plate parquet shard, free.
+    # Unlike the v1 HDF5 path, we do NOT pad spectra to a global max length —
+    # each shard's spectrum column is a variable-length pa.list_<float32> and
+    # parquet/HATS merges variable lengths across shards natively. Peak RAM
+    # is bounded by one plate (~500 fibers × 4612 wavelengths × 5 arrays ~
+    # ~45 MB) rather than the full DR17 (~250 GB after padding).
+    try:
+        n_written = 0
+        total = 0
+
+        if args.num_processes > 1 and len(groups) > 1:
+            with Pool(args.num_processes) as pool:
+                iter_results = pool.imap(_process_plate_to_table, groups)
+                for i, result in enumerate(tqdm(iter_results, total=len(groups)), 1):
+                    if result is None:
+                        continue
+                    plate_path, table = result
+                    out_name = os.path.basename(plate_path).replace(".fits", ".parquet")
+                    pq.write_table(table, os.path.join(scratch, f"part-{out_name}"))
+                    n_written += 1
+                    total += table.num_rows
+                    del table
         else:
-            combined[col] = np.concatenate([np.asarray(t[col]) for t in joined_tables])
+            for i, group in enumerate(tqdm(groups), 1):
+                result = _process_plate_to_table(group)
+                if result is None:
+                    continue
+                plate_path, table = result
+                out_name = os.path.basename(plate_path).replace(".fits", ".parquet")
+                pq.write_table(table, os.path.join(scratch, f"part-{out_name}"))
+                n_written += 1
+                total += table.num_rows
+                del table
 
-    table = _build_arrow_table(combined)
-    print(f"\nWriting HATS catalog: {table.num_rows} rows")
-    catalog_dir = write_hats(
-        [table],
-        output_path=args.output_root,
-        catalog_name=CATALOG_NAME,
-        pixel_threshold=args.pixel_threshold,
-    )
-    print(f"Done: {catalog_dir}")
+        if n_written == 0:
+            print("ERROR: no plates produced spectra", file=sys.stderr)
+            return 1
+
+        print(f"\nIngesting {n_written} plate(s), {total} spectra → HATS catalog")
+        catalog_dir = write_hats_from_parquet_dir(
+            scratch,
+            output_path=args.output_root,
+            catalog_name=CATALOG_NAME,
+            pixel_threshold=args.pixel_threshold,
+        )
+        print(f"Done: {catalog_dir}")
+    finally:
+        if args.scratch_dir is None:
+            shutil.rmtree(scratch, ignore_errors=True)
     return 0
 
 

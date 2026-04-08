@@ -16,15 +16,17 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import shutil
 import sys
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 from astropy.table import Table
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import to_native_endian, write_hats
+from mmu.hats_import import default_scratch_dir, to_native_endian, write_hats_from_parquet_dir
 
 
 CATALOG_NAME = "galex"
@@ -69,6 +71,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--scratch-dir", default=None,
+                        help="Scratch dir for per-shard parquet files (default: ceph "
+                             "MultimodalUniverse_v2_hats_scratch/galex_<pid>).")
     parser.add_argument("--ra-center", type=float, default=None)
     parser.add_argument("--dec-center", type=float, default=None)
     parser.add_argument("--radius", type=float, default=None,
@@ -87,33 +92,45 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"Found {len(files)} GALEX shard(s)")
 
-    tables = []
-    total = 0
-    for i, p in enumerate(files, 1):
-        t = read_shard(p)
-        if cone_active:
-            ra = t.column("ra").to_numpy()
-            dec = t.column("dec").to_numpy()
-            mask = apply_cone_filter(ra, dec, args.ra_center, args.dec_center, args.radius)
-            t = t.filter(pa.array(mask))
-            if t.num_rows == 0:
-                continue
-        tables.append(t)
-        total += t.num_rows
-        print(f"  [{i}/{len(files)}] {os.path.basename(p)}: {t.num_rows} rows")
+    scratch = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
+    os.makedirs(scratch, exist_ok=True)
+    print(f"Streaming per-shard parquet to {scratch}")
 
-    if not tables:
-        print("ERROR: no rows survived the cone cut", file=sys.stderr)
-        return 1
+    try:
+        total = 0
+        n_written = 0
+        for i, p in enumerate(files, 1):
+            t = read_shard(p)
+            if cone_active:
+                ra = t.column("ra").to_numpy()
+                dec = t.column("dec").to_numpy()
+                mask = apply_cone_filter(ra, dec, args.ra_center, args.dec_center, args.radius)
+                t = t.filter(pa.array(mask))
+                if t.num_rows == 0:
+                    print(f"  [{i}/{len(files)}] {os.path.basename(p)}: 0 rows (cone filtered)")
+                    continue
+            out_path = os.path.join(scratch, f"part-{os.path.basename(p)}.parquet")
+            pq.write_table(t, out_path)
+            n_written += 1
+            total += t.num_rows
+            print(f"  [{i}/{len(files)}] {os.path.basename(p)}: {t.num_rows} rows → part-{i:04d}")
+            del t
 
-    print(f"\nWriting HATS catalog: {total} rows from {len(tables)} shards")
-    catalog_dir = write_hats(
-        tables,
-        output_path=args.output_root,
-        catalog_name=CATALOG_NAME,
-        pixel_threshold=args.pixel_threshold,
-    )
-    print(f"Done: {catalog_dir}")
+        if n_written == 0:
+            print("ERROR: no rows survived the cone cut", file=sys.stderr)
+            return 1
+
+        print(f"\nIngesting {n_written} shard(s), {total} rows → HATS catalog")
+        catalog_dir = write_hats_from_parquet_dir(
+            scratch,
+            output_path=args.output_root,
+            catalog_name=CATALOG_NAME,
+            pixel_threshold=args.pixel_threshold,
+        )
+        print(f"Done: {catalog_dir}")
+    finally:
+        if args.scratch_dir is None:
+            shutil.rmtree(scratch, ignore_errors=True)
     return 0
 
 
