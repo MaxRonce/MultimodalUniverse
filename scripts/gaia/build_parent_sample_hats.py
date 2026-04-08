@@ -148,23 +148,39 @@ def find_shard_pairs(raw_root: str) -> list[tuple[str, str]]:
     return [(sources[k], xps[k]) for k in common]
 
 
-def _read_xp_shard(xp_path: str) -> dict[str, np.ndarray]:
-    """Load the XP source_ids and coefficient arrays from one shard.
+def _read_xp_coords(xp_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load only ``source_id``, ``ra``, ``dec`` from one XP shard.
 
-    Returns a dict with:
-        source_id: (N,) int64
-        coeff:     (N, 110) float32  (55 bp + 55 rp)
-        coeff_error: (N, 110) float32
+    This is the cheap pre-filter read: ~2 MB per shard vs ~77 MB for the
+    full coefficient arrays. Used by :func:`process_shard` to apply the
+    cone cut BEFORE touching the expensive coefficient columns or the
+    even-larger GaiaSource file.
     """
     with h5py.File(xp_path, "r") as f:
         source_id = np.asarray(f["source_id"][:], dtype=np.int64)
+        ra = np.asarray(f["ra"][:], dtype=np.float64)
+        dec = np.asarray(f["dec"][:], dtype=np.float64)
+    return source_id, ra, dec
+
+
+def _read_xp_coeffs(xp_path: str) -> dict[str, np.ndarray]:
+    """Load the full coefficient arrays from one XP shard.
+
+    Returns a dict with:
+        coeff:     (N, 110) float32  (55 bp + 55 rp)
+        coeff_error: (N, 110) float32
+
+    Only called for shards that have at least one source surviving the
+    cone cut (or for full-catalog builds where no cone is set).
+    """
+    with h5py.File(xp_path, "r") as f:
         bp_c = np.asarray(f["bp_coefficients"][:], dtype=np.float32)
         rp_c = np.asarray(f["rp_coefficients"][:], dtype=np.float32)
         bp_e = np.asarray(f["bp_coefficient_errors"][:], dtype=np.float32)
         rp_e = np.asarray(f["rp_coefficient_errors"][:], dtype=np.float32)
     coeff = np.concatenate([bp_c, rp_c], axis=-1).astype(np.float32)
     coeff_error = np.concatenate([bp_e, rp_e], axis=-1).astype(np.float32)
-    return {"source_id": source_id, "coeff": coeff, "coeff_error": coeff_error}
+    return {"coeff": coeff, "coeff_error": coeff_error}
 
 
 def _read_source_columns(source_path: str, columns: list[str]) -> dict[str, np.ndarray]:
@@ -195,39 +211,60 @@ def process_shard(
     """Process one (source, xp) shard pair into a PyArrow table.
 
     Returns ``None`` if the cone cut leaves zero rows.
+
+    Fast-path for cone cuts: reads only the cheap XP coord columns first,
+    applies the cone filter, and skips the shard entirely if no XP source
+    falls in the cone. Since XP sources are a strict subset of GaiaSource
+    sources (v1 ``merge_parts.py`` asserts this) and XP already carries
+    ra/dec, this avoids both the expensive coefficient read and the even
+    larger GaiaSource read for ~99% of shards in a 1° cone.
     """
-    xp = _read_xp_shard(xp_path)
+    cone_active = (
+        ra_center is not None
+        and dec_center is not None
+        and radius is not None
+    )
+
+    # Cheap pre-filter: read only source_id/ra/dec from the XP file.
+    xp_source_id_all, xp_ra_all, xp_dec_all = _read_xp_coords(xp_path)
+
+    if cone_active:
+        xp_mask = apply_cone_filter(
+            xp_ra_all, xp_dec_all, ra_center, dec_center, radius
+        )
+        if not xp_mask.any():
+            return None
+        xp_source_id = xp_source_id_all[xp_mask]
+    else:
+        xp_mask = None
+        xp_source_id = xp_source_id_all
+
+    # At least one source is interesting — pay the cost of the full XP
+    # coefficient read and the GaiaSource read now.
+    xp_coeffs = _read_xp_coeffs(xp_path)
+    coeff_all = xp_coeffs["coeff"]
+    coeff_error_all = xp_coeffs["coeff_error"]
+    if xp_mask is not None:
+        coeff_all = coeff_all[xp_mask]
+        coeff_error_all = coeff_error_all[xp_mask]
+
     src = _read_source_columns(source_path, ALL_SOURCE_COLUMNS)
 
-    # Inner-join on source_id. Both sides are sorted by source_id within the
-    # shard, but we use np.intersect1d with return_indices to be safe.
+    # Inner-join XP survivors with GaiaSource on source_id.
     _, ix_xp, ix_src = np.intersect1d(
-        xp["source_id"], src["source_id"], return_indices=True, assume_unique=True
+        xp_source_id, src["source_id"], return_indices=True, assume_unique=True
     )
     n = ix_xp.size
     if n == 0:
         return None
 
-    # Gather the joined rows from both sides.
-    coeff = xp["coeff"][ix_xp]
-    coeff_error = xp["coeff_error"][ix_xp]
-    source_id = xp["source_id"][ix_xp]
+    coeff = coeff_all[ix_xp]
+    coeff_error = coeff_error_all[ix_xp]
+    source_id = xp_source_id[ix_xp]
     src_joined = {c: src[c][ix_src] for c in ALL_SOURCE_COLUMNS if c != "source_id"}
 
     ra = np.asarray(src_joined["ra"], dtype=np.float64)
     dec = np.asarray(src_joined["dec"], dtype=np.float64)
-
-    if ra_center is not None and dec_center is not None and radius is not None:
-        mask = apply_cone_filter(ra, dec, ra_center, dec_center, radius)
-        if not mask.any():
-            return None
-        coeff = coeff[mask]
-        coeff_error = coeff_error[mask]
-        source_id = source_id[mask]
-        ra = ra[mask]
-        dec = dec[mask]
-        src_joined = {k: v[mask] for k, v in src_joined.items()}
-        n = mask.sum()
 
     def _struct(feature_list: list[str]) -> pa.StructArray:
         """Build a struct array from a list of float32 scalar columns."""

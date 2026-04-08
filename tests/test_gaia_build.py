@@ -50,14 +50,24 @@ def _write_fake_gaia_source(path: str, source_ids: np.ndarray, ra: np.ndarray, d
             f.create_dataset(c, data=rng.normal(0, 1, n).astype(np.float32))
 
 
-def _write_fake_xp(path: str, source_ids: np.ndarray) -> None:
-    """Write a tiny XpContinuousMeanSpectrum_*.hdf5 with 55-coefficient arrays."""
+def _write_fake_xp(
+    path: str,
+    source_ids: np.ndarray,
+    ra: np.ndarray,
+    dec: np.ndarray,
+) -> None:
+    """Write a tiny XpContinuousMeanSpectrum_*.hdf5 with 55-coefficient arrays.
+
+    The ``ra``/``dec`` arrays must match the GaiaSource ra/dec for the same
+    source_ids. In the real Gaia Archive bulk files, XP contains the same
+    astrometric coordinates as GaiaSource for its subset of sources.
+    """
     n = len(source_ids)
     rng = np.random.default_rng(int(source_ids[0]) if n else 0)
     with h5py.File(path, "w") as f:
         f.create_dataset("source_id", data=source_ids.astype(np.int64))
-        f.create_dataset("ra", data=rng.uniform(0, 360, n).astype(np.float64))
-        f.create_dataset("dec", data=rng.uniform(-90, 90, n).astype(np.float64))
+        f.create_dataset("ra", data=ra.astype(np.float64))
+        f.create_dataset("dec", data=dec.astype(np.float64))
         f.create_dataset("bp_coefficients", data=rng.normal(0, 1, (n, 55)).astype(np.float32))
         f.create_dataset("rp_coefficients", data=rng.normal(0, 1, (n, 55)).astype(np.float32))
         f.create_dataset("bp_coefficient_errors", data=rng.uniform(0.01, 0.1, (n, 55)).astype(np.float32))
@@ -80,8 +90,14 @@ def fake_gaia_shards(tmp_path):
         src_ids_1, ra_1, dec_1,
     )
     # XP has source_ids for index 0, 2, 5, 8 (4 sources; 3 in cone)
-    xp_ids_1 = src_ids_1[[0, 2, 5, 8]]
-    _write_fake_xp(str(raw / "XpContinuousMeanSpectrum_000000-003111.hdf5"), xp_ids_1)
+    xp_idx_1 = [0, 2, 5, 8]
+    xp_ids_1 = src_ids_1[xp_idx_1]
+    xp_ra_1 = ra_1[xp_idx_1]
+    xp_dec_1 = dec_1[xp_idx_1]
+    _write_fake_xp(
+        str(raw / "XpContinuousMeanSpectrum_000000-003111.hdf5"),
+        xp_ids_1, xp_ra_1, xp_dec_1,
+    )
 
     # Shard 2: 5 source_ids, 2 of which have XP. None in the cone.
     src_ids_2 = np.arange(2000, 2005, dtype=np.int64)
@@ -91,8 +107,14 @@ def fake_gaia_shards(tmp_path):
         str(raw / "GaiaSource_003112-005263.hdf5"),
         src_ids_2, ra_2, dec_2,
     )
-    xp_ids_2 = src_ids_2[[1, 3]]
-    _write_fake_xp(str(raw / "XpContinuousMeanSpectrum_003112-005263.hdf5"), xp_ids_2)
+    xp_idx_2 = [1, 3]
+    xp_ids_2 = src_ids_2[xp_idx_2]
+    xp_ra_2 = ra_2[xp_idx_2]
+    xp_dec_2 = dec_2[xp_idx_2]
+    _write_fake_xp(
+        str(raw / "XpContinuousMeanSpectrum_003112-005263.hdf5"),
+        xp_ids_2, xp_ra_2, xp_dec_2,
+    )
 
     return str(raw)
 
