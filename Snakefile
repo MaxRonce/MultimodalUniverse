@@ -51,6 +51,24 @@ RA_CENTER = _resolve("ra_center", None)
 DEC_CENTER = _resolve("dec_center", None)
 RADIUS = _resolve("radius", None)
 
+
+# --------------------------------------------------------------------------- #
+#                               OUTPUT SAFETY                                 #
+# --------------------------------------------------------------------------- #
+# /mnt/ceph/users/polymathic/ contains datasets that took MONTHS to produce,
+# INCLUDING the READ-ONLY raw data mirror under external_data/ that every
+# build script reads from. A Snakefile misconfiguration (typo in hats_root,
+# wrong profile, stale envvar) could in principle ask Snakemake to write into
+# these paths directly. Before ANY rule is parsed we validate HATS_ROOT so a
+# bad value aborts the pipeline before a single directory is created.
+#
+# The validation is in `mmu.safety.validate_hats_root` so we can unit-test it
+# rigorously. If you're adding a new allowed output prefix, update the
+# whitelist there (and the tests).
+from mmu.safety import validate_hats_root
+
+validate_hats_root(HATS_ROOT)
+
 # Datasets that have a working raw -> HATS build script under scripts/{name}/
 PORTED = [
     "sdss",      # raw FITS plate files
