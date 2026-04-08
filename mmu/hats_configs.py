@@ -45,7 +45,11 @@ DATASETS: dict[str, DatasetConfig] = {
     "galah":        DatasetConfig("galah", "spectra", "galah"),
     "apogee":       DatasetConfig("apogee", "spectra", "APOGEE/apogee"),
     "chandra":      DatasetConfig("chandra", "spectra", "chandra"),
-    "gaia":         DatasetConfig("gaia", "spectra", "Gaia"),
+    # gaia = full Gaia DR3 source catalog, ~1.8B rows, no XP filter.
+    # gaia_xp = the ~220M subset joined with XpContinuousMeanSpectrum
+    # (same raw HDF5 dir; the two scripts read different files from it).
+    "gaia":         DatasetConfig("gaia", "tabular", "Gaia"),
+    "gaia_xp":      DatasetConfig("gaia_xp", "spectra", "Gaia"),
     "desi_provabgs": DatasetConfig("desi_provabgs", "tabular", "DESI_PROVABGS"),
 
     # --- Images ---

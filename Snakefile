@@ -79,7 +79,8 @@ PORTED = [
     "desi",      # raw DESI coadd FITS files, merged via desispec.coadd_cameras
     "tess",      # raw TESS-SPOC FFI lightcurves (one file per TIC, sector)
     "ssl_legacysurvey",  # raw Stein-et-al DECaLS image chunks (h5 per 1M objects)
-    "gaia",      # raw Gaia DR3 (GaiaSource + XpContinuousMeanSpectrum joined on source_id)
+    "gaia",      # raw Gaia DR3 GaiaSource, full ~1.8B source catalog
+    "gaia_xp",   # raw Gaia DR3, GaiaSource ∩ XpContinuousMeanSpectrum (~220M)
     "legacysurvey",  # raw DECaLS DR10 south sweeps + brick coadds (image cutouts + nearby catalog)
     "manga",     # raw SDSS-IV MaNGA IFU LOGCUBE + DAP MAPS files (spaxels + griz images + analysis maps)
     "foundation",  # Foundation DR1 SNe Ia (SNANA ASCII lightcurves, ~180 SNe)
@@ -218,14 +219,29 @@ SHARDED_DATASETS = {
         # OOM thrashing on the per-worker 5 GB default.
         ingest_workers=8,
     ),
+    # gaia = full Gaia DR3 source catalog (~1.8B rows from 3386 GaiaSource
+    # shards). 16 shards × ~211 shards each × Pool(96) keeps the scatter
+    # wall under ~1h on preempt. ingest_workers=8 because the per-row
+    # struct schema is big enough that 32+ dask workers OOM (same as the
+    # desi/manga lesson).
     "gaia": dict(
+        num_shards=16,
+        num_processes=96,
+        build_mem_mb=900_000,
+        build_runtime_min=240,
+        ingest_mem_mb=900_000,
+        ingest_runtime_min=360,
+        ingest_workers=8,
+    ),
+    # gaia_xp = XP-joined subset (~220M rows), same raw Gaia/ dir.
+    "gaia_xp": dict(
         num_shards=8,
         num_processes=96,   # per-worker reads one (source, xp) HDF5 pair
         build_mem_mb=900_000,
         build_runtime_min=240,
         ingest_mem_mb=900_000,
         ingest_runtime_min=240,
-        ingest_workers=96,
+        ingest_workers=8,
     ),
     "manga": dict(
         num_shards=8,
