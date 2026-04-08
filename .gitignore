@@ -203,3 +203,7 @@ test_data/
 snakemake_config.local.yaml
 test_output/
 .snakemake/
+
+# Playwright MCP scratch (DOM accessibility dumps + browser console logs
+# captured when Claude browses docs — noise, not source).
+.playwright-mcp/
