@@ -641,6 +641,15 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
     """
     sweep_path, raw_root, scratch, ra_center, dec_center, radius = args
     basename = os.path.basename(sweep_path)
+    # Skip sweeps already written on a previous run. Parquet writes are
+    # idempotent but the per-sweep work (WCS cutouts on hundreds of bricks)
+    # is expensive, so a rerun that keeps the scratch dir around can reuse
+    # what's already there and only fill in the gaps. This is how we recover
+    # from the 135 SKIPPED sweeps dropped by the ChunkedArray bug without
+    # reprocessing every sweep.
+    out_path = os.path.join(scratch, f"part-{basename}.parquet")
+    if os.path.exists(out_path):
+        return basename, 0, 0, None
     try:
         cat = read_sweep(
             sweep_path,
@@ -676,7 +685,6 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
             return basename, len(cat), 0, None
 
         table = build_table(sweep_records)
-        out_path = os.path.join(scratch, f"part-{basename}.parquet")
         pq.write_table(table, out_path)
         n_cutouts = table.num_rows
         n_cat = len(cat)
