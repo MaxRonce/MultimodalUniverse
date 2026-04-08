@@ -54,13 +54,14 @@ RADIUS = _resolve("radius", None)
 # Datasets that have a working raw -> HATS build script under scripts/{name}/
 PORTED = [
     "sdss",      # raw FITS plate files
-    "allwise",   # raw IRSA parquet
+    "allwise",   # raw IRSA parquet, healpix-prefiltered for cone cuts
     "twomass",   # raw IRSA gzipped CSV
     "sages",     # single FITS table (DR1 u/v photometry)
     "galex",     # multi-FITS GUVCat shards (latitude-partitioned)
     "desi",      # raw DESI coadd FITS files, merged via desispec.coadd_cameras
     "tess",      # raw TESS-SPOC FFI lightcurves (one file per TIC, sector)
     "ssl_legacysurvey",  # raw Stein-et-al DECaLS image chunks (h5 per 1M objects)
+    "gaia",      # raw Gaia DR3 (GaiaSource + XpContinuousMeanSpectrum joined on source_id)
 ]
 
 
@@ -158,5 +159,14 @@ rule build_ssl_legacysurvey:
         marker = catalog_marker("ssl_legacysurvey"),
     params:
         cmd = build_command("ssl_legacysurvey"),
+    shell:
+        "{params.cmd}"
+
+
+rule build_gaia:
+    output:
+        marker = catalog_marker("gaia"),
+    params:
+        cmd = build_command("gaia"),
     shell:
         "{params.cmd}"

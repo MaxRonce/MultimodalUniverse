@@ -36,6 +36,8 @@ dependencies = [
     # PyTorch loader (mmu.data depends on torch at module-import time)
     "torch",
     "desispec>=0.70.0",
+    # Orchestration: every cluster run goes through Snakemake. Not optional.
+    "snakemake",
 ]
 dynamic = ["version"]
 
