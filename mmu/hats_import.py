@@ -32,6 +32,25 @@ from hats_import.pipeline import pipeline_with_client
 LOGGER = logging.getLogger(__name__)
 
 
+# Sibling to the HATS output root on ceph. Per-shard parquet files from
+# streaming build scripts go under here as ``<scratch>/<catalog>_<pid>/part-*.parquet``
+# so peak RAM stays bounded by one shard instead of the full catalog.
+# Kept on ceph (not /tmp) so the scratch dir survives compute-node failure
+# and so we can see how far a failed build got.
+DEFAULT_SCRATCH_ROOT = "/mnt/ceph/users/polymathic/MultimodalUniverse_v2_hats_scratch"
+
+
+def default_scratch_dir(catalog_name: str) -> str:
+    """Return the canonical per-catalog scratch directory on ceph.
+
+    The directory is namespaced by catalog name and the current process ID,
+    so concurrent builds of the same dataset don't stomp on each other.
+    Callers are responsible for creating it and for cleaning it up once
+    ``write_hats_from_parquet_dir`` has returned successfully.
+    """
+    return os.path.join(DEFAULT_SCRATCH_ROOT, f"{catalog_name}_{os.getpid()}")
+
+
 def to_native_endian(array: np.ndarray) -> np.ndarray:
     """Return a copy of ``array`` in the machine's native byte order.
 
@@ -105,8 +124,8 @@ def write_hats(
     pixel_threshold: int = 8192,
     lowest_healpix_order: int = 4,
     margin_threshold_arcsec: float = 10.0,
-    n_workers: int = 1,
-    debug: bool = True,
+    n_workers: int = 32,
+    debug: bool = False,
     client: Client | None = None,
 ) -> str:
     """Write a list of PyArrow tables as a HATS catalog under ``output_path``.
@@ -173,8 +192,8 @@ def write_hats_from_parquet_dir(
     lowest_healpix_order: int = 4,
     margin_threshold_arcsec: float = 10.0,
     chunksize: int = 500_000,
-    n_workers: int = 1,
-    debug: bool = True,
+    n_workers: int = 32,
+    debug: bool = False,
     client: Client | None = None,
 ) -> str:
     """Write a HATS catalog by streaming parquet files from a directory.
