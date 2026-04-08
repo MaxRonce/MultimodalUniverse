@@ -83,6 +83,10 @@ PORTED = [
     "legacysurvey",  # raw DECaLS DR10 south sweeps + brick coadds (image cutouts + nearby catalog)
     "manga",     # raw SDSS-IV MaNGA IFU LOGCUBE + DAP MAPS files (spaxels + griz images + analysis maps)
     "foundation",  # Foundation DR1 SNe Ia (SNANA ASCII lightcurves, ~180 SNe)
+    "snls",        # JLA2014 SNLS SNe Ia (~239 SNe, shared mmu.sn_ia_snana helper)
+    "ps1_sne_ia",  # Pan-STARRS1 SNe Ia (~369 SNe)
+    "des_y3_sne_ia",  # DES Y3 SNe Ia (~251 SNe)
+    "swift_sne_ia",   # Swift UV/optical SNe Ia (~117 SNe)
 ]
 
 
@@ -317,8 +321,12 @@ for _name, _cfg in SHARDED_DATASETS.items():
             mem_mb = _cfg["ingest_mem_mb"],
             runtime = _cfg["ingest_runtime_min"],
             cpus_per_task = 96,
-            slurm_partition = SHARDED_SLURM_PARTITION,
-            qos = "preempt" if SHARDED_SLURM_PARTITION == "preempt" else None,
+            # Gather jobs always run on the guaranteed (non-preempt) partition
+            # so they can't get killed mid-HATS-write. A preempted gather leaves
+            # a half-written catalog dir that the next run would have to clean
+            # up. Scatter shards are preemptible because they're idempotent
+            # and cheap to requeue.
+            slurm_partition = SLURM_PARTITION,
         shell:
             "python -u -m scripts.{params.name}.build_parent_sample_hats "
             "--scratch-dir {params.scratch} "
@@ -456,6 +464,74 @@ rule build_foundation:
     resources:
         mem_mb = 50_000,
         runtime = 60,             # 1h — only ~180 SNANA ASCII files
+        cpus_per_task = 96,
+        slurm_partition = SLURM_PARTITION,
+    shell:
+        "{params.cmd}"
+
+
+# Remaining SN-Ia datasets share the SNANA ASCII parser in mmu.sn_ia_snana.
+# Each is a thin wrapper script with the same shape as build_foundation;
+# per-dataset size caps are all small (100-400 SNe) so they fit in a single
+# node with minimal resources.
+rule build_snls:
+    output:
+        marker = catalog_marker("snls"),
+    input:
+        script = build_script("snls"),
+    params:
+        cmd = build_command("snls"),
+    resources:
+        mem_mb = 50_000,
+        runtime = 60,
+        cpus_per_task = 96,
+        slurm_partition = SLURM_PARTITION,
+    shell:
+        "{params.cmd}"
+
+
+rule build_ps1_sne_ia:
+    output:
+        marker = catalog_marker("ps1_sne_ia"),
+    input:
+        script = build_script("ps1_sne_ia"),
+    params:
+        cmd = build_command("ps1_sne_ia"),
+    resources:
+        mem_mb = 50_000,
+        runtime = 60,
+        cpus_per_task = 96,
+        slurm_partition = SLURM_PARTITION,
+    shell:
+        "{params.cmd}"
+
+
+rule build_des_y3_sne_ia:
+    output:
+        marker = catalog_marker("des_y3_sne_ia"),
+    input:
+        script = build_script("des_y3_sne_ia"),
+    params:
+        cmd = build_command("des_y3_sne_ia"),
+    resources:
+        mem_mb = 50_000,
+        runtime = 60,
+        cpus_per_task = 96,
+        slurm_partition = SLURM_PARTITION,
+    shell:
+        "{params.cmd}"
+
+
+rule build_swift_sne_ia:
+    output:
+        marker = catalog_marker("swift_sne_ia"),
+    input:
+        script = build_script("swift_sne_ia"),
+    params:
+        cmd = build_command("swift_sne_ia"),
+    resources:
+        mem_mb = 50_000,
+        runtime = 60,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:

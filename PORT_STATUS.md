@@ -6,62 +6,53 @@ Live tracker for the raw → HATS port of v1 MMU. Every non-skipped dataset in `
 
 **Schema rule:** Struct-of-parallel-lists with plain pyarrow types. NO HF `datasets` extension types inside `list<>` or `struct<>` (see `project_image_storage` memory — nested_pandas crashes on them in hats-import's finishing stage).
 
-**Scatter/gather sharding:** Large datasets are built via scatter-gather — N independent sbatch jobs each process a stride slice of the inputs and write per-unit parquet shards to a shared ceph scratch dir, then one gather job runs `write_hats_from_parquet_dir`. Controlled by `SHARDED_DATASETS` in the Snakefile. All dependency tracking goes through Snakemake's DAG, no bespoke shell launchers.
+**No normalization:** Every catalog keeps its survey-native column names, units, and values untouched. No canonical aliases, no unit conversions, no cross-survey unification. Users who want a unified view build it on top.
+
+**Scatter/gather sharding:** Large datasets are built via scatter-gather — N independent sbatch jobs each process a stride slice of the inputs and write per-unit parquet shards to a shared ceph scratch dir, then one gather job runs `write_hats_from_parquet_dir`. Controlled by `SHARDED_DATASETS` in the Snakefile. All dependency tracking goes through Snakemake's DAG, no bespoke shell launchers. Scatter jobs run on `preempt` (bursts into idle rome nodes cluster-wide); gather jobs run on `ccm` (guaranteed, non-preemptible so a half-written HATS catalog is impossible).
 
 **Legend:** `[x]` done · `[ ]` pending · `[~]` in progress · `[skip]` out of scope
 
 ---
 
-## Ported baseline — script exists + tests pass
+## Production builds landed so far
 
-- [x] **sdss** (spectra) — `scripts/sdss/build_parent_sample_hats.py`
-  - Spectrum struct<flux, ivar, lsf_sigma, lambda, mask> + photometry
-  - Cone args + streaming per-plate parquet + `multiprocessing.Pool`
-  - Tests: 11 passing
-- [x] **desi** (spectra) — `desispec.coadd_cameras` coadd
-  - Spectrum struct + Z/ZERR/ZWARN + photometry
-  - Streaming per-coadd-file parquet + `multiprocessing.Pool` with fork-COW catalog sharing
-  - Tests: 20 passing
-- [x] **ssl_legacysurvey** (image) — struct-of-parallel-lists (reference impl)
-  - `image: struct<band, flux (3,152,152), psf_fwhm, scale>` + photometry
-  - Tests: 8 passing
-- [x] **tess** (timeseries) — variable-length lightcurves
-  - `lightcurve: struct<time, flux, flux_err, quality>` per (TIC, sector)
-  - Streaming per-batch parquet (batches of 1000 LCs) + `multiprocessing.Pool(96)`
-  - Cone args accepted but no-op (filenames don't encode RA/Dec)
-  - Tests: 11 passing
-- [x] **allwise** (tabular) — 298 cols from IRSA parquet
-  - Cone filter + healpix-k5 prefilter
-  - Streaming per-shard parquet + `multiprocessing.Pool(96)`
-  - Tests: 12 passing
-- [x] **twomass** (tabular) — 2MASS PSC pipe-delimited CSV
-  - Streaming per-shard parquet (92 shards)
-  - Tests: 6 passing
-- [x] **galex** (tabular) — GUVCat FITS shards (36 shards)
-  - Streaming per-shard parquet
-  - Tests: 5 passing
-- [x] **sages** (tabular) — single u/v photometry FITS table
+| Dataset | Rows | Size | Sky frac | Notes |
+|---|---:|---:|---:|---|
+| sdss | 4,254,830 | 193 GB | 0.35 | DR17 spectra, full run |
+| gaia (XP subset) | 219,197,643 | 293 GB | 1.00 | GaiaSource × XpContinuousMeanSpectrum join. See TODO below — user wants `gaia` renamed to `gaia_xp` and a NEW `gaia` containing all ~1.8B DR3 sources. |
+| galex | 82,992,062 | 18 GB | 0.82 | GUVCat AIS |
+| tess | 159,994 | 17 GB | 0.06 | SPOC FFI lightcurves |
+| sages | 29,332,961 | 1.5 GB | 0.26 | DR1 u/v photometry |
 
-## Phase 1 — Flagship datasets
+**Total landed so far: 336 M rows, 523 GB.**
 
-- [x] **gaia** — BUNDLED: XP spectra + photometry + astrometry + RV + stellar params
-  - Joined on `source_id` between GaiaSource shards and XpContinuousMeanSpectrum shards
-  - Streaming per-shard-pair parquet + `multiprocessing.Pool(96)`
-  - Tests: 10 passing
-- [x] **legacysurvey** — BUNDLED: multi-band images + RGB + masks + catalog
-  - Struct-of-parallel-lists for `image`, `rgb`, `blobmodel`, `object_mask`, nearby `catalog`
-  - **Scatter-gather sharded** (8 shards × `Pool(32)`) via Snakemake `build_sharded_shard` + `build_legacysurvey` rules
-  - Per-sweep worker in `_process_sweep_to_parquet`; catches ALL exceptions (including cfitsio unpicklable ones) → picklable error strings
-  - Tests: 22 passing
-- [skip] **hsc** — source catalog not mirrored on Flatiron cluster
-- [skip] **kepler** — raw Kepler FITS not mirrored; only v1 HDF5 exists at `spoc/SPOC/`
-- [x] **manga** — BUNDLED, most complex: IFU cubes + spaxel coords + griz reconstructions + DAP maps
-  - `spaxels: struct<flux, ivar, lambda, mask>` (9216×4563) + `images: struct<4 bands × 96²>` + `maps: struct<~50 DAP maps>`
-  - Streaming per-plate-ifu parquet + `multiprocessing.Pool(32)`
-  - Sharding flags added (eligible for `SHARDED_DATASETS` entry)
-  - Tests: 11 passing
+---
 
-## Phase 2 — Remaining datasets
+## In flight right now
+
+- [~] **legacysurvey** — 128-shard preempt scatter running. Previous run had a ChunkedArray bug that silently dropped 135 large sweeps; fix landed in commit `a81eae9`, skip-if-exists optimization in `a880b99` lets the rerun reuse the 211 good parquets already on disk.
+- [~] **desi** — scatter complete (16/16 markers exist), gather rerun pending with `ingest_workers=8` after the first attempt crashed in the hats-import splitting stage with too-many-dask-workers OOM.
+- [~] **manga** — scatter complete (8/8 markers), gather rerun pending with `ingest_workers=8` (same reason as desi; first attempt crawled to 2% in 1h43m with constant dask worker restarts).
+- [~] **foundation / snls / ps1_sne_ia / des_y3_sne_ia / swift_sne_ia** — all 5 SN-Ia scripts queued in the current snakemake master, tiny datasets (100–400 SNe each), expected ~1 min wall each.
+
+## Ported + tests passing (baseline)
+
+- [x] **sdss** — spectra, scatter/gather sharded (20 shards in speedster run)
+- [x] **desi** — spectra with fork-COW catalog sharing in scatter workers
+- [x] **ssl_legacysurvey** — image, struct-of-parallel-lists reference impl
+- [x] **tess** — timeseries, batched streaming + Pool(96)
+- [x] **allwise** — tabular, healpix-k5 prefilter + Pool(96)
+- [x] **twomass** — tabular, per-shard streaming Pool
+- [x] **galex** — tabular, per-FITS-shard streaming
+- [x] **sages** — tabular, single FITS
+- [x] **gaia** — BUNDLED (XP + photometry + 20-field astrometry + RV + gspphot), scatter/gather sharded
+- [x] **legacysurvey** — BUNDLED (images + RGB + masks + nearby catalog), scatter/gather sharded
+- [x] **manga** — BUNDLED IFU cubes + griz images + DAP maps, scatter/gather sharded
+- [x] **foundation / snls / ps1_sne_ia / des_y3_sne_ia / swift_sne_ia** — SNANA ASCII lightcurves via shared `mmu.sn_ia_snana` helper
+
+**Total: 16 datasets with working scripts + tests green.**
+
+## Phase 2 — Remaining datasets to port
 
 ### Spectra (reuse sdss/desi pattern)
 - [ ] **vipers** — VIMOS Public Extragalactic Redshift Survey
@@ -74,62 +65,60 @@ Live tracker for the raw → HATS port of v1 MMU. Every non-skipped dataset in `
 - [ ] **btsbot** — ZTF BTS image triplets
 - [ ] **gz10** — Galaxy Zoo 10 single RGB + classification label
 
-### SN time series (shared `mmu/sn_ia_snana.py` helper)
-- [x] **foundation** — Foundation DR1 SNe Ia (SNANA ASCII lightcurves, ~180 SNe)
-  - Thin wrapper around `mmu.sn_ia_snana.build_main`
-  - Tests: 6 passing
-- [x] **snls** — Supernova Legacy Survey (JLA2014, ~239 SNe)
-  - Wrapper around shared SN-Ia SNANA helper
-- [x] **ps1_sne_ia** — Pan-STARRS1 SNe Ia (PS1_PSc\*.txt, ~369 SNe, object_id prefix "PS1_")
-  - Wrapper
-- [x] **des_y3_sne_ia** — DES Y3 SNe Ia (des_real_\*.dat, ~251 SNe, object_id prefix "DES_")
-  - Wrapper
-- [x] **swift_sne_ia** — Swift UV/optical SNe (\*.dat, ~117 SNe)
-  - Wrapper
-
 ### Tabular
 - [ ] **desi_provabgs** — Stellar parameters + MCMC posteriors (100×13 samples per object)
+
+## Follow-up work
+
+- [ ] **gaia restructure**: split the current 220M XP-joined `gaia` catalog into
+  - `gaia` — ALL ~1.8B Gaia DR3 sources from `GaiaSource_*.hdf5`, no XP filter. New build script.
+  - `gaia_xp` — the current 220M XP-joined catalog, renamed from `gaia`.
+  Means moving the existing catalog and adding a second entry in `mmu/hats_configs.py`. Queued for after the current production run settles.
+- [ ] **ssl_legacysurvey full-sky production**: ~42 TB expected output, crosses the Flatiron ceph "let us know if you'll generate >10 TB" courtesy threshold. Need to email scicomp before launching.
+
+## Skipped (out of scope)
+
+- [skip] **plasticc** — raw dir empty on cluster
+- [skip] **kepler** — raw FITS not mirrored; only v1-processed HDF5 exists
+- [skip] **hsc** — source catalog not on cluster mirror
+- [skip] **cfa**, **csp**, **lamost**, **yse** — in v1 but deliberately excluded
 
 ## Infrastructure shipped
 
 - `mmu/cone.py` — shared cone-cut helper (haversine + bbox prefilter)
 - `mmu/safety.py` — output-path guardrails (allowlist + `external_data/` denylist) with 30 tests
 - `mmu/hats_import.py` — `write_hats` and `write_hats_from_parquet_dir` helpers
-  - Production defaults flipped to `debug=False, n_workers=32` (was `debug=True, 1` — single-core ingest bottleneck)
+  - Production defaults: `debug=False, n_workers=32` (previously `debug=True, 1` was silently bottlenecking ingest to single-core)
   - `default_scratch_dir()` for per-catalog ceph scratch paths
 - `mmu/sn_ia_snana.py` — shared build helper for the 5 SNANA ASCII SN-Ia datasets
 - `mmu/hats_configs.py` — registry with `DatasetConfig` + raw paths
-- `Snakefile` with per-dataset `build_<name>` rules
-  - Each rule takes its build script as an `input:` → auto-rerun on script change
-  - `SHARDED_DATASETS` scatter-gather rule pair for large datasets
+- `Snakefile`
+  - Per-dataset `build_<name>` rules, each declaring its build script as an `input:` (auto-rerun on edit)
+  - `SHARDED_DATASETS` config + generic `build_sharded_shard` wildcard rule + loop-generated gather rules
+  - `SHARDED_SLURM_PARTITION` for scatter (preempt), gather always runs on `SLURM_PARTITION` (ccm, guaranteed)
   - `validate_hats_root` top-level safety check
+  - `qos="preempt"` resource for preempt scatter, `--slurm-requeue` auto-requeue on preemption
 - `snakemake_config.yaml` — `cluster`, `cosmos`, `test` profiles
 
 ## SLURM launchers
 
 - `scripts/slurm/run_cosmos_slurm.sh` — COSMOS 1° validation via Snakemake/slurm executor
 - `scripts/slurm/run_production_slurm.sh` — all-sky production via Snakemake/slurm executor
-- Ad-hoc bespoke `/tmp/<dataset>_sbatch.sh` files exist on the cluster from crash-recovery resubmissions — these are being phased out in favor of pure Snakemake DAG execution via `SHARDED_DATASETS`.
 
-## Skipped (out of scope)
-
-- [skip] **plasticc** — raw dir empty on cluster (`hats_configs.skip=True`)
-- [skip] **kepler** — raw FITS not mirrored; only v1-processed HDF5 exists
-- [skip] **hsc** — source catalog not on cluster mirror
-- [skip] **cfa**, **csp**, **lamost**, **yse** — in v1 but deliberately excluded
+No more bespoke `/tmp/*.sh` launchers — everything flows through Snakemake now, including scatter/gather sharded builds.
 
 ---
 
-## Totals (current state)
+## Totals
 
 | Category | Count |
 |---|---|
-| Ported + tests passing | **18** (sdss, desi, ssl_legacysurvey, tess, allwise, twomass, galex, sages, gaia, legacysurvey, manga, foundation, snls, ps1_sne_ia, des_y3_sne_ia, swift_sne_ia, ... — counting) |
-| Phase 2 spectra remaining | 4 (vipers, galah, apogee, chandra) |
-| Phase 2 images remaining | 3 (jwst, btsbot, gz10) |
-| Phase 2 tabular remaining | 1 (desi_provabgs) |
+| Ported + tests green | 16 |
+| Landed in production | 5 (sdss, gaia[-xp], galex, tess, sages) |
+| In flight right now | 8 (legacysurvey, desi, manga, foundation, snls, ps1_sne_ia, des_y3_sne_ia, swift_sne_ia) |
+| Phase 2 remaining to port | 8 (vipers, galah, apogee, chandra, jwst, btsbot, gz10, desi_provabgs) |
+| Follow-up | 2 (gaia restructure, ssl_legacysurvey full-sky) |
 | Skipped | 7 (plasticc, kepler, hsc, cfa, csp, lamost, yse) |
-| **v1 datasets total** | **31** |
 
 ## Verification criteria (per dataset)
 
