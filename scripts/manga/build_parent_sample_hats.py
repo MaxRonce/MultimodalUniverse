@@ -1,38 +1,41 @@
 """Convert raw SDSS-IV MaNGA into a HATS catalog.
 
-Matches v1 MMU's ``scripts/manga/build_parent_sample.py`` exactly, with
-HATS output instead of HDF5:
+Reads the same DR17 inputs as v1 MMU's ``scripts/manga/build_parent_sample.py``
+but stores cubes / maps at their **native** spatial shape rather than v1's
+psycho 96×96 zero-padding. Each row carries ``spatial_shape_y`` and
+``spatial_shape_x`` so a reader can reconstruct the per-IFU geometry without
+trusting a hard-coded constant. The spectral axis is moved to the **last**
+position so per-spaxel spectra are contiguous in memory:
 
-    1. Read drpall-v3_1_1.fits and dapall-v3_1_1-3.1.0.fits, inner-join on
-       plateifu, keep only DAPDONE rows.
-    2. (If a cone cut is active) trim the joined catalog by ifura/ifudec.
-    3. For each surviving plate-ifu:
-         - Open ``redux/v3_1_1/{plate}/stack/manga-{plateifu}-LOGCUBE.fits.gz``
-           and extract flux/ivar/mask/lsf/wave + griz reconstructed images
-           and PSFs. Pad spatial dims to 96×96.
-         - Open ``analysis/v3_1_1/3.1.0/HYB10-MILESHC-MASTARSSP/{plate}/{ifu}/
-           manga-{plateifu}-MAPS-HYB10-MILESHC-MASTARSSP.fits.gz`` for the DAP
-           analysis maps + spaxel coordinate grids. Pad to 96×96.
-    4. Build a per-row dict matching v1's HuggingFace `Features(...)`:
+    spaxels.flux  : list<list<list<float32>>>   (ny, nx, nwave)
+    spaxels.ivar  : list<list<list<float32>>>   (ny, nx, nwave)
+    spaxels.mask  : list<list<list<int64>>>     (ny, nx, nwave)
+    spaxels.lsf   : list<list<list<float32>>>   (ny, nx, nwave)
+    spaxels.lambda: list<float32>               (nwave,)   shared per object
+    spaxels.x, y  : list<list<int8>>            (ny, nx)
+    spaxels.spaxel_idx          : list<list<int16>>   (ny, nx)
+    spaxels.skycoo_x, skycoo_y  : list<list<float32>> (ny, nx)
+    spaxels.ellcoo_{r,rre,rkpc,theta} : list<list<float32>> (ny, nx)
+    spaxels.{flux,lambda,skycoo,ellcoo_*}_units : string  (scalar per row)
 
-           spaxels: struct<flux, ivar, mask, lsf, lambda, x, y, spaxel_idx,
-                            *_units, skycoo_x/y, ellcoo_r/rre/rkpc/theta, *_units>
-           images:  struct<filter, flux, flux_units, psf, psf_units, scale, scale_units>
-           maps:    struct<group, label, flux, ivar, mask, array_units>
-           ra, dec, object_id (= plateifu), z, spaxel_size, spaxel_size_units
+    images.flux/psf : list<list<list<float32>>>  (n_bands, ny, nx)
+    images.{filter,flux_units,psf_units,scale,scale_units} : list<...>
 
-       All arrays stored as plain nested lists (no extension types) — see
-       ``project_image_storage`` memory.
-    5. Write HATS via ``mmu.hats_import.write_hats``.
+    maps.flux/ivar/mask : list<list<list<float32>>>  (n_maps, ny, nx)
+    maps.{group,label,array_units} : list<string>
 
-Cluster layout::
+    + ra, dec, object_id (=plateifu), z, spaxel_size, spaxel_size_units,
+      spatial_shape_y, spatial_shape_x  (top-level scalars)
 
-    /mnt/ceph/users/polymathic/external_data/astro/manga/
-        drpall-v3_1_1.fits                                  # plate-ifu summary catalog
-        dapall-v3_1_1-3.1.0.fits                            # DAP done flag, etc.
-        dr17/manga/spectro/redux/v3_1_1/{plate}/stack/manga-{plateifu}-LOGCUBE.fits.gz
-        dr17/manga/spectro/analysis/v3_1_1/3.1.0/HYB10-MILESHC-MASTARSSP/{plate}/{ifu}/
-            manga-{plateifu}-MAPS-HYB10-MILESHC-MASTARSSP.fits.gz
+Pipeline:
+
+    1. Read drpall + dapall, inner-join on plateifu, keep only DAPDONE rows.
+    2. (Optional) cone-cut by ifura/ifudec.
+    3. For each surviving plate-ifu, open LOGCUBE + DAP MAPS and assemble a
+       per-row dict at the IFU's native spatial shape.
+    4. Write per-plate-ifu parquet shards in the build phase, then run
+       ``write_hats_from_parquet_dir`` for the ingest phase. Build/ingest
+       split + multiprocessing pool match the other sharded datasets.
 """
 
 from __future__ import annotations
@@ -51,13 +54,11 @@ from astropy.table import Table, join
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import default_scratch_dir, np_to_pyarrow_list, write_hats_from_parquet_dir
+from mmu.hats_import import default_scratch_dir, write_hats_from_parquet_dir
 
 
 CATALOG_NAME = "manga"
 
-IMAGE_SIZE = 96
-SPECTRUM_SIZE = 4563
 N_BANDS = 4
 BANDS = ["g", "r", "i", "z"]
 SPAXEL_SIZE_ARCSEC = 0.5
@@ -100,25 +101,18 @@ def maps_path(raw_root: str, plateifu: str) -> str:
     )
 
 
-def _pad_spatial(arr: np.ndarray) -> np.ndarray:
-    """Pad the LAST two axes of ``arr`` symmetrically up to ``IMAGE_SIZE``."""
-    *_, ny, nx = arr.shape
-    pad_y = (IMAGE_SIZE - ny) // 2
-    pad_x = (IMAGE_SIZE - nx) // 2
-    if pad_y == 0 and pad_x == 0:
-        return arr
-    pads = [(0, 0)] * (arr.ndim - 2) + [
-        (pad_y, IMAGE_SIZE - ny - pad_y),
-        (pad_x, IMAGE_SIZE - nx - pad_x),
-    ]
-    return np.pad(arr, pads)
-
-
 def _to_native(arr: np.ndarray) -> np.ndarray:
     """Make the buffer little-endian native so PyArrow accepts it."""
     if arr.dtype.byteorder == ">":
         return arr.byteswap().view(arr.dtype.newbyteorder("<"))
     return arr
+
+
+def _spectral_last(arr: np.ndarray, dtype) -> np.ndarray:
+    """FITS LOGCUBE arrays come in as ``(nwave, ny, nx)``; move the spectral
+    axis to the last position so per-spaxel spectra are contiguous."""
+    arr = _to_native(np.asarray(arr, dtype=dtype))
+    return np.moveaxis(arr, 0, -1)
 
 
 def process_cube(
@@ -136,65 +130,40 @@ def process_cube(
         return None
 
     with fits.open(cube_file) as cube:
-        flux = _to_native(np.asarray(cube["FLUX"].data, dtype=np.float32))
-        ivar = _to_native(np.asarray(cube["IVAR"].data, dtype=np.float32))
-        mask = _to_native(np.asarray(cube["MASK"].data, dtype=np.int64))
-        lsf = _to_native(np.asarray(cube["LSFPOST"].data, dtype=np.float32))
-        wave = _to_native(np.asarray(cube["WAVE"].data, dtype=np.float32))
-        flux_units = cube["FLUX"].header.get("BUNIT", "")
-        lambda_units = cube["FLUX"].header.get("CUNIT3", "")
+        flux = _spectral_last(cube["FLUX"].data, np.float32)        # (ny, nx, nwave)
+        ivar = _spectral_last(cube["IVAR"].data, np.float32)
+        mask = _spectral_last(cube["MASK"].data, np.int64)
+        lsf  = _spectral_last(cube["LSFPOST"].data, np.float32)
+        wave = _to_native(np.asarray(cube["WAVE"].data, dtype=np.float32))  # (nwave,)
+        flux_units = _b2s(cube["FLUX"].header.get("BUNIT", ""))
+        lambda_units = _b2s(cube["FLUX"].header.get("CUNIT3", ""))
 
-        # Pad spatial axes (last two) to IMAGE_SIZE; mask gets DONOTUSE pad value.
-        flux = _pad_spatial(flux)
-        ivar = _pad_spatial(ivar)
-        mask = np.pad(
-            mask,
-            [(0, 0)] + [
-                ((IMAGE_SIZE - mask.shape[1]) // 2, IMAGE_SIZE - mask.shape[1] - (IMAGE_SIZE - mask.shape[1]) // 2),
-                ((IMAGE_SIZE - mask.shape[2]) // 2, IMAGE_SIZE - mask.shape[2] - (IMAGE_SIZE - mask.shape[2]) // 2),
-            ],
-            constant_values=1024,
-        )
-        lsf = _pad_spatial(lsf)
+        ny, nx, nwave = flux.shape
 
-        nwave = flux.shape[0]
-        nspaxels = IMAGE_SIZE * IMAGE_SIZE  # 9216
+        # Per-spaxel index grids at native shape (no padding).
+        yy, xx = np.indices((ny, nx))
+        x_arr = xx.astype(np.int8)
+        y_arr = yy.astype(np.int8)
+        spaxel_idx = np.arange(ny * nx, dtype=np.int16).reshape(ny, nx)
 
-        # Reshape per-spaxel spectra to (nspaxels, nwave) — one row per spaxel.
-        flux_2d = flux.reshape(nwave, nspaxels).T  # (nspaxels, nwave)
-        ivar_2d = ivar.reshape(nwave, nspaxels).T
-        mask_2d = mask.reshape(nwave, nspaxels).T
-        lsf_2d = lsf.reshape(nwave, nspaxels).T
-        # Wavelength is shared by all spaxels but v1 stores it per-spaxel; we
-        # repeat to keep per-spaxel symmetry.
-        lam_2d = np.tile(wave[None, :], (nspaxels, 1))
-
-        # Spaxel x/y indices and unique idx.
-        yy, xx = np.indices((IMAGE_SIZE, IMAGE_SIZE))
-        x_arr = xx.reshape(nspaxels).astype(np.int8)
-        y_arr = yy.reshape(nspaxels).astype(np.int8)
-        spaxel_idx = np.arange(nspaxels, dtype=np.int16)
-
-        # Reconstructed griz images and PSFs.
+        # Reconstructed griz images and PSFs at native shape (n_bands, ny, nx).
         img_stack = np.stack([
-            _pad_spatial(_to_native(np.asarray(cube[f"{b.upper()}IMG"].data, dtype=np.float32)))
+            _to_native(np.asarray(cube[f"{b.upper()}IMG"].data, dtype=np.float32))
             for b in BANDS
         ])
         psf_stack = np.stack([
-            _pad_spatial(_to_native(np.asarray(cube[f"{b.upper()}PSF"].data, dtype=np.float32)))
+            _to_native(np.asarray(cube[f"{b.upper()}PSF"].data, dtype=np.float32))
             for b in BANDS
         ])
 
     # DAP MAPS file: spaxel coordinate grids + analysis maps.
     with fits.open(map_file) as mapf:
-        skycoo = _to_native(np.asarray(mapf["SPX_SKYCOO"].data, dtype=np.float32))
-        skycoo = _pad_spatial(skycoo)  # shape (2, 96, 96)
-        skycoo_units = mapf["SPX_SKYCOO"].header.get("BUNIT", "")
+        skycoo = _to_native(np.asarray(mapf["SPX_SKYCOO"].data, dtype=np.float32))  # (2, ny, nx)
+        skycoo_units = _b2s(mapf["SPX_SKYCOO"].header.get("BUNIT", ""))
 
-        ellcoo = _to_native(np.asarray(mapf["SPX_ELLCOO"].data, dtype=np.float32))
-        ellcoo = _pad_spatial(ellcoo)  # shape (4, 96, 96): r, r/re, r_kpc, theta
+        ellcoo = _to_native(np.asarray(mapf["SPX_ELLCOO"].data, dtype=np.float32))  # (4, ny, nx)
         ellcoo_units = [
-            mapf["SPX_ELLCOO"].header.get(f"U{i}", "")
+            _b2s(mapf["SPX_ELLCOO"].header.get(f"U{i}", ""))
             for i in range(1, 5)
         ]
 
@@ -209,20 +178,17 @@ def process_cube(
             if arr is None:
                 continue
             arr = _to_native(np.asarray(arr, dtype=np.float32))
-            arr = _pad_spatial(arr)
             errdata = ext.header.get("ERRDATA")
             qualdata = ext.header.get("QUALDATA")
             if errdata and errdata in mapf:
                 err = _to_native(np.asarray(mapf[errdata].data, dtype=np.float32))
-                err = _pad_spatial(err)
             else:
                 err = np.zeros_like(arr)
             if qualdata and qualdata in mapf:
                 qual = _to_native(np.asarray(mapf[qualdata].data, dtype=np.float32))
-                qual = _pad_spatial(qual)
             else:
                 qual = np.full_like(arr, 1073741824.0)
-            unit = ext.header.get("BUNIT", "")
+            unit = _b2s(ext.header.get("BUNIT", ""))
             base_name = ext.name.lower()
             if arr.ndim == 3:
                 # Multi-channel: emit one map per channel.
@@ -253,27 +219,29 @@ def process_cube(
 
     return {
         "plateifu": plateifu,
+        "spatial_shape_y": int(ny),
+        "spatial_shape_x": int(nx),
         "spaxels": {
-            "flux": flux_2d, "ivar": ivar_2d, "mask": mask_2d,
-            "lsf": lsf_2d, "lambda": lam_2d,
+            "flux": flux, "ivar": ivar, "mask": mask, "lsf": lsf,
+            "lambda": wave,
             "x": x_arr, "y": y_arr, "spaxel_idx": spaxel_idx,
-            "flux_units": [flux_units] * nspaxels,
-            "lambda_units": [lambda_units] * nspaxels,
-            "skycoo_x": skycoo[0].reshape(nspaxels),
-            "skycoo_y": skycoo[1].reshape(nspaxels),
-            "ellcoo_r": ellcoo[0].reshape(nspaxels),
-            "ellcoo_rre": ellcoo[1].reshape(nspaxels),
-            "ellcoo_rkpc": ellcoo[2].reshape(nspaxels),
-            "ellcoo_theta": ellcoo[3].reshape(nspaxels),
-            "skycoo_units": [skycoo_units] * nspaxels,
-            "ellcoo_r_units": [ellcoo_units[0]] * nspaxels,
-            "ellcoo_rre_units": [ellcoo_units[1]] * nspaxels,
-            "ellcoo_rkpc_units": [ellcoo_units[2]] * nspaxels,
-            "ellcoo_theta_units": [ellcoo_units[3]] * nspaxels,
+            "flux_units": flux_units,
+            "lambda_units": lambda_units,
+            "skycoo_x": skycoo[0],
+            "skycoo_y": skycoo[1],
+            "ellcoo_r": ellcoo[0],
+            "ellcoo_rre": ellcoo[1],
+            "ellcoo_rkpc": ellcoo[2],
+            "ellcoo_theta": ellcoo[3],
+            "skycoo_units": skycoo_units,
+            "ellcoo_r_units": ellcoo_units[0],
+            "ellcoo_rre_units": ellcoo_units[1],
+            "ellcoo_rkpc_units": ellcoo_units[2],
+            "ellcoo_theta_units": ellcoo_units[3],
         },
         "images": {
             "filter": list(BANDS),
-            "flux": img_stack,                  # (4, 96, 96)
+            "flux": img_stack,                  # (n_bands, ny, nx)
             "flux_units": ["nanomaggies/pixel"] * N_BANDS,
             "psf": psf_stack,
             "psf_units": ["nanomaggies/pixel"] * N_BANDS,
@@ -284,101 +252,86 @@ def process_cube(
     }
 
 
-def _build_spaxels_struct(records: list[dict]) -> pa.StructArray:
-    """Convert per-row spaxel dicts into a single struct column.
+def _ndarray_to_nested_array(array: np.ndarray, value_type: pa.DataType) -> pa.Array:
+    """Convert one ndarray (any rank) into a nested PyArrow list array.
 
-    The 2D float arrays use the fast ``np_to_pyarrow_list`` path; everything
-    else is built directly with pa.array.
+    The result has ``ndim`` levels of nesting matching the input shape.
+    Used per-row; the caller stitches per-row arrays with ``pa.concat_arrays``.
     """
-    nrows = len(records)
-    spx_list = [r["spaxels"] for r in records]
-    nspax_per_row = [len(s["x"]) for s in spx_list]
+    arr = np.ascontiguousarray(array)
+    values = pa.array(arr.reshape(-1), type=value_type)
+    nested: pa.Array = values
+    for dim in reversed(arr.shape):
+        offsets = np.arange(0, len(nested) + 1, dim, dtype=np.int32)
+        nested = pa.ListArray.from_arrays(offsets, nested)
+    return nested
 
-    def _2d_list_col(name: str, dtype) -> pa.Array:
-        """Build a list<list<dtype>> column where row i is the per-spaxel
-        flux array for object i (shape ``(nspaxels_i, nwave)``)."""
-        # Concatenate all rows' (nspaxels, nwave) → (sum_nspaxels, nwave)
-        # then build the inner list<float32> via offset arithmetic, then
-        # group by row using outer offsets.
-        arrays = [s[name].astype(dtype) for s in spx_list]
-        if not arrays:
-            return pa.array([], type=pa.list_(pa.list_(pa.from_numpy_dtype(dtype))))
-        all_concat = np.concatenate(arrays, axis=0)
-        # inner list (per-spaxel spectrum)
-        inner = np_to_pyarrow_list(all_concat)
-        # outer list: offsets in units of inner-list length
-        outer_offsets = np.zeros(nrows + 1, dtype=np.int32)
-        for i, n in enumerate(nspax_per_row):
-            outer_offsets[i + 1] = outer_offsets[i] + n
-        return pa.ListArray.from_arrays(values=inner, offsets=outer_offsets)
 
-    def _flat_list_col(name: str, dtype, pa_type) -> pa.Array:
-        """Build a list<dtype> column where row i is a flat per-spaxel array."""
-        arrays = [np.asarray(s[name], dtype=dtype) for s in spx_list]
-        offsets = np.zeros(nrows + 1, dtype=np.int32)
-        for i, a in enumerate(arrays):
-            offsets[i + 1] = offsets[i] + len(a)
-        if arrays:
-            values = pa.array(np.concatenate(arrays), type=pa_type)
-        else:
-            values = pa.array([], type=pa_type)
-        return pa.ListArray.from_arrays(values=values, offsets=offsets)
+def _nested_column(arrays: list[np.ndarray], value_type: pa.DataType) -> pa.Array:
+    """Build a column where row i is the nested-list version of ``arrays[i]``.
 
-    def _str_list_col(name: str) -> pa.Array:
-        offsets = np.zeros(nrows + 1, dtype=np.int32)
-        flat: list[str] = []
-        for i, s in enumerate(spx_list):
-            flat.extend(s[name])
-            offsets[i + 1] = offsets[i] + len(s[name])
-        return pa.ListArray.from_arrays(
-            values=pa.array(flat, type=pa.string()),
-            offsets=offsets,
-        )
+    Each row's ndarray can have a different shape — they don't need to share
+    any dimension, since each row is encoded into its own list-of-lists tree
+    and we just concatenate the resulting per-row arrays.
+    """
+    return pa.concat_arrays(
+        [_ndarray_to_nested_array(a, value_type) for a in arrays]
+    )
 
-    fields = {
-        "flux":      _2d_list_col("flux", np.float32),
-        "ivar":      _2d_list_col("ivar", np.float32),
-        "mask":      _2d_list_col("mask", np.int64),
-        "lsf":       _2d_list_col("lsf", np.float32),
-        "lambda":    _2d_list_col("lambda", np.float32),
-        "x":         _flat_list_col("x", np.int8, pa.int8()),
-        "y":         _flat_list_col("y", np.int8, pa.int8()),
-        "spaxel_idx": _flat_list_col("spaxel_idx", np.int16, pa.int16()),
-        "flux_units":   _str_list_col("flux_units"),
-        "lambda_units": _str_list_col("lambda_units"),
-        "skycoo_x":    _flat_list_col("skycoo_x", np.float32, pa.float32()),
-        "skycoo_y":    _flat_list_col("skycoo_y", np.float32, pa.float32()),
-        "ellcoo_r":    _flat_list_col("ellcoo_r", np.float32, pa.float32()),
-        "ellcoo_rre":  _flat_list_col("ellcoo_rre", np.float32, pa.float32()),
-        "ellcoo_rkpc": _flat_list_col("ellcoo_rkpc", np.float32, pa.float32()),
-        "ellcoo_theta": _flat_list_col("ellcoo_theta", np.float32, pa.float32()),
-        "skycoo_units":      _str_list_col("skycoo_units"),
-        "ellcoo_r_units":    _str_list_col("ellcoo_r_units"),
-        "ellcoo_rre_units":  _str_list_col("ellcoo_rre_units"),
-        "ellcoo_rkpc_units": _str_list_col("ellcoo_rkpc_units"),
-        "ellcoo_theta_units": _str_list_col("ellcoo_theta_units"),
-    }
-    return pa.StructArray.from_arrays(list(fields.values()), names=list(fields.keys()))
+
+def _build_spaxels_struct(records: list[dict]) -> pa.StructArray:
+    """Build the spaxels struct column at native (ny, nx) shape per row.
+
+    Float/int cube fields become ``list<list<list<...>>>`` (ny, nx, nwave) or
+    ``list<list<...>>`` (ny, nx); ``lambda`` is shared per row as ``list<f32>``;
+    unit fields are scalar strings (one value per row, not one per spaxel).
+    """
+    spx = [r["spaxels"] for r in records]
+    return pa.StructArray.from_arrays(
+        [
+            _nested_column([s["flux"]   for s in spx], pa.float32()),  # (ny,nx,nwave)
+            _nested_column([s["ivar"]   for s in spx], pa.float32()),
+            _nested_column([s["mask"]   for s in spx], pa.int64()),
+            _nested_column([s["lsf"]    for s in spx], pa.float32()),
+            _nested_column([s["lambda"] for s in spx], pa.float32()),  # (nwave,)
+            _nested_column([s["x"]            for s in spx], pa.int8()),    # (ny,nx)
+            _nested_column([s["y"]            for s in spx], pa.int8()),
+            _nested_column([s["spaxel_idx"]   for s in spx], pa.int16()),
+            pa.array([s["flux_units"]    for s in spx], type=pa.string()),
+            pa.array([s["lambda_units"]  for s in spx], type=pa.string()),
+            _nested_column([s["skycoo_x"]    for s in spx], pa.float32()),
+            _nested_column([s["skycoo_y"]    for s in spx], pa.float32()),
+            _nested_column([s["ellcoo_r"]    for s in spx], pa.float32()),
+            _nested_column([s["ellcoo_rre"]  for s in spx], pa.float32()),
+            _nested_column([s["ellcoo_rkpc"] for s in spx], pa.float32()),
+            _nested_column([s["ellcoo_theta"] for s in spx], pa.float32()),
+            pa.array([s["skycoo_units"]       for s in spx], type=pa.string()),
+            pa.array([s["ellcoo_r_units"]     for s in spx], type=pa.string()),
+            pa.array([s["ellcoo_rre_units"]   for s in spx], type=pa.string()),
+            pa.array([s["ellcoo_rkpc_units"]  for s in spx], type=pa.string()),
+            pa.array([s["ellcoo_theta_units"] for s in spx], type=pa.string()),
+        ],
+        names=[
+            "flux", "ivar", "mask", "lsf", "lambda",
+            "x", "y", "spaxel_idx",
+            "flux_units", "lambda_units",
+            "skycoo_x", "skycoo_y",
+            "ellcoo_r", "ellcoo_rre", "ellcoo_rkpc", "ellcoo_theta",
+            "skycoo_units",
+            "ellcoo_r_units", "ellcoo_rre_units",
+            "ellcoo_rkpc_units", "ellcoo_theta_units",
+        ],
+    )
 
 
 def _build_images_struct(records: list[dict]) -> pa.StructArray:
-    n = len(records)
-    bands = pa.array([r["images"]["filter"] for r in records], type=pa.list_(pa.string()))
-
-    def _img_col(key: str) -> pa.Array:
-        # records[i]["images"][key] has shape (4, 96, 96).
-        nested = [
-            [[list(row) for row in band] for band in r["images"][key]]
-            for r in records
-        ]
-        return pa.array(nested, type=pa.list_(pa.list_(pa.list_(pa.float32()))))
-
+    """Images struct at native (n_bands, ny, nx) shape per row."""
     return pa.StructArray.from_arrays(
         [
-            bands,
-            _img_col("flux"),
+            pa.array([r["images"]["filter"] for r in records], type=pa.list_(pa.string())),
+            _nested_column([r["images"]["flux"] for r in records], pa.float32()),
             pa.array([r["images"]["flux_units"] for r in records], type=pa.list_(pa.string())),
-            _img_col("psf"),
+            _nested_column([r["images"]["psf"] for r in records], pa.float32()),
             pa.array([r["images"]["psf_units"] for r in records], type=pa.list_(pa.string())),
             pa.array([r["images"]["scale"] for r in records], type=pa.list_(pa.float32())),
             pa.array([r["images"]["scale_units"] for r in records], type=pa.list_(pa.string())),
@@ -387,38 +340,36 @@ def _build_images_struct(records: list[dict]) -> pa.StructArray:
     )
 
 
-def _build_maps_struct(records: list[dict]) -> pa.StructArray:
-    n = len(records)
-    groups = []
-    labels = []
-    flux_per_row = []
-    ivar_per_row = []
-    mask_per_row = []
-    units = []
-    for r in records:
-        gs, ls, fl, iv, mk, un = [], [], [], [], [], []
-        for m in r["maps"]:
-            gs.append(m["group"])
-            ls.append(m["label"])
-            fl.append([list(row) for row in m["flux"]])
-            iv.append([list(row) for row in m["ivar"]])
-            mk.append([list(row) for row in m["mask"]])
-            un.append(m["array_units"])
-        groups.append(gs)
-        labels.append(ls)
-        flux_per_row.append(fl)
-        ivar_per_row.append(iv)
-        mask_per_row.append(mk)
-        units.append(un)
+def _maps_cube(record: dict, key: str, dtype) -> np.ndarray:
+    """Stack a row's per-map 2D arrays into a single (n_maps, ny, nx) ndarray
+    so it serializes as a single nested list-of-list-of-list field."""
+    maps = record["maps"]
+    if not maps:
+        return np.zeros(
+            (0, record["spatial_shape_y"], record["spatial_shape_x"]),
+            dtype=dtype,
+        )
+    return np.stack([np.asarray(m[key], dtype=dtype) for m in maps], axis=0)
 
+
+def _build_maps_struct(records: list[dict]) -> pa.StructArray:
     return pa.StructArray.from_arrays(
         [
-            pa.array(groups, type=pa.list_(pa.string())),
-            pa.array(labels, type=pa.list_(pa.string())),
-            pa.array(flux_per_row, type=pa.list_(pa.list_(pa.list_(pa.float32())))),
-            pa.array(ivar_per_row, type=pa.list_(pa.list_(pa.list_(pa.float32())))),
-            pa.array(mask_per_row, type=pa.list_(pa.list_(pa.list_(pa.float32())))),
-            pa.array(units, type=pa.list_(pa.string())),
+            pa.array(
+                [[m["group"] for m in r["maps"]] for r in records],
+                type=pa.list_(pa.string()),
+            ),
+            pa.array(
+                [[m["label"] for m in r["maps"]] for r in records],
+                type=pa.list_(pa.string()),
+            ),
+            _nested_column([_maps_cube(r, "flux", np.float32) for r in records], pa.float32()),
+            _nested_column([_maps_cube(r, "ivar", np.float32) for r in records], pa.float32()),
+            _nested_column([_maps_cube(r, "mask", np.float32) for r in records], pa.float32()),
+            pa.array(
+                [[m["array_units"] for m in r["maps"]] for r in records],
+                type=pa.list_(pa.string()),
+            ),
         ],
         names=["group", "label", "flux", "ivar", "mask", "array_units"],
     )
@@ -426,8 +377,7 @@ def _build_maps_struct(records: list[dict]) -> pa.StructArray:
 
 def build_table(records: list[dict], catalog: Table) -> pa.Table:
     """Stitch the per-cube records back to the joined catalog and build the
-    PyArrow table."""
-    # Build a plateifu → catalog row map for the surviving plate-ifus.
+    PyArrow table at native shape."""
     cat_lookup = {}
     plateifu_col = np.array([_b2s(p) for p in catalog["plateifu"]])
     for i, p in enumerate(plateifu_col):
@@ -461,6 +411,12 @@ def build_table(records: list[dict], catalog: Table) -> pa.Table:
         ),
         "spaxel_size_units": pa.array(
             ["arcsec"] * len(keep_records), type=pa.string()
+        ),
+        "spatial_shape_y": pa.array(
+            [r["spatial_shape_y"] for r in keep_records], type=pa.int16(),
+        ),
+        "spatial_shape_x": pa.array(
+            [r["spatial_shape_x"] for r in keep_records], type=pa.int16(),
         ),
         "spaxels": _build_spaxels_struct(keep_records),
         "images":  _build_images_struct(keep_records),
