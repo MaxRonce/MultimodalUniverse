@@ -83,6 +83,7 @@ PORTED = [
     "gaia_xp",   # raw Gaia DR3, GaiaSource ∩ XpContinuousMeanSpectrum (~220M)
     "legacysurvey",  # raw DECaLS DR10 south sweeps + brick coadds (image cutouts + nearby catalog)
     "manga",     # raw SDSS-IV MaNGA IFU LOGCUBE + DAP MAPS files (spaxels + griz images + analysis maps)
+    "hsc",         # HSC SSP PDR3 Deep/UltraDeep, 5-band 160×160 cutouts + 65 scalars
     "foundation",  # Foundation DR1 SNe Ia (SNANA ASCII lightcurves, ~180 SNe)
     "snls",        # JLA2014 SNLS SNe Ia (~239 SNe, shared mmu.sn_ia_snana helper)
     "ps1_sne_ia",  # Pan-STARRS1 SNe Ia (~369 SNe)
@@ -255,6 +256,20 @@ SHARDED_DATASETS = {
         # at the default 5 GB per-worker limit OOM-thrash in the splitting
         # stage — the first manga gather attempt crawled to 2% in 1h43m
         # with constant worker restarts. 8 workers × ~100 GB each fits.
+        ingest_workers=8,
+    ),
+    # hsc = HSC SSP PDR3 Deep/UltraDeep, 477k objects across ~600 (tract,
+    # patch) groups. Each pool worker opens 5 calexp FITS HDUs (~150 MB
+    # combined per band) for one patch and cuts out 160×160 stamps. With
+    # 32 workers per shard the per-worker peak is ~5 GB. 8 shards × 75
+    # patches each.
+    "hsc": dict(
+        num_shards=8,
+        num_processes=32,
+        build_mem_mb=400_000,
+        build_runtime_min=240,
+        ingest_mem_mb=400_000,
+        ingest_runtime_min=180,
         ingest_workers=8,
     ),
     # ssl_legacysurvey = Stein-et-al DECaLS image chunks. Each h5 chunk is
