@@ -666,30 +666,39 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
         ])
         unique_bricks = np.unique(brickname_col)
         sweep_records: list[dict] = []
+        brick_errors: list[str] = []
         for brick in unique_bricks:
             brick_cat = cat[brickname_col == brick]
             try:
                 recs = process_brick(brick_cat, raw_root)
             except BaseException as exc:  # noqa: BLE001
                 # Any per-brick failure (corrupted FITS, missing image file,
-                # cfitsio error, numpy weirdness) should skip the brick not
-                # kill the whole sweep.
-                return (
-                    basename, len(cat), 0,
-                    f"brick {brick}: {type(exc).__name__}: {exc}",
-                )
+                # cfitsio error, numpy weirdness) should skip THIS brick and
+                # keep processing the rest of the sweep. The earlier version
+                # returned on the first failure, which dropped every good
+                # brick in the sweep along with the bad one.
+                brick_errors.append(f"{brick}: {type(exc).__name__}: {exc}")
+                continue
             if recs:
                 sweep_records.extend(recs)
 
+        # Summarize per-brick errors in the return err field (as a warning,
+        # not a fatal) so the main-process logger can print them without
+        # losing the sweep's successfully-processed bricks.
+        err_summary = (
+            f"{len(brick_errors)} brick error(s): " + "; ".join(brick_errors[:3])
+            + (" ..." if len(brick_errors) > 3 else "")
+        ) if brick_errors else None
+
         if not sweep_records:
-            return basename, len(cat), 0, None
+            return basename, len(cat), 0, err_summary
 
         table = build_table(sweep_records)
         pq.write_table(table, out_path)
         n_cutouts = table.num_rows
         n_cat = len(cat)
         del sweep_records, table, cat
-        return basename, n_cat, n_cutouts, None
+        return basename, n_cat, n_cutouts, err_summary
     except BaseException as exc:  # noqa: BLE001
         return basename, 0, 0, f"{type(exc).__name__}: {exc}"
 
@@ -794,9 +803,18 @@ def main(argv: list[str] | None = None) -> int:
 
             def _report(i: int, result: tuple) -> None:
                 basename, n_cat, n_cut, err = result
-                if err:
+                # `err` is now a WARNING summary if the sweep had some bad
+                # bricks but also some good ones (n_cut > 0). The sweep is
+                # NOT skipped in that case; we still write its good-brick
+                # parquet. Only skip logging when n_cut == 0 AND err is set.
+                if err and n_cut == 0:
                     print(f"[shard {args.shard_idx}] [{i}/{n_total}] {basename}: "
                           f"SKIPPED {err}", file=sys.stderr, flush=True)
+                    return
+                if err:
+                    print(f"[shard {args.shard_idx}] [{i}/{n_total}] {basename}: "
+                          f"{n_cat} cat rows → {n_cut} cutouts (WARN: {err})",
+                          file=sys.stderr, flush=True)
                     return
                 if n_cut == 0:
                     # Quiet: many DR10 sweeps are full rejects (no i-band).
