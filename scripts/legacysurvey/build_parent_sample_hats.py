@@ -682,9 +682,11 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
             if recs:
                 sweep_records.extend(recs)
             if (bi + 1) % 50 == 0 or bi == n_bricks - 1:
-                print(f"  {basename}: brick {bi+1}/{n_bricks}, "
-                      f"{len(sweep_records)} cutouts so far",
-                      flush=True)
+                sys.stderr.write(
+                    f"  {basename}: brick {bi+1}/{n_bricks}, "
+                    f"{len(sweep_records)} cutouts so far\n"
+                )
+                sys.stderr.flush()
             del recs
 
         del cat, brickname_col, unique_bricks
