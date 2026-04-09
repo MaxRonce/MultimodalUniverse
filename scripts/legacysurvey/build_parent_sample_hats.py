@@ -669,7 +669,8 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
         brick_errors: list[str] = []
         n_cat = len(cat)
 
-        for brick in unique_bricks:
+        n_bricks = len(unique_bricks)
+        for bi, brick in enumerate(unique_bricks):
             brick_cat = cat[brickname_col == brick]
             try:
                 recs = process_brick(brick_cat, raw_root)
@@ -680,6 +681,10 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
                 continue
             if recs:
                 sweep_records.extend(recs)
+            if (bi + 1) % 50 == 0 or bi == n_bricks - 1:
+                print(f"  {basename}: brick {bi+1}/{n_bricks}, "
+                      f"{len(sweep_records)} cutouts so far",
+                      flush=True)
             del recs
 
         del cat, brickname_col, unique_bricks
