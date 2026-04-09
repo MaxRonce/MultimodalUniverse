@@ -42,8 +42,8 @@ DATASETS: dict[str, DatasetConfig] = {
     "sdss":         DatasetConfig("sdss", "spectra", "SDSS"),
     "desi":         DatasetConfig("desi", "spectra", "DESI_DR1"),
     "vipers":       DatasetConfig("vipers", "spectra", "VIPERS"),
-    "galah":        DatasetConfig("galah", "spectra", "galah"),
-    "apogee":       DatasetConfig("apogee", "spectra", "APOGEE/apogee"),
+    "galah":        DatasetConfig("galah", "spectra", "galah/dr3"),
+    "apogee":       DatasetConfig("apogee", "spectra", "APOGEE/apogee_v2"),
     "chandra":      DatasetConfig("chandra", "spectra", "chandra"),
     # gaia = full Gaia DR3 source catalog, ~1.8B rows, no XP filter.
     # gaia_xp = the ~220M subset joined with XpContinuousMeanSpectrum
