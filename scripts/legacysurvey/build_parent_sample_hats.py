@@ -672,6 +672,8 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
             brick_cat = cat[brickname_col == brick]
             try:
                 recs = process_brick(brick_cat, raw_root)
+            except (KeyboardInterrupt, SystemExit):
+                raise
             except BaseException as exc:  # noqa: BLE001
                 brick_errors.append(f"{brick}: {type(exc).__name__}: {exc}")
                 continue
@@ -690,10 +692,17 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
             return basename, n_cat, 0, err_summary
 
         table = build_table(sweep_records)
-        pq.write_table(table, out_path)
+        del sweep_records
+        # Atomic write: write to .tmp then rename so a crash mid-write
+        # doesn't leave a corrupt parquet that skip-if-exists treats as done.
+        tmp_path = out_path + ".tmp"
+        pq.write_table(table, tmp_path)
+        os.rename(tmp_path, out_path)
         n_cutouts = table.num_rows
-        del sweep_records, table
+        del table
         return basename, n_cat, n_cutouts, err_summary
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except BaseException as exc:  # noqa: BLE001
         return basename, 0, 0, f"{type(exc).__name__}: {exc}"
 
@@ -707,10 +716,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-files", type=int, default=None,
                         help="Cap on number of sweep files to process.")
     parser.add_argument("--pixel-threshold", type=int, default=8192)
-    parser.add_argument("--num-processes", type=int, default=8,
+    parser.add_argument("--num-processes", type=int, default=4,
                         help="Pool size for parallel sweep processing. Each worker "
-                             "holds one sweep's cutouts (~80 GB peak). Default 8 "
-                             "keeps total RSS under ~640 GB on a 900 GB node.")
+                             "peaks at ~240 GB during build_table (3x copy). Default 4 "
+                             "keeps total RSS under ~960 GB nominal on a 900 GB node.")
     parser.add_argument("--scratch-dir", default=None,
                         help="Shared ceph scratch directory for per-sweep parquet "
                              "shards. REQUIRED when running sharded — all shard "
