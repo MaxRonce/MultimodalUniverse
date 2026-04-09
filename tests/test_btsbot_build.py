@@ -122,7 +122,7 @@ class TestReadSplit:
         table = build.read_split(fake_raw_root, 0)
         img_type = table.schema.field("image").type
         fields = {f.name: f.type for f in img_type}
-        assert fields["array"] == pa.list_(pa.list_(pa.list_(pa.float32())))
+        assert fields["array"] == pa.large_list(pa.large_list(pa.large_list(pa.float32())))
 
     def test_image_band_is_single_entry(self, fake_raw_root):
         """Each ZTF alert has a single band (g or r) in the band list."""

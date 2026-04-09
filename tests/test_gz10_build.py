@@ -96,7 +96,7 @@ class TestReadTable:
         table = build.read_table(fake_gz10)
         img_type = table.schema.field("image").type
         fields = {f.name: f.type for f in img_type}
-        assert fields["array"] == pa.list_(pa.list_(pa.list_(pa.uint8())))
+        assert fields["array"] == pa.large_list(pa.large_list(pa.large_list(pa.uint8())))
 
     def test_image_scale_type(self, fake_gz10):
         table = build.read_table(fake_gz10)

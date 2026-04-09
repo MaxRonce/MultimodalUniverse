@@ -73,10 +73,13 @@ validate_hats_root(HATS_ROOT)
 PORTED = [
     "sdss",      # raw FITS plate files
     "allwise",   # raw IRSA parquet, healpix-prefiltered for cone cuts
+    "btsbot",    # raw ZTF triplets + alert metadata
+    "desi_provabgs",  # raw PROVABGS VAC HDF5
     "twomass",   # raw IRSA gzipped CSV
     "sages",     # single FITS table (DR1 u/v photometry)
     "galex",     # multi-FITS GUVCat shards (latitude-partitioned)
     "desi",      # raw DESI coadd FITS files, merged via desispec.coadd_cameras
+    "gz10",      # raw Galaxy10 DECals HDF5
     "tess",      # raw TESS-SPOC FFI lightcurves (one file per TIC, sector)
     "ssl_legacysurvey",  # raw Stein-et-al DECaLS image chunks (h5 per 1M objects)
     "gaia",      # raw Gaia DR3 GaiaSource, full ~1.8B source catalog
@@ -478,6 +481,57 @@ rule build_galex:
         "{params.cmd}"
 
 
+rule build_gz10:
+    output:
+        marker = catalog_marker("gz10"),
+    input:
+        script = build_script("gz10"),
+    params:
+        cmd = build_command("gz10"),
+    resources:
+        mem_mb = 250_000,
+        runtime = 480,
+        cpus_per_task = 96,
+        slurm_partition = SLURM_PARTITION,
+    shell:
+        "{params.cmd}"
+
+
+rule build_btsbot:
+    output:
+        marker = catalog_marker("btsbot"),
+    input:
+        script = build_script("btsbot"),
+    params:
+        cmd = build_command("btsbot"),
+    resources:
+        mem_mb = 250_000,
+        runtime = 480,
+        cpus_per_task = 96,
+        slurm_partition = SLURM_PARTITION,
+    shell:
+        "{params.cmd}"
+
+
+rule build_desi_provabgs:
+    output:
+        marker = catalog_marker("desi_provabgs"),
+    input:
+        script = build_script("desi_provabgs"),
+    params:
+        # Cluster currently lacks the provabgs runtime dependency, so the
+        # production path skips the optional best-fit augmentation until that
+        # environment is restored.
+        cmd = build_command("desi_provabgs") + " --skip-best-fit",
+    resources:
+        mem_mb = 250_000,
+        runtime = 480,
+        cpus_per_task = 96,
+        slurm_partition = SLURM_PARTITION,
+    shell:
+        "{params.cmd}"
+
+
 rule build_tess:
     output:
         marker = catalog_marker("tess"),
@@ -576,5 +630,4 @@ rule build_swift_sne_ia:
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
-
 
