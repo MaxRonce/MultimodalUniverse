@@ -279,6 +279,8 @@ def _process_object(row: dict) -> dict | None:
     for out_name, src_name in VAC_KEY_MAP.items():
         record[out_name] = np.float32(row["vac"][src_name])
     for out_name, src_name in CATALOG_KEY_MAP.items():
+        if out_name == "timestamp":
+            continue
         value = row["catalog"][src_name]
         if out_name in _INT_FEATURES:
             record[out_name] = np.int32(value)
