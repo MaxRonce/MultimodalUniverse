@@ -42,11 +42,13 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import shutil
 import sys
 
 import h5py
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 def _as_array(arr):
@@ -55,7 +57,10 @@ def _as_array(arr):
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import write_hats
+from mmu.hats_import import (
+    default_scratch_dir,
+    write_hats_from_parquet_dir,
+)
 
 
 CATALOG_NAME = "jwst"
@@ -180,6 +185,11 @@ def main(argv: list[str] | None = None) -> int:
         default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME),
     )
     parser.add_argument(
+        "--scratch-dir",
+        default=None,
+        help="Directory for per-file parquet shards before HATS ingest.",
+    )
+    parser.add_argument(
         "--max-files",
         type=int,
         default=None,
@@ -200,29 +210,36 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"Found {len(files)} JWST HDF5 file(s)", flush=True)
 
-    tables = []
-    for path in files:
-        t = read_hdf5(
+    scratch_dir = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
+    os.makedirs(scratch_dir, exist_ok=True)
+
+    n_written = 0
+    for idx, path in enumerate(files):
+        table = read_hdf5(
             path,
             ra_center=args.ra_center,
             dec_center=args.dec_center,
             radius=args.radius,
         )
-        if t is not None and t.num_rows > 0:
-            tables.append(t)
-            print(f"  {os.path.basename(path)}: {t.num_rows} rows", flush=True)
+        if table is None or table.num_rows == 0:
+            continue
+        shard_path = os.path.join(scratch_dir, f"part-{idx:04d}.parquet")
+        pq.write_table(table, shard_path)
+        n_written += 1
+        print(f"  {os.path.basename(path)}: {table.num_rows} rows", flush=True)
 
-    if not tables:
+    if n_written == 0:
         print("No rows after filtering; nothing to write.", file=sys.stderr)
         return 1
 
-    catalog_dir = write_hats(
-        tables,
+    catalog_dir = write_hats_from_parquet_dir(
+        scratch_dir,
         output_path=args.output_root,
         catalog_name=CATALOG_NAME,
         pixel_threshold=args.pixel_threshold,
         debug=True,
     )
+    shutil.rmtree(scratch_dir, ignore_errors=True)
     print(f"Done: {catalog_dir}", flush=True)
     return 0
 
