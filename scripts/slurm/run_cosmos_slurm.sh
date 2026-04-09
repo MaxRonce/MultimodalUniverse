@@ -47,10 +47,8 @@ LOG=/tmp/cosmos_slurm.log
     uv run snakemake \
         --executor slurm \
         --jobs 10 \
-        --workflow-profile=none \
         --config profile=cosmos \
         --keep-going \
-        --rerun-triggers mtime \
         -- $RULES
     echo "DONE_EXIT_$?"
     echo "=== cosmos validation complete $(date) ==="

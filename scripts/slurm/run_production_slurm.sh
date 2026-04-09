@@ -57,10 +57,8 @@ LOG=/tmp/production_slurm.log
     uv run snakemake \
         --executor slurm \
         --jobs 20 \
-        --workflow-profile=none \
         --config profile=cluster \
         --keep-going \
-        --rerun-triggers mtime \
         -- $RULES
     echo "DONE_EXIT_$?"
     echo "=== production complete $(date) ==="
