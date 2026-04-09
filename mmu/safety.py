@@ -46,22 +46,47 @@ class UnsafeOutputPathError(ValueError):
     """
 
 
+def _path_components(path: str) -> list[str]:
+    """Split a normalized absolute path into its component segments.
+
+    Strips leading/trailing empty strings from an absolute path so that
+    ``/a/b/c`` yields ``["a", "b", "c"]`` rather than ``["", "a", "b", "c"]``.
+    """
+    return [p for p in path.split(os.sep) if p]
+
+
+def _is_under(path: str, prefix: str) -> bool:
+    """True if ``path`` is ``prefix`` or lives beneath it, using path-segment
+    comparison rather than string prefix matching.
+
+    This catches the substring false-positive: ``/a/b_extra`` is NOT under
+    ``/a/b`` even though ``"/a/b_extra".startswith("/a/b")`` is True.
+    """
+    path_parts = _path_components(os.path.normpath(path))
+    prefix_parts = _path_components(os.path.normpath(prefix))
+    return (
+        len(path_parts) >= len(prefix_parts)
+        and path_parts[: len(prefix_parts)] == prefix_parts
+    )
+
+
 def validate_hats_root(hats_root: str) -> None:
     """Raise ``UnsafeOutputPathError`` if ``hats_root`` is not safe to write into.
 
     Rules:
 
     1. ``hats_root`` must be a non-empty string.
-    2. If ``hats_root`` starts with ``/mnt/ceph/users/polymathic/`` it must
-       also match one of :data:`ALLOWED_HATS_ROOT_PREFIXES`.
-    3. ``hats_root`` must not contain any substring in :data:`FORBIDDEN_SUBSTRINGS`
-       anywhere in the path (belt-and-suspenders check against
-       ``external_data/`` etc.).
-    4. Paths outside ``/mnt/ceph/users/polymathic/`` are allowed without
+    2. Symlinks along ``hats_root`` are resolved via ``os.path.realpath`` so
+       a symlink pointing at ``external_data/`` can't bypass the check.
+    3. If the resolved path starts with ``/mnt/ceph/users/polymathic/`` it must
+       also match one of :data:`ALLOWED_HATS_ROOT_PREFIXES`. Matching is done
+       by path-segment comparison so ``/mmu_v2_hats_extra`` does NOT match
+       ``/mmu_v2_hats`` (no substring false positives).
+    4. The resolved path must not have any component equal to a
+       :data:`FORBIDDEN_SUBSTRINGS` entry (e.g. an ``external_data`` segment
+       anywhere in the path).
+    5. Paths outside ``/mnt/ceph/users/polymathic/`` are allowed without
        further checks (user home dirs, local scratch, test fixtures, etc.).
-
-    This function is a pure string check with no filesystem side effects, so
-    it's safe to call from test code and from Snakefile parse time.
     """
     if not hats_root or not isinstance(hats_root, str):
         raise UnsafeOutputPathError(
@@ -69,30 +94,40 @@ def validate_hats_root(hats_root: str) -> None:
             "Refusing to run without a known-good output directory."
         )
 
-    normalized = os.path.normpath(hats_root).rstrip("/")
+    # Resolve symlinks against the real filesystem. For paths that don't yet
+    # exist on disk (e.g. a brand-new output dir), realpath still resolves
+    # any existing parent components and leaves the leaf alone — good enough
+    # to catch the symlink-to-external_data attack.
+    resolved = os.path.realpath(os.path.normpath(hats_root)).rstrip("/")
+    components = _path_components(resolved)
 
-    # Rule 3: forbidden substrings, checked against BOTH the raw and normalized
-    # paths so we catch things like ``/foo/../polymathic/external_data`` too.
+    # Rule 4: forbidden substrings as path COMPONENTS (not substrings).
+    # Also check the raw input so ``/foo/../polymathic/external_data`` is caught
+    # even if realpath doesn't fully resolve it.
     for forbidden in FORBIDDEN_SUBSTRINGS:
-        if forbidden in normalized or forbidden in hats_root:
+        if forbidden in components or forbidden in _path_components(
+            os.path.normpath(hats_root)
+        ):
             raise UnsafeOutputPathError(
-                f"Refusing to use hats_root={hats_root!r}: path contains "
-                f"{forbidden!r}, which is on the forbidden substring list. "
+                f"Refusing to use hats_root={hats_root!r} "
+                f"(resolved to {resolved!r}): path has a {forbidden!r} "
+                "component, which is on the forbidden list. "
                 "This check exists specifically to prevent overwriting the "
                 "read-only raw data mirror at "
                 f"{POLYMATHIC_ROOT}/external_data/."
             )
 
-    # Rule 2: anything under POLYMATHIC_ROOT must match an allowed prefix.
-    if normalized == POLYMATHIC_ROOT or normalized.startswith(POLYMATHIC_ROOT + "/"):
+    # Rule 3: anything under POLYMATHIC_ROOT must match an allowed prefix
+    # by path-segment comparison (not string startswith).
+    if _is_under(resolved, POLYMATHIC_ROOT):
         is_allowed = any(
-            normalized == prefix or normalized.startswith(prefix + "/")
-            for prefix in ALLOWED_HATS_ROOT_PREFIXES
+            _is_under(resolved, prefix) for prefix in ALLOWED_HATS_ROOT_PREFIXES
         )
         if not is_allowed:
             allowed = "\n  - ".join(ALLOWED_HATS_ROOT_PREFIXES)
             raise UnsafeOutputPathError(
-                f"Refusing to use hats_root={hats_root!r}. "
+                f"Refusing to use hats_root={hats_root!r} "
+                f"(resolved to {resolved!r}). "
                 f"Writes under {POLYMATHIC_ROOT}/ are only allowed under:\n"
                 f"  - {allowed}\n"
                 f"If you really want to write somewhere else on this mount, "
