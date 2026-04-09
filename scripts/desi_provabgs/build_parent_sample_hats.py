@@ -31,6 +31,11 @@ import sys
 
 import numpy as np
 import pyarrow as pa
+
+
+def _as_array(arr):
+    return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+
 from astropy.table import Table
 from tqdm import tqdm
 

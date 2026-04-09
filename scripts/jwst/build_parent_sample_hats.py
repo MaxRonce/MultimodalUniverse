@@ -48,6 +48,11 @@ import h5py
 import numpy as np
 import pyarrow as pa
 
+
+def _as_array(arr):
+    return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+
+
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import write_hats
@@ -147,7 +152,7 @@ def read_hdf5(
     )
 
     image_col = pa.StructArray.from_arrays(
-        [band_arr, flux_arr, ivar_arr, mask_arr, psf_fwhm_arr, scale_arr],
+            [_as_array(a) for a in [band_arr, flux_arr, ivar_arr, mask_arr, psf_fwhm_arr, scale_arr]],
         names=["band", "flux", "ivar", "mask", "psf_fwhm", "scale"],
     )
 

@@ -34,6 +34,11 @@ from multiprocessing import Pool
 
 import numpy as np
 import pyarrow as pa
+
+
+def _as_array(arr):
+    return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+
 from astropy.io import fits
 from tqdm import tqdm
 
@@ -109,12 +114,12 @@ def build_arrow_table(records: list[dict]) -> pa.Table:
     mask_arrays = [r["spectrum_mask"] for r in records]
 
     spectrum = pa.StructArray.from_arrays(
-        [
+            [_as_array(a) for a in [
             pa.array(flux_arrays, type=pa.list_(pa.float32())),
             pa.array(wave_arrays, type=pa.list_(pa.float32())),
             pa.array(noise_arrays, type=pa.list_(pa.float32())),
             pa.array(mask_arrays, type=pa.list_(pa.float32())),
-        ],
+        ]],
         names=["flux", "wave", "noise", "mask"],
     )
 

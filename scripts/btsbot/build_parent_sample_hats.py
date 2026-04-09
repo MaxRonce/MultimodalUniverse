@@ -44,6 +44,11 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 
+
+def _as_array(arr):
+    return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+
+
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 from mmu.hats_import import write_hats
@@ -147,7 +152,7 @@ def read_split(
     array_arr = pa.array(array_nested, type=pa.list_(pa.list_(pa.list_(pa.float32()))))
     scale_arr = pa.array([[PIXEL_SCALE] * 3] * n_rows, type=pa.list_(pa.float32()))
     image_col = pa.StructArray.from_arrays(
-        [band_arr, view_arr, array_arr, scale_arr],
+            [_as_array(a) for a in [band_arr, view_arr, array_arr, scale_arr]],
         names=["band", "view", "array", "scale"],
     )
 
