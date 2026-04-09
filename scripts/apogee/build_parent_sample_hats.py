@@ -97,6 +97,14 @@ def _default_cache_root() -> str:
     return os.path.expanduser("~/Library/Caches/mmu_apogee_raw")
 
 
+def _is_readable_fits_table(path: str) -> bool:
+    try:
+        Table.read(path, hdu=1)
+        return True
+    except Exception:
+        return False
+
+
 def _visit_path(raw_root: str, field: str, telescope: str, filename: str) -> str:
     return os.path.join(
         raw_root,
@@ -140,11 +148,13 @@ def _download_file(url: str, local_path: str) -> str:
 
 def ensure_catalog_path(raw_root: str, cache_root: str) -> str:
     path = _catalog_path(raw_root)
-    if os.path.exists(path):
+    if os.path.exists(path) and _is_readable_fits_table(path):
         return path
     filename = "allStar-dr17-synspec_rev1.fits"
     url = f"https://data.sdss.org/sas/dr17/apogee/spectro/aspcap/dr17/synspec_rev1/{filename}"
     cache_path = os.path.join(cache_root, "spectro", "aspcap", "dr17", "synspec_rev1", filename)
+    if os.path.exists(cache_path) and not _is_readable_fits_table(cache_path):
+        os.remove(cache_path)
     return _download_file(url, cache_path)
 
 

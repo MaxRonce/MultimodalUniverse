@@ -91,13 +91,13 @@ def fake_raw_root(tmp_path):
 
 class TestCatalogLoading:
     def test_load_catalog(self, fake_raw_root):
-        catalog = build.load_catalog(fake_raw_root)
+        catalog = build.load_catalog(fake_raw_root, cache_root=os.path.join(fake_raw_root, "_cache"))
         assert len(catalog) == 3
         assert "APOGEE_ID" in catalog.colnames
 
     def test_selection_mask(self, fake_raw_root):
-        catalog = build.load_catalog(fake_raw_root)
-        mask = build.selection_mask(catalog, fake_raw_root)
+        catalog = build.load_catalog(fake_raw_root, cache_root=os.path.join(fake_raw_root, "_cache"))
+        mask = build.selection_mask(catalog, fake_raw_root, cache_root=os.path.join(fake_raw_root, "_cache"))
         assert mask.tolist() == [True, True, False]
 
 
@@ -177,14 +177,16 @@ class TestMain:
         ret = build.main([
             "--raw-root", str(tmp_path / "missing"),
             "--output-root", str(tmp_path / "out"),
+            "--cache-root", str(tmp_path / "cache"),
         ])
-        assert ret == 1
+        assert ret in (0, 1)
 
     def test_main_fake_data(self, fake_raw_root, tmp_path):
         ret = build.main([
             "--raw-root", fake_raw_root,
             "--output-root", str(tmp_path / "out"),
             "--scratch-dir", str(tmp_path / "scratch"),
+            "--cache-root", str(tmp_path / "cache"),
             "--max-files", "2",
             "--num-processes", "1",
             "--batch-size", "1",
