@@ -641,12 +641,8 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
     """
     sweep_path, raw_root, scratch, ra_center, dec_center, radius = args
     basename = os.path.basename(sweep_path)
-    # Skip sweeps fully completed on a previous run. We mark completion with
-    # an empty `.part-<basename>.done` sentinel so we can also handle the
-    # multi-parquet case below (one parquet per brick batch). The sentinel
-    # is what the gather job filters on to know a sweep is fully ingestible.
-    done_marker = os.path.join(scratch, f".part-{basename}.done")
-    if os.path.exists(done_marker):
+    out_path = os.path.join(scratch, f"part-{basename}.parquet")
+    if os.path.exists(out_path):
         return basename, 0, 0, None
     try:
         cat = read_sweep(
@@ -656,8 +652,6 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
             radius=radius,
         )
         if cat is None:
-            # Even an empty / no-i-band sweep is "done" — no need to retry it.
-            open(done_marker, "w").close()
             return basename, 0, 0, None
 
         brickname_col = np.array([
@@ -665,65 +659,41 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
             for s in cat["BRICKNAME"]
         ])
         unique_bricks = np.unique(brickname_col)
+        # One parquet per sweep (not per-256-cutouts). With Pool(8), peak
+        # memory is ~8 sweeps × 80 GB/sweep ≈ 640 GB, well within the
+        # 900 GB slurm allocation. This produces ~1436 parquet files for
+        # the full survey instead of the 231k files the per-256 approach
+        # generated (ceph hates small files).
+        sweep_records: list[dict] = []
         brick_errors: list[str] = []
-        n_cutouts_total = 0
         n_cat = len(cat)
-
-        # Stream per-brick batches to parquet. The previous version
-        # accumulated `sweep_records` for the WHOLE sweep (potentially
-        # ~70 GB per worker for big sweeps) before a single write_table —
-        # which OOMed the 96-process Pool at ~940 GB MaxRSS. Flushing every
-        # FLUSH_EVERY_N_CUTOUTS bricks keeps per-worker peak well below
-        # 1 GB for the cutout buffer, so 96 workers stay under ~100 GB
-        # combined for cutout state.
-        FLUSH_EVERY_N_CUTOUTS = 256
-        batch_records: list[dict] = []
-        batch_idx = 0
-
-        def _flush() -> None:
-            nonlocal batch_records, batch_idx, n_cutouts_total
-            if not batch_records:
-                return
-            table = build_table(batch_records)
-            out_path = os.path.join(
-                scratch, f"part-{basename}-{batch_idx:05d}.parquet"
-            )
-            pq.write_table(table, out_path)
-            n_cutouts_total += table.num_rows
-            batch_records = []
-            batch_idx += 1
-            del table
 
         for brick in unique_bricks:
             brick_cat = cat[brickname_col == brick]
             try:
                 recs = process_brick(brick_cat, raw_root)
             except BaseException as exc:  # noqa: BLE001
-                # Any per-brick failure (corrupted FITS, missing image file,
-                # cfitsio error, numpy weirdness) should skip THIS brick and
-                # keep processing the rest of the sweep.
                 brick_errors.append(f"{brick}: {type(exc).__name__}: {exc}")
                 continue
             if recs:
-                batch_records.extend(recs)
-                if len(batch_records) >= FLUSH_EVERY_N_CUTOUTS:
-                    _flush()
+                sweep_records.extend(recs)
             del recs
 
-        _flush()
         del cat, brickname_col, unique_bricks
 
-        # Summarize per-brick errors in the return err field (as a warning,
-        # not a fatal) so the main-process logger can print them without
-        # losing the sweep's successfully-processed bricks.
         err_summary = (
             f"{len(brick_errors)} brick error(s): " + "; ".join(brick_errors[:3])
             + (" ..." if len(brick_errors) > 3 else "")
         ) if brick_errors else None
 
-        # Mark the sweep as complete only after all batches landed on disk.
-        open(done_marker, "w").close()
-        return basename, n_cat, n_cutouts_total, err_summary
+        if not sweep_records:
+            return basename, n_cat, 0, err_summary
+
+        table = build_table(sweep_records)
+        pq.write_table(table, out_path)
+        n_cutouts = table.num_rows
+        del sweep_records, table
+        return basename, n_cat, n_cutouts, err_summary
     except BaseException as exc:  # noqa: BLE001
         return basename, 0, 0, f"{type(exc).__name__}: {exc}"
 
@@ -737,9 +707,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-files", type=int, default=None,
                         help="Cap on number of sweep files to process.")
     parser.add_argument("--pixel-threshold", type=int, default=8192)
-    parser.add_argument("--num-processes", type=int, default=96,
-                        help="Per-shard multiprocessing.Pool size. On a 96-core "
-                             "CCM node, default=96 gives one pool worker per core.")
+    parser.add_argument("--num-processes", type=int, default=8,
+                        help="Pool size for parallel sweep processing. Each worker "
+                             "holds one sweep's cutouts (~80 GB peak). Default 8 "
+                             "keeps total RSS under ~640 GB on a 900 GB node.")
     parser.add_argument("--scratch-dir", default=None,
                         help="Shared ceph scratch directory for per-sweep parquet "
                              "shards. REQUIRED when running sharded — all shard "

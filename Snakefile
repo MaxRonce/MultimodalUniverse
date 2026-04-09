@@ -209,7 +209,8 @@ SHARDED_SCRATCH_ROOT = f"{HATS_ROOT}_scratch"
 SHARDED_DATASETS = {
     "legacysurvey": dict(
         num_shards=128,
-        num_processes=32,   # Pool(32) processes bricks WITHIN one sweep (not across sweeps).
+        num_processes=8,    # Pool(8) processes sweeps in parallel. Each worker holds one
+                            # sweep's cutouts (~80 GB peak). 8 × 80 GB = 640 GB < 900 GB alloc.
         build_mem_mb=900_000,
         # Sweeps are sequential: ~11 sweeps/shard × ~20 min/sweep = ~220 min nominal.
         # 480 min gives 2× headroom for slow sweeps (some have 200k+ objects).
