@@ -85,6 +85,7 @@ PORTED = [
     "ssl_legacysurvey",  # raw Stein-et-al DECaLS image chunks (h5 per 1M objects)
     "gaia",      # raw Gaia DR3 GaiaSource, full ~1.8B source catalog
     "gaia_xp",   # raw Gaia DR3, GaiaSource ∩ XpContinuousMeanSpectrum (~220M)
+    "galah",     # raw GALAH DR3 catalogs + spectra tarball
     "legacysurvey",  # raw DECaLS DR10 south sweeps + brick coadds (image cutouts + nearby catalog)
     "manga",     # raw SDSS-IV MaNGA IFU LOGCUBE + DAP MAPS files (spaxels + griz images + analysis maps)
     "hsc",         # HSC SSP PDR3 Deep/UltraDeep, 5-band 160×160 cutouts + 65 scalars
@@ -492,6 +493,22 @@ rule build_galex:
     resources:
         mem_mb = 200_000,
         runtime = 480,
+        cpus_per_task = 96,
+        slurm_partition = SLURM_PARTITION,
+    shell:
+        "{params.cmd}"
+
+
+rule build_galah:
+    output:
+        marker = catalog_marker("galah"),
+    input:
+        script = build_script("galah"),
+    params:
+        cmd = build_command("galah"),
+    resources:
+        mem_mb = 500_000,
+        runtime = 1440,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
     shell:
