@@ -171,9 +171,9 @@ SLURM_PARTITION = _resolve("slurm_partition", "ccm")
 SHARDED_SLURM_PARTITION = _resolve("sharded_slurm_partition", SLURM_PARTITION)
 
 
-def slurm_qos(partition: str) -> str:
-    """Return the required QoS string for a partition, or empty string."""
-    return "preempt" if partition == "preempt" else ""
+def slurm_qos(partition: str) -> str | None:
+    """Return the required QoS string for a partition, or None."""
+    return "preempt" if partition == "preempt" else None
 
 
 # --------------------------------------------------------------------------- #
