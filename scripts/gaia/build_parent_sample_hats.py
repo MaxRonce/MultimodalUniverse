@@ -222,7 +222,10 @@ def main(argv: list[str] | None = None) -> int:
         default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME),
     )
     parser.add_argument("--max-files", type=int, default=None)
-    parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--pixel-threshold", type=int, default=100_000,
+                        help="Max rows per HATS partition. Default 100k for gaia's "
+                             "1.8B rows — keeps output to ~18k partitions instead of "
+                             "485k (which caused the gather to freeze).")
     parser.add_argument("--ra-center", type=float, default=None)
     parser.add_argument("--dec-center", type=float, default=None)
     parser.add_argument("--radius", type=float, default=None,
