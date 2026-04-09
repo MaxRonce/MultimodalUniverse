@@ -140,7 +140,7 @@ def _build_image_struct(image_array: np.ndarray, psfsize: np.ndarray) -> pa.Stru
 
     band_arr = pa.array([BANDS] * n, type=pa.list_(pa.string()))
     nested_flux = [[[list(row) for row in img[b]] for b in range(N_BANDS)] for img in arr]
-    flux_arr = pa.array(nested_flux, type=pa.list_(pa.list_(pa.list_(pa.float32()))))
+    flux_arr = pa.array(nested_flux, type=pa.large_list(pa.large_list(pa.large_list(pa.float32()))))
     psf_fwhm_arr = pa.array(
         [list(row) for row in psfsize.astype(np.float32)],
         type=pa.list_(pa.float32()),
@@ -149,8 +149,11 @@ def _build_image_struct(image_array: np.ndarray, psfsize: np.ndarray) -> pa.Stru
         [[PIXEL_SCALE] * N_BANDS] * n,
         type=pa.list_(pa.float32()),
     )
+    def _as_array(a):
+        return a.combine_chunks() if isinstance(a, pa.ChunkedArray) else a
+
     return pa.StructArray.from_arrays(
-        [band_arr, flux_arr, psf_fwhm_arr, scale_arr],
+        [_as_array(a) for a in [band_arr, flux_arr, psf_fwhm_arr, scale_arr]],
         names=["band", "flux", "psf_fwhm", "scale"],
     )
 

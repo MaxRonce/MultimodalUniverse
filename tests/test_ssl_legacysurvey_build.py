@@ -99,7 +99,7 @@ class TestReadChunk:
         fields = {f.name: f.type for f in image_type}
         assert set(fields.keys()) == {"band", "flux", "psf_fwhm", "scale"}
         assert fields["band"] == pa.list_(pa.string())
-        assert fields["flux"] == pa.list_(pa.list_(pa.list_(pa.float32())))
+        assert fields["flux"] == pa.large_list(pa.large_list(pa.large_list(pa.float32())))
         assert fields["psf_fwhm"] == pa.list_(pa.float32())
         assert fields["scale"] == pa.list_(pa.float32())
 

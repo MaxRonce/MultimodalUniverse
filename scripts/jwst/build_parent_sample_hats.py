@@ -317,8 +317,11 @@ def process_mosaic(mosaic_name: str, mosaic_dir: str, pixel_threshold: int, scra
     )
     psf_arr = pa.array([r["image_psf_fwhm"].tolist() for r in records], type=pa.list_(pa.float32()))
     scale_arr = pa.array([r["image_scale"].tolist() for r in records], type=pa.list_(pa.float32()))
+    def _as_array(a):
+        return a.combine_chunks() if isinstance(a, pa.ChunkedArray) else a
+
     image_col = pa.StructArray.from_arrays(
-        [band_arr, flux_arr, ivar_arr, mask_arr, psf_arr, scale_arr],
+        [_as_array(a) for a in [band_arr, flux_arr, ivar_arr, mask_arr, psf_arr, scale_arr]],
         names=["band", "flux", "ivar", "mask", "psf_fwhm", "scale"],
     )
     columns = {

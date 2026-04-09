@@ -397,7 +397,6 @@ def main(argv: list[str] | None = None) -> int:
     shard_idx = 0
     pending: list[dict] = []
     work = [(i, row_dicts[i], args.raw_root, cache_root) for i in range(len(row_dicts))]
-    iterator = Pool(args.num_processes).imap_unordered(_row_to_record, work) if args.num_processes > 1 else map(_row_to_record, work)
 
     if args.num_processes > 1:
         with Pool(args.num_processes) as pool:
