@@ -514,34 +514,40 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: --scratch-dir is required in sharded mode", file=sys.stderr)
         return 2
 
-    zcat_path = args.zcatalog or os.path.join(args.raw_root, "zall-pix-iron.fits")
-    if not os.path.exists(zcat_path):
-        print(f"ERROR: missing redshift catalog {zcat_path}", file=sys.stderr)
-        return 1
-
-    print(f"Loading {zcat_path}...")
-    catalog = Table.read(zcat_path)
-    print(f"  {len(catalog)} total rows")
-    mask = selection_fn(catalog)
-    catalog = catalog[mask]
-    print(f"  {len(catalog)} rows after selection_fn")
-
-    if args.ra_center is not None and args.dec_center is not None and args.radius is not None:
-        cone_mask = apply_cone_filter(
-            np.asarray(catalog["TARGET_RA"]),
-            np.asarray(catalog["TARGET_DEC"]),
-            args.ra_center,
-            args.dec_center,
-            args.radius,
-        )
-        catalog = catalog[cone_mask]
-        print(
-            f"  {len(catalog)} rows after cone cut "
-            f"(ra={args.ra_center}, dec={args.dec_center}, radius={args.radius})"
-        )
-        if len(catalog) == 0:
-            print("  WARNING: cone cut left zero rows; no catalog to build.", file=sys.stderr)
+    # --only-ingest should skip ALL build-phase setup, including the
+    # expensive 28M-row zall-pix-iron.fits load. The raw mirror may not
+    # even be accessible from the gather node, so accessing it here breaks
+    # pure-ingest reruns unnecessarily.
+    catalog = None
+    if not args.only_ingest:
+        zcat_path = args.zcatalog or os.path.join(args.raw_root, "zall-pix-iron.fits")
+        if not os.path.exists(zcat_path):
+            print(f"ERROR: missing redshift catalog {zcat_path}", file=sys.stderr)
             return 1
+
+        print(f"Loading {zcat_path}...")
+        catalog = Table.read(zcat_path)
+        print(f"  {len(catalog)} total rows")
+        mask = selection_fn(catalog)
+        catalog = catalog[mask]
+        print(f"  {len(catalog)} rows after selection_fn")
+
+        if args.ra_center is not None and args.dec_center is not None and args.radius is not None:
+            cone_mask = apply_cone_filter(
+                np.asarray(catalog["TARGET_RA"]),
+                np.asarray(catalog["TARGET_DEC"]),
+                args.ra_center,
+                args.dec_center,
+                args.radius,
+            )
+            catalog = catalog[cone_mask]
+            print(
+                f"  {len(catalog)} rows after cone cut "
+                f"(ra={args.ra_center}, dec={args.dec_center}, radius={args.radius})"
+            )
+            if len(catalog) == 0:
+                print("  WARNING: cone cut left zero rows; no catalog to build.", file=sys.stderr)
+                return 1
 
     if args.in_memory:
         table = build_table(catalog, args.raw_root, max_groups=args.max_groups)

@@ -383,20 +383,25 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: --scratch-dir is required in sharded mode", file=sys.stderr)
         return 2
 
-    pairs = find_shard_pairs(args.raw_root)
-    if args.max_files is not None:
-        pairs = pairs[:args.max_files]
-    if not pairs:
-        print(f"ERROR: no GaiaSource/XP shard pairs under {args.raw_root}", file=sys.stderr)
-        return 1
-    print(f"[shard {args.shard_idx}/{args.num_shards}] Found {len(pairs)} "
-          f"(source, xp) shard pair(s)", flush=True)
+    # In --only-ingest mode we don't touch raw files at all — the gather job
+    # just reads the already-written per-shard parquets out of scratch. Skip
+    # find_shard_pairs so the raw Gaia mirror doesn't need to be reachable.
+    pairs: list[tuple[str, str]] = []
+    if not args.only_ingest:
+        pairs = find_shard_pairs(args.raw_root)
+        if args.max_files is not None:
+            pairs = pairs[:args.max_files]
+        if not pairs:
+            print(f"ERROR: no GaiaSource/XP shard pairs under {args.raw_root}", file=sys.stderr)
+            return 1
+        print(f"[shard {args.shard_idx}/{args.num_shards}] Found {len(pairs)} "
+              f"(source, xp) shard pair(s)", flush=True)
 
-    # Apply stride slicing for sharded mode.
-    if args.num_shards > 1:
-        pairs = pairs[args.shard_idx::args.num_shards]
-        print(f"[shard {args.shard_idx}] my stride: {len(pairs)} shard pair(s)",
-              flush=True)
+        # Apply stride slicing for sharded mode.
+        if args.num_shards > 1:
+            pairs = pairs[args.shard_idx::args.num_shards]
+            print(f"[shard {args.shard_idx}] my stride: {len(pairs)} shard pair(s)",
+                  flush=True)
 
     if args.in_memory:
         tables: list[pa.Table] = []
