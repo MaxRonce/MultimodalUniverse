@@ -72,6 +72,7 @@ validate_hats_root(HATS_ROOT)
 # Datasets that have a working raw -> HATS build script under scripts/{name}/
 PORTED = [
     "sdss",      # raw FITS plate files
+    "apogee",    # raw APOGEE DR17 allStar + apStar/aspcapStar FITS
     "allwise",   # raw IRSA parquet, healpix-prefiltered for cone cuts
     "btsbot",    # raw ZTF triplets + alert metadata
     "desi_provabgs",  # raw PROVABGS VAC HDF5
@@ -417,6 +418,22 @@ rule build_allwise:
         "{params.cmd}"
 
 
+rule build_apogee:
+    output:
+        marker = catalog_marker("apogee"),
+    input:
+        script = build_script("apogee"),
+    params:
+        cmd = build_command("apogee"),
+    resources:
+        mem_mb = 500_000,
+        runtime = 1440,
+        cpus_per_task = 96,
+        slurm_partition = SLURM_PARTITION,
+    shell:
+        "{params.cmd}"
+
+
 rule build_sdss:
     output:
         marker = catalog_marker("sdss"),
@@ -630,4 +647,3 @@ rule build_swift_sne_ia:
         slurm_partition = SLURM_PARTITION,
     shell:
         "{params.cmd}"
-
