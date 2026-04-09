@@ -643,7 +643,8 @@ def _process_sweep_to_parquet(args: tuple) -> tuple[str, int, int, str | None]:
     basename = os.path.basename(sweep_path)
     out_path = os.path.join(scratch, f"part-{basename}.parquet")
     if os.path.exists(out_path):
-        return basename, 0, 0, None
+        n_rows = pq.read_metadata(out_path).num_rows
+        return basename, 0, n_rows, "already done"
     try:
         cat = read_sweep(
             sweep_path,
