@@ -26,6 +26,7 @@ import os
 import shutil
 import sys
 import urllib.request
+import warnings
 from multiprocessing import Pool
 
 import numpy as np
@@ -99,7 +100,12 @@ def _default_cache_root() -> str:
 
 def _is_readable_fits_table(path: str) -> bool:
     try:
-        Table.read(path, hdu=1)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            Table.read(path, hdu=1)
+        for w in caught:
+            if "truncated" in str(w.message).lower():
+                return False
         return True
     except Exception:
         return False
