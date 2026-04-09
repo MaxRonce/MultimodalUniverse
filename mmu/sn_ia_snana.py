@@ -42,6 +42,16 @@ from mmu.hats_configs import MMU_V2_HATS_ROOT
 from mmu.hats_import import write_hats
 
 
+# SNANA header prefixes that are NOT metadata and should not be stuffed into
+# the meta dict by the catch-all colon parser. These have structural meaning
+# (they drive the obs table) or are free-form comments that can recur and
+# whose "value" is not what we want to remember as e.g. COMMENT=<first word>.
+_NON_META_PREFIXES = frozenset({
+    "COMMENT", "END", "END_PHOTOMETRY", "BEGIN_PHOTOMETRY",
+    "NOBS", "NVAR", "VARLIST", "OBS",
+})
+
+
 def _parse_snana_ascii(path: str) -> tuple[dict[str, str], list[str], list[list[str]]]:
     """Parse a SNANA ASCII lightcurve file.
 
@@ -50,6 +60,15 @@ def _parse_snana_ascii(path: str) -> tuple[dict[str, str], list[str], list[list[
       so e.g. ``RA: 150.1 deg`` becomes ``meta["RA"] = "150.1"``).
     - ``varlist`` is the column names of the obs table.
     - ``obs_rows`` is a list of per-obs lists of strings (one row per ``OBS:`` line).
+
+    Defensive behavior:
+    - If ``OBS:`` lines appear before ``VARLIST:``, raise ValueError rather
+      than silently producing empty rows.
+    - Non-metadata prefixes (``COMMENT``, ``END``, ``BEGIN_PHOTOMETRY``, etc.)
+      are skipped rather than stuffed into the meta dict.
+    - Duplicate metadata keys raise ValueError — SNANA files shouldn't
+      repeat real metadata keys, and silently overwriting hides upstream
+      data issues.
     """
     meta: dict[str, str] = {}
     varlist: list[str] = []
@@ -60,22 +79,39 @@ def _parse_snana_ascii(path: str) -> tuple[dict[str, str], list[str], list[list[
             if not line or line.startswith("#"):
                 continue
             if line.startswith("OBS:"):
+                if not varlist:
+                    raise ValueError(
+                        f"{path}: OBS: line before VARLIST: header. "
+                        "Cannot interpret observation columns."
+                    )
                 parts = line.split()
                 obs_rows.append(parts[1 : 1 + len(varlist)])
                 continue
             if line.startswith("VARLIST:"):
                 varlist = line.split()[1:]
                 continue
-            if line.startswith("END:") or line.startswith("END_PHOTOMETRY:"):
+            # Recognized structural prefixes we explicitly skip (COMMENT:,
+            # END:, BEGIN_PHOTOMETRY:, NOBS:, NVAR:, ...).
+            head, sep, _ = line.partition(":")
+            if not sep:
+                continue
+            key = head.strip()
+            if key in _NON_META_PREFIXES:
                 continue
             # A metadata line like "RA: 150.1 deg" or "REDSHIFT_HELIO: 0.05 +- 0.001".
             # Take the first whitespace-separated token after the colon as the value;
             # SNANA files are inconsistent about trailing units / errors.
-            if ":" in line:
-                key, _, rest = line.partition(":")
-                tokens = rest.strip().split()
-                if tokens:
-                    meta[key.strip()] = tokens[0]
+            rest = line.partition(":")[2].strip().split()
+            if not rest:
+                continue
+            if key in meta:
+                # Repeating a real metadata key is a real upstream problem —
+                # fail loud instead of silently letting the second line win.
+                raise ValueError(
+                    f"{path}: duplicate metadata key {key!r} "
+                    f"({meta[key]!r} vs {rest[0]!r})."
+                )
+            meta[key] = rest[0]
     return meta, varlist, obs_rows
 
 
