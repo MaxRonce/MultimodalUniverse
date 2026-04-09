@@ -293,6 +293,15 @@ rule build_sharded_shard:
         output_root = lambda w: f"{HATS_ROOT}/{w.shard_name}",
         num_shards = lambda w: SHARDED_DATASETS[w.shard_name]["num_shards"],
         num_processes = lambda w: SHARDED_DATASETS[w.shard_name]["num_processes"],
+        # Cone + max-files args from the active config profile. Honoured by
+        # every sharded build script so `profile=cosmos` actually produces a
+        # cosmos slice instead of the full-sky scatter.
+        cone_args = (
+            f"--ra-center {RA_CENTER} --dec-center {DEC_CENTER} --radius {RADIUS}"
+            if RA_CENTER is not None and DEC_CENTER is not None and RADIUS is not None
+            else ""
+        ),
+        max_files_arg = f"--max-files {MAX_FILES}" if MAX_FILES is not None else "",
     resources:
         mem_mb = lambda w: SHARDED_DATASETS[w.shard_name]["build_mem_mb"],
         runtime = lambda w: SHARDED_DATASETS[w.shard_name]["build_runtime_min"],
@@ -303,6 +312,7 @@ rule build_sharded_shard:
         "mkdir -p {params.scratch} && "
         "python -u -m scripts.{wildcards.shard_name}.build_parent_sample_hats "
         "--scratch-dir {params.scratch} "
+        "{params.cone_args} {params.max_files_arg} "
         "--output-root {params.output_root} "
         "--num-shards {params.num_shards} "
         "--shard-idx {wildcards.shard_idx} "
