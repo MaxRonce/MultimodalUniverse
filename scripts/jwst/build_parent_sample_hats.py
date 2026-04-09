@@ -1,40 +1,25 @@
-"""Convert JWST NIRCam deep-field cutouts into a HATS catalog.
+"""Convert raw JWST DJA mosaics into a single HATS catalog.
 
-The cluster mirrors the JWST data (already processed by v1's
-``build_parent_sample.py``, which downloads FITS mosaics and extracts
-96×96 cutouts) as HDF5 files under::
+This builder uses the mirrored original-data layout under::
 
     /mnt/ceph/users/polymathic/external_data/astro/JWST/
-        {survey}/healpix={N}/001-of-001.hdf5
+        <mosaic-name>/
+            <mosaic>-fix_phot_apcorr.fits
+            <mosaic>-<filter>-clear_drc_sci.fits.gz
+            <mosaic>-<filter>-clear_drc_wht_full.fits.gz  # preferred
+            <mosaic>-<filter>-clear_drc_wht.fits.gz       # fallback
+            <mosaic>-<filter>-clear_drc_exp.fits.gz       # fallback
 
-where survey is one of: primer-cosmos, primer-uds, ceers, ngdeep, gds, gdn.
-
-Each HDF5 file contains per-object arrays:
-    - object_id   int64
-    - ra, dec     float64
-    - healpix     int64
-    - image_band  (N_filters,) bytes — e.g. b'f090w'
-    - image_flux  (N_filters, 96, 96) float32
-    - image_ivar  (N_filters, 96, 96) float32
-    - image_mask  (N_filters, 96, 96) bool
-    - image_psf_fwhm (N_filters,) float32
-    - image_scale (N_filters,) float32
-    - mag_auto, flux_radius, flux_auto, fluxerr_auto,
-      cxx_image, cyy_image, cxy_image   float32 scalars
-
-Schema::
-
+It preserves the current JWST image schema:
     image: struct<
-        band:     list<string>,                   # e.g. ['f090w', ..., 'f444w']
-        flux:     list<list<list<float32>>>,      # (N_filters, 96, 96)
-        ivar:     list<list<list<float32>>>,      # (N_filters, 96, 96)
-        mask:     list<list<list<bool>>>,         # (N_filters, 96, 96)
-        psf_fwhm: list<float32>,                  # N_filters floats
-        scale:    list<float32>,                  # N_filters floats
+        band: list<string>,
+        flux: list<list<list<float32>>>,
+        ivar: list<list<list<float32>>>,
+        mask: list<list<list<bool>>>,
+        psf_fwhm: list<float32>,
+        scale: list<float32>,
     >
-    + mag_auto, flux_radius, flux_auto, fluxerr_auto,
-      cxx_image, cyy_image, cxy_image  (float32)
-    + object_id (string), ra (float64), dec (float64)
+plus the scalar morphology/photometry features and top-level ra/dec.
 """
 
 from __future__ import annotations
@@ -42,194 +27,342 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
 import shutil
 import sys
+import zlib
 
-import h5py
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-
-def _as_array(arr):
-    return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
-
+from astropy.io import fits
+from astropy.nddata.utils import Cutout2D
+from astropy.table import Table
+from astropy.wcs import WCS
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import (
-    default_scratch_dir,
-    write_hats_from_parquet_dir,
-)
+from mmu.hats_import import default_scratch_dir, to_native_endian, write_hats_from_parquet_dir
 
 
 CATALOG_NAME = "jwst"
 
 IMAGE_SIZE = 96
-SURVEYS = ["primer-cosmos", "primer-uds", "ceers", "ngdeep", "gds", "gdn"]
-
+MOSAIC_FILTERS = ["f090w", "f115w", "f150w", "f200w", "f277w", "f356w", "f444w"]
 FLOAT_FEATURES = [
-    "mag_auto", "flux_radius", "flux_auto", "fluxerr_auto",
-    "cxx_image", "cyy_image", "cxy_image",
+    "mag_auto",
+    "flux_radius",
+    "flux_auto",
+    "fluxerr_auto",
+    "cxx_image",
+    "cyy_image",
+    "cxy_image",
 ]
 
+MOSAIC_MAG_AUTO_CUT = {
+    "primer": 27.0,
+    "ceers": 27.0,
+    "ngdeep": 27.5,
+    "gds": 27.5,
+    "gdn": 27.5,
+}
+MIN_FILTERS_CUT = 4
 
-def find_raw_files(raw_root: str, max_files: int | None = None) -> list[str]:
-    """Find all HDF5 files under raw_root (any survey/healpix layout)."""
-    files = sorted(glob.glob(os.path.join(raw_root, "**", "*.hdf5"), recursive=True))
+EMPIRICAL_PSF_FWHM = {
+    "f090w": 0.033,
+    "f115w": 0.040,
+    "f150w": 0.050,
+    "f200w": 0.066,
+    "f277w": 0.092,
+    "f356w": 0.116,
+    "f444w": 0.145,
+}
+
+
+def _mosaic_key(mosaic_name: str) -> str:
+    return mosaic_name.split("-")[0]
+
+
+def _survey_id(mosaic_name: str) -> str:
+    if "primer-cosmos" in mosaic_name:
+        return "primer-cosmos"
+    if "primer-uds" in mosaic_name:
+        return "primer-uds"
+    return _mosaic_key(mosaic_name)
+
+
+def _catalog_path(mosaic_dir: str, mosaic_name: str) -> str:
+    return os.path.join(mosaic_dir, f"{mosaic_name}-fix_phot_apcorr.fits")
+
+
+def _sci_path(mosaic_dir: str, mosaic_name: str, filt: str) -> str:
+    return os.path.join(mosaic_dir, f"{mosaic_name}-{filt}-clear_drc_sci.fits.gz")
+
+
+def _wht_full_path(mosaic_dir: str, mosaic_name: str, filt: str) -> str:
+    return os.path.join(mosaic_dir, f"{mosaic_name}-{filt}-clear_drc_wht_full.fits.gz")
+
+
+def _wht_path(mosaic_dir: str, mosaic_name: str, filt: str) -> str:
+    return os.path.join(mosaic_dir, f"{mosaic_name}-{filt}-clear_drc_wht.fits.gz")
+
+
+def _exp_path(mosaic_dir: str, mosaic_name: str, filt: str) -> str:
+    return os.path.join(mosaic_dir, f"{mosaic_name}-{filt}-clear_drc_exp.fits.gz")
+
+
+def find_mosaic_dirs(raw_root: str, max_files: int | None = None) -> list[tuple[str, str]]:
+    pattern = re.compile(r"(.+)-fix_phot_apcorr\.fits$")
+    mosaics = []
+    for path in sorted(glob.glob(os.path.join(raw_root, "*", "*-fix_phot_apcorr.fits"))):
+        name = os.path.basename(path)
+        m = pattern.match(name)
+        if not m:
+            continue
+        mosaic_name = m.group(1)
+        mosaics.append((mosaic_name, os.path.dirname(path)))
     if max_files is not None:
-        files = files[:max_files]
-    return files
+        mosaics = mosaics[:max_files]
+    return mosaics
 
 
-def _decode_band(val) -> str:
-    """Decode a bytes or str band name to a plain Python str."""
-    if isinstance(val, (bytes, np.bytes_)):
-        return val.decode("utf-8")
-    return str(val)
+def selection_function(catalog: Table, mag_cut: float, min_filters: int = MIN_FILTERS_CUT) -> np.ndarray:
+    filters = [f for f in MOSAIC_FILTERS if f"{f}_flux_aper_0" in catalog.colnames]
+    if not filters:
+        return np.zeros(len(catalog), dtype=bool)
+    non_zero = np.zeros(len(catalog), dtype=np.int32)
+    for filt in filters:
+        non_zero += (np.asarray(catalog[f"{filt}_flux_aper_0"]) > 0).astype(np.int32)
+    return (non_zero >= min_filters) & (np.asarray(catalog["mag_auto"]) < mag_cut)
 
 
-def read_hdf5(
-    path: str,
-    ra_center: float | None = None,
-    dec_center: float | None = None,
-    radius: float | None = None,
-) -> pa.Table | None:
-    """Read one JWST HDF5 file and return a PyArrow table, or None.
+def build_total_inverse_variance(mosaic_name: str, filt: str, mosaic_dir: str) -> str:
+    out_path = _wht_full_path(mosaic_dir, mosaic_name, filt)
+    if os.path.exists(out_path):
+        return out_path
 
-    Applies cone cut early if parameters are given.
-    """
-    with h5py.File(path, "r") as f:
-        ra = np.asarray(f["ra"][:], dtype=np.float64)
-        dec = np.asarray(f["dec"][:], dtype=np.float64)
-        n_total = ra.shape[0]
+    with fits.open(_sci_path(mosaic_dir, mosaic_name, filt)) as sci_hdu, \
+         fits.open(_wht_path(mosaic_dir, mosaic_name, filt)) as wht_hdu, \
+         fits.open(_exp_path(mosaic_dir, mosaic_name, filt)) as exp_hdu:
+        sci = to_native_endian(np.asarray(sci_hdu[0].data, dtype=np.float32))
+        wht = to_native_endian(np.asarray(wht_hdu[0].data, dtype=np.float32))
+        exp = to_native_endian(np.asarray(exp_hdu[0].data, dtype=np.float32))
+        header = exp_hdu[0].header
 
-        if ra_center is not None and dec_center is not None and radius is not None:
-            cone_mask = apply_cone_filter(ra, dec, ra_center, dec_center, radius)
-            keep = np.where(cone_mask)[0]
-            if keep.size == 0:
-                return None
-        else:
-            keep = np.arange(n_total)
+        full_exp = np.zeros_like(sci, dtype=np.float32)
+        full_exp[2::4, 2::4] += exp
+        full_exp = np.maximum(full_exp, np.roll(full_exp, 1, axis=0))
+        full_exp = np.maximum(full_exp, np.roll(full_exp, -1, axis=0))
+        full_exp = np.maximum(full_exp, np.roll(full_exp, 1, axis=1))
+        full_exp = np.maximum(full_exp, np.roll(full_exp, -1, axis=1))
 
-        ra = ra[keep]
-        dec = dec[keep]
-        n_rows = len(keep)
+        phot_scale = 1.0
+        for key in ["PHOTMJSR", "PHOTSCAL"]:
+            if key in header and header[key] != 0:
+                phot_scale /= header[key]
+        if "OPHOTFNU" in header and "PHOTFNU" in header and header["OPHOTFNU"] != 0:
+            phot_scale *= header["PHOTFNU"] / header["OPHOTFNU"]
 
-        object_id = np.asarray(f["object_id"][keep])
-        image_flux = np.asarray(f["image_flux"][keep], dtype=np.float32)  # (N, F, H, W)
-        image_ivar = np.asarray(f["image_ivar"][keep], dtype=np.float32)
-        image_mask = np.asarray(f["image_mask"][keep], dtype=bool)
-        image_psf_fwhm = np.asarray(f["image_psf_fwhm"][keep], dtype=np.float32)
-        image_scale = np.asarray(f["image_scale"][keep], dtype=np.float32)
-        image_band_raw = f["image_band"][keep]  # (N, N_filters) bytes
+        effective_gain = phot_scale * full_exp
+        var_poisson_dn = np.zeros_like(sci, dtype=np.float32)
+        positive_gain = effective_gain > 0
+        var_poisson_dn[positive_gain] = np.maximum(sci[positive_gain], 0) / effective_gain[positive_gain]
 
-        scalars = {}
-        for feat in FLOAT_FEATURES:
-            if feat in f:
-                scalars[feat] = np.asarray(f[feat][keep], dtype=np.float32)
+        var_wht = np.zeros_like(wht, dtype=np.float32)
+        positive_wht = wht > 0
+        var_wht[positive_wht] = 1.0 / wht[positive_wht]
+        var_total = var_wht + var_poisson_dn
 
-    n_filters = image_flux.shape[1]
+        full_wht = np.zeros_like(var_total, dtype=np.float32)
+        positive_total = var_total > 0
+        full_wht[positive_total] = 1.0 / var_total[positive_total]
 
-    # Build band list per row (decode bytes → str)
-    bands_per_row = [
-        [_decode_band(image_band_raw[i, j]) for j in range(n_filters)]
-        for i in range(n_rows)
+        fits.PrimaryHDU(data=full_wht, header=wht_hdu[0].header).writeto(out_path, overwrite=True)
+    return out_path
+
+
+def process_mosaic(mosaic_name: str, mosaic_dir: str, pixel_threshold: int, scratch_dir: str, ra_center: float | None, dec_center: float | None, radius: float | None) -> int:
+    os.makedirs(scratch_dir, exist_ok=True)
+    catalog = Table.read(_catalog_path(mosaic_dir, mosaic_name))
+    mag_cut = MOSAIC_MAG_AUTO_CUT[_mosaic_key(mosaic_name)]
+    sel = selection_function(catalog, mag_cut=mag_cut, min_filters=MIN_FILTERS_CUT)
+    catalog = catalog[sel]
+    if len(catalog) == 0:
+        return 0
+
+    if ra_center is not None and dec_center is not None and radius is not None:
+        cone = apply_cone_filter(
+            np.asarray(catalog["ra"], dtype=np.float64),
+            np.asarray(catalog["dec"], dtype=np.float64),
+            ra_center,
+            dec_center,
+            radius,
+        )
+        catalog = catalog[cone]
+        if len(catalog) == 0:
+            return 0
+
+    available_filters = [
+        filt for filt in MOSAIC_FILTERS
+        if os.path.exists(_sci_path(mosaic_dir, mosaic_name, filt))
     ]
+    if not available_filters:
+        return 0
 
-    band_arr = pa.array(bands_per_row, type=pa.list_(pa.string()))
+    images = {}
+    for filt in available_filters:
+        sci_hdu = fits.open(_sci_path(mosaic_dir, mosaic_name, filt))
+        ivar_path = _wht_full_path(mosaic_dir, mosaic_name, filt)
+        if not os.path.exists(ivar_path):
+            if os.path.exists(_wht_path(mosaic_dir, mosaic_name, filt)) and os.path.exists(_exp_path(mosaic_dir, mosaic_name, filt)):
+                ivar_path = build_total_inverse_variance(mosaic_name, filt, mosaic_dir)
+            else:
+                continue
+        ivar_hdu = fits.open(ivar_path)
+        wcs = WCS(sci_hdu[0].header)
+        pix_scale = float(round(np.sqrt(np.linalg.det(np.abs(wcs.pixel_scale_matrix))) * 3600, 4))
+        images[filt] = {
+            "sci": sci_hdu[0],
+            "ivar": ivar_hdu[0],
+            "wcs": wcs,
+            "pix_scale": pix_scale,
+        }
 
-    # Nested list arrays: list<list<list<float32>>> shape (N_filters, H, W)
-    flux_nested = [[[list(row) for row in image_flux[i, f_]] for f_ in range(n_filters)] for i in range(n_rows)]
-    ivar_nested = [[[list(row) for row in image_ivar[i, f_]] for f_ in range(n_filters)] for i in range(n_rows)]
-    mask_nested = [[[list(map(bool, row)) for row in image_mask[i, f_]] for f_ in range(n_filters)] for i in range(n_rows)]
+    if not images:
+        return 0
 
-    flux_arr = pa.array(flux_nested, type=pa.list_(pa.list_(pa.list_(pa.float32()))))
-    ivar_arr = pa.array(ivar_nested, type=pa.list_(pa.list_(pa.list_(pa.float32()))))
-    mask_arr = pa.array(mask_nested, type=pa.list_(pa.list_(pa.list_(pa.bool_()))))
-    psf_fwhm_arr = pa.array(
-        [list(image_psf_fwhm[i]) for i in range(n_rows)],
-        type=pa.list_(pa.float32()),
+    survey_hash = zlib.crc32(mosaic_name.encode())
+    records = []
+    for row in catalog:
+        ra = float(row["ra"])
+        dec = float(row["dec"])
+        flux_stack = []
+        ivar_stack = []
+        mask_stack = []
+        bands = []
+        psf = []
+        scales = []
+
+        for filt, img in images.items():
+            x, y = img["wcs"].all_world2pix(ra, dec, 0)
+            cutout_flux = Cutout2D(
+                to_native_endian(np.asarray(img["sci"].data, dtype=np.float32)),
+                (x, y),
+                (IMAGE_SIZE, IMAGE_SIZE),
+                wcs=img["wcs"],
+                mode="partial",
+                fill_value=0,
+            ).data
+            cutout_ivar = Cutout2D(
+                to_native_endian(np.asarray(img["ivar"].data, dtype=np.float32)),
+                (x, y),
+                (IMAGE_SIZE, IMAGE_SIZE),
+                wcs=img["wcs"],
+                mode="partial",
+                fill_value=0,
+            ).data
+            cutout_flux = np.nan_to_num(cutout_flux).astype(np.float32)
+            cutout_ivar = np.nan_to_num(cutout_ivar).astype(np.float32)
+            flux_stack.append(cutout_flux)
+            ivar_stack.append(cutout_ivar)
+            mask_stack.append((cutout_ivar > 0).astype(bool))
+            bands.append(filt)
+            psf.append(np.float32(EMPIRICAL_PSF_FWHM[filt]))
+            scales.append(np.float32(img["pix_scale"]))
+
+        if not flux_stack:
+            continue
+
+        record = {
+            "object_id": str(int(row["id"]) + survey_hash),
+            "ra": np.float64(ra),
+            "dec": np.float64(dec),
+            "image_band": bands,
+            "image_flux": np.stack(flux_stack, axis=0).astype(np.float32),
+            "image_ivar": np.stack(ivar_stack, axis=0).astype(np.float32),
+            "image_mask": np.stack(mask_stack, axis=0).astype(bool),
+            "image_psf_fwhm": np.array(psf, dtype=np.float32),
+            "image_scale": np.array(scales, dtype=np.float32),
+        }
+        for feat in FLOAT_FEATURES:
+            record[feat] = np.float32(row[feat])
+        records.append(record)
+
+    for img in images.values():
+        img["sci"]._file.close()
+        img["ivar"]._file.close()
+
+    if not records:
+        return 0
+
+    band_arr = pa.array([r["image_band"] for r in records], type=pa.list_(pa.string()))
+    flux_arr = pa.array(
+        [[[list(row) for row in band] for band in r["image_flux"]] for r in records],
+        type=pa.list_(pa.list_(pa.list_(pa.float32()))),
     )
-    scale_arr = pa.array(
-        [list(image_scale[i]) for i in range(n_rows)],
-        type=pa.list_(pa.float32()),
+    ivar_arr = pa.array(
+        [[[list(row) for row in band] for band in r["image_ivar"]] for r in records],
+        type=pa.list_(pa.list_(pa.list_(pa.float32()))),
     )
-
+    mask_arr = pa.array(
+        [[[list(map(bool, row)) for row in band] for band in r["image_mask"]] for r in records],
+        type=pa.list_(pa.list_(pa.list_(pa.bool_()))),
+    )
+    psf_arr = pa.array([r["image_psf_fwhm"].tolist() for r in records], type=pa.list_(pa.float32()))
+    scale_arr = pa.array([r["image_scale"].tolist() for r in records], type=pa.list_(pa.float32()))
     image_col = pa.StructArray.from_arrays(
-            [_as_array(a) for a in [band_arr, flux_arr, ivar_arr, mask_arr, psf_fwhm_arr, scale_arr]],
+        [band_arr, flux_arr, ivar_arr, mask_arr, psf_arr, scale_arr],
         names=["band", "flux", "ivar", "mask", "psf_fwhm", "scale"],
     )
-
-    columns: dict[str, pa.Array] = {
-        "ra": pa.array(ra, type=pa.float64()),
-        "dec": pa.array(dec, type=pa.float64()),
-        "object_id": pa.array([str(int(v)) for v in object_id], type=pa.string()),
+    columns = {
+        "object_id": pa.array([r["object_id"] for r in records], type=pa.string()),
+        "ra": pa.array(np.array([r["ra"] for r in records], dtype=np.float64), type=pa.float64()),
+        "dec": pa.array(np.array([r["dec"] for r in records], dtype=np.float64), type=pa.float64()),
         "image": image_col,
     }
-    for feat, arr in scalars.items():
-        columns[feat] = pa.array(arr, type=pa.float32())
+    for feat in FLOAT_FEATURES:
+        columns[feat] = pa.array(np.array([r[feat] for r in records], dtype=np.float32), type=pa.float32())
+    table = pa.table(columns)
 
-    return pa.table(columns)
+    shard_path = os.path.join(scratch_dir, f"{mosaic_name}.parquet")
+    pq.write_table(table, shard_path)
+    return table.num_rows
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--raw-root",
-        default=DATASETS[CATALOG_NAME].raw_path,
-        help="Root directory containing per-survey HDF5 healpix files.",
-    )
-    parser.add_argument(
-        "--output-root",
-        default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME),
-    )
-    parser.add_argument(
-        "--scratch-dir",
-        default=None,
-        help="Directory for per-file parquet shards before HATS ingest.",
-    )
-    parser.add_argument(
-        "--max-files",
-        type=int,
-        default=None,
-        help="Cap on number of HDF5 files to process.",
-    )
+    parser.add_argument("--raw-root", default=DATASETS[CATALOG_NAME].raw_path)
+    parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
+    parser.add_argument("--scratch-dir", default=None)
+    parser.add_argument("--max-files", type=int, default=None, help="Cap number of mosaics.")
     parser.add_argument("--pixel-threshold", type=int, default=8192)
     parser.add_argument("--ra-center", type=float, default=None)
     parser.add_argument("--dec-center", type=float, default=None)
-    parser.add_argument(
-        "--radius", type=float, default=None,
-        help="Cone radius in degrees; requires --ra-center/--dec-center.",
-    )
+    parser.add_argument("--radius", type=float, default=None)
     args = parser.parse_args(argv)
 
-    files = find_raw_files(args.raw_root, max_files=args.max_files)
-    if not files:
-        print(f"ERROR: no .hdf5 files found under {args.raw_root}", file=sys.stderr)
+    mosaics = find_mosaic_dirs(args.raw_root, max_files=args.max_files)
+    if not mosaics:
+        print(f"ERROR: no JWST raw mosaics found under {args.raw_root}", file=sys.stderr)
         return 1
-    print(f"Found {len(files)} JWST HDF5 file(s)", flush=True)
 
     scratch_dir = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
     os.makedirs(scratch_dir, exist_ok=True)
 
-    n_written = 0
-    for idx, path in enumerate(files):
-        table = read_hdf5(
-            path,
+    total_rows = 0
+    for mosaic_name, mosaic_dir in mosaics:
+        total_rows += process_mosaic(
+            mosaic_name,
+            mosaic_dir,
+            pixel_threshold=args.pixel_threshold,
+            scratch_dir=scratch_dir,
             ra_center=args.ra_center,
             dec_center=args.dec_center,
             radius=args.radius,
         )
-        if table is None or table.num_rows == 0:
-            continue
-        shard_path = os.path.join(scratch_dir, f"part-{idx:04d}.parquet")
-        pq.write_table(table, shard_path)
-        n_written += 1
-        print(f"  {os.path.basename(path)}: {table.num_rows} rows", flush=True)
 
-    if n_written == 0:
-        print("No rows after filtering; nothing to write.", file=sys.stderr)
+    if total_rows == 0:
+        print("ERROR: no JWST rows processed", file=sys.stderr)
         return 1
 
     catalog_dir = write_hats_from_parquet_dir(

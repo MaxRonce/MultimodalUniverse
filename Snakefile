@@ -515,6 +515,22 @@ rule build_galah:
         "{params.cmd}"
 
 
+rule build_jwst:
+    output:
+        marker = catalog_marker("jwst"),
+    input:
+        script = build_script("jwst"),
+    params:
+        cmd = build_command("jwst"),
+    resources:
+        mem_mb = 500_000,
+        runtime = 1440,
+        cpus_per_task = 96,
+        slurm_partition = SLURM_PARTITION,
+    shell:
+        "{params.cmd}"
+
+
 rule build_gz10:
     output:
         marker = catalog_marker("gz10"),

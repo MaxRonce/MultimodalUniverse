@@ -5,10 +5,11 @@ from __future__ import annotations
 import importlib.util
 import os
 
-import h5py
 import numpy as np
 import pyarrow as pa
 import pytest
+from astropy.io import fits
+from astropy.table import Table
 
 
 def _load_build_module():
@@ -23,167 +24,107 @@ def _load_build_module():
 
 build = _load_build_module()
 
-N_ROWS = 6
-N_FILTERS = 7
-_FILTERS = [b"f090w", b"f115w", b"f150w", b"f200w", b"f277w", b"f356w", b"f444w"]
+
+def _make_wcs_header(size: int = 128):
+    hdr = fits.Header()
+    hdr["NAXIS"] = 2
+    hdr["NAXIS1"] = size
+    hdr["NAXIS2"] = size
+    hdr["CTYPE1"] = "RA---TAN"
+    hdr["CTYPE2"] = "DEC--TAN"
+    hdr["CRPIX1"] = size / 2
+    hdr["CRPIX2"] = size / 2
+    hdr["CRVAL1"] = 150.0
+    hdr["CRVAL2"] = 2.0
+    hdr["CDELT1"] = -0.000011111
+    hdr["CDELT2"] = 0.000011111
+    return hdr
 
 
-def _write_fake_jwst_hdf5(path: str, n_rows: int = N_ROWS, n_filters: int = N_FILTERS) -> None:
-    """Write a minimal JWST HDF5 file matching the real on-disk layout."""
-    rng = np.random.default_rng(99)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with h5py.File(path, "w") as f:
-        f.create_dataset("ra", data=rng.uniform(0, 360, n_rows).astype(np.float64))
-        f.create_dataset("dec", data=rng.uniform(-30, 30, n_rows).astype(np.float64))
-        f.create_dataset("object_id", data=rng.integers(1_000, 9_999, n_rows).astype(np.int64))
-        f.create_dataset("healpix", data=np.zeros(n_rows, dtype=np.int64))
-        # image_band: (N, N_filters) bytes
-        bands = np.array([_FILTERS[:n_filters]] * n_rows, dtype="S5")
-        f.create_dataset("image_band", data=bands)
-        f.create_dataset(
-            "image_flux",
-            data=rng.normal(0, 1, (n_rows, n_filters, build.IMAGE_SIZE, build.IMAGE_SIZE)).astype(np.float32),
-        )
-        f.create_dataset(
-            "image_ivar",
-            data=rng.uniform(0.1, 10, (n_rows, n_filters, build.IMAGE_SIZE, build.IMAGE_SIZE)).astype(np.float32),
-        )
-        f.create_dataset(
-            "image_mask",
-            data=rng.integers(0, 2, (n_rows, n_filters, build.IMAGE_SIZE, build.IMAGE_SIZE), dtype=np.uint8).astype(bool),
-        )
-        f.create_dataset(
-            "image_psf_fwhm",
-            data=rng.uniform(0.03, 0.15, (n_rows, n_filters)).astype(np.float32),
-        )
-        f.create_dataset(
-            "image_scale",
-            data=np.full((n_rows, n_filters), 0.04, dtype=np.float32),
-        )
-        for feat in build.FLOAT_FEATURES:
-            f.create_dataset(feat, data=rng.uniform(0, 1, n_rows).astype(np.float32))
+def _write_image(path: str, value: float) -> None:
+    fits.PrimaryHDU(np.full((128, 128), value, dtype=np.float32), header=_make_wcs_header()).writeto(path, overwrite=True)
+
+
+def _write_catalog(path: str) -> None:
+    cat = Table({
+        "id": np.array([1, 2], dtype=np.int64),
+        "ra": np.array([150.0, 150.0001], dtype=np.float64),
+        "dec": np.array([2.0, 2.0001], dtype=np.float64),
+        "mag_auto": np.array([26.0, 26.5], dtype=np.float32),
+        "flux_radius": np.array([1.0, 1.1], dtype=np.float32),
+        "flux_auto": np.array([2.0, 2.1], dtype=np.float32),
+        "fluxerr_auto": np.array([0.1, 0.1], dtype=np.float32),
+        "cxx_image": np.array([0.2, 0.2], dtype=np.float32),
+        "cyy_image": np.array([0.3, 0.3], dtype=np.float32),
+        "cxy_image": np.array([0.0, 0.0], dtype=np.float32),
+        "f090w_flux_aper_0": np.array([1.0, 1.0], dtype=np.float32),
+        "f115w_flux_aper_0": np.array([1.0, 1.0], dtype=np.float32),
+        "f150w_flux_aper_0": np.array([1.0, 1.0], dtype=np.float32),
+        "f200w_flux_aper_0": np.array([1.0, 1.0], dtype=np.float32),
+    })
+    cat.write(path, format="fits", overwrite=True)
 
 
 @pytest.fixture
 def fake_raw_root(tmp_path):
-    root = str(tmp_path / "jwst")
-    hdf5_path = os.path.join(root, "ceers", "healpix=0", "001-of-001.hdf5")
-    _write_fake_jwst_hdf5(hdf5_path, n_rows=N_ROWS, n_filters=N_FILTERS)
-    return root
+    root = tmp_path / "JWST"
+    mosaic = root / "ceers-full-grizli-v7.0"
+    mosaic.mkdir(parents=True)
+    _write_catalog(str(mosaic / "ceers-full-grizli-v7.0-fix_phot_apcorr.fits"))
+    for filt, val in [("f090w", 1.0), ("f115w", 2.0), ("f150w", 3.0), ("f200w", 4.0)]:
+        _write_image(str(mosaic / f"ceers-full-grizli-v7.0-{filt}-clear_drc_sci.fits.gz"), val)
+        _write_image(str(mosaic / f"ceers-full-grizli-v7.0-{filt}-clear_drc_wht_full.fits.gz"), 10.0)
+    return str(root)
 
 
-class TestConstants:
-    def test_image_size(self):
-        assert build.IMAGE_SIZE == 96
-
-    def test_float_features(self):
-        assert "mag_auto" in build.FLOAT_FEATURES
-        assert "flux_radius" in build.FLOAT_FEATURES
-        assert len(build.FLOAT_FEATURES) == 7
+class TestFindMosaics:
+    def test_find_mosaic_dirs(self, fake_raw_root):
+        mosaics = build.find_mosaic_dirs(fake_raw_root)
+        assert len(mosaics) == 1
+        assert mosaics[0][0] == "ceers-full-grizli-v7.0"
 
 
-class TestFindRawFiles:
-    def test_finds_hdf5(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
+class TestSelection:
+    def test_selection_function(self, fake_raw_root):
+        path = os.path.join(fake_raw_root, "ceers-full-grizli-v7.0", "ceers-full-grizli-v7.0-fix_phot_apcorr.fits")
+        catalog = Table.read(path)
+        mask = build.selection_function(catalog, mag_cut=27.0)
+        assert mask.all()
+
+
+class TestProcessMosaic:
+    def test_process_mosaic(self, fake_raw_root, tmp_path):
+        rows = build.process_mosaic(
+            "ceers-full-grizli-v7.0",
+            os.path.join(fake_raw_root, "ceers-full-grizli-v7.0"),
+            pixel_threshold=32,
+            scratch_dir=str(tmp_path / "scratch"),
+            ra_center=None,
+            dec_center=None,
+            radius=None,
+        )
+        assert rows == 2
+        files = list((tmp_path / "scratch").glob("*.parquet"))
         assert len(files) == 1
-        assert files[0].endswith(".hdf5")
-
-    def test_max_files(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root, max_files=0)
-        assert len(files) == 0
 
 
-class TestReadHdf5:
-    def test_row_count(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_hdf5(files[0])
-        assert table.num_rows == N_ROWS
+class TestMain:
+    def test_main_fake_data(self, fake_raw_root, tmp_path):
+        ret = build.main([
+            "--raw-root", fake_raw_root,
+            "--output-root", str(tmp_path / "out"),
+            "--scratch-dir", str(tmp_path / "scratch"),
+            "--max-files", "1",
+            "--pixel-threshold", "32",
+        ])
+        assert ret == 0
+        hats = list((tmp_path / "out").rglob("hats.properties"))
+        assert hats
 
-    def test_required_columns(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_hdf5(files[0])
-        names = set(table.schema.names)
-        assert {"ra", "dec", "object_id", "image"} <= names
-
-    def test_float_features_present(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_hdf5(files[0])
-        names = set(table.schema.names)
-        for f in build.FLOAT_FEATURES:
-            assert f in names, f"Missing column: {f}"
-
-    def test_object_id_is_string(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_hdf5(files[0])
-        assert table.schema.field("object_id").type == pa.string()
-
-    def test_image_struct_fields(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_hdf5(files[0])
-        img_type = table.schema.field("image").type
-        assert pa.types.is_struct(img_type)
-        field_names = {f.name for f in img_type}
-        assert field_names == {"band", "flux", "ivar", "mask", "psf_fwhm", "scale"}
-
-    def test_image_flux_type(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_hdf5(files[0])
-        img_type = table.schema.field("image").type
-        fields = {f.name: f.type for f in img_type}
-        assert fields["flux"] == pa.list_(pa.list_(pa.list_(pa.float32())))
-
-    def test_image_ivar_type(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_hdf5(files[0])
-        img_type = table.schema.field("image").type
-        fields = {f.name: f.type for f in img_type}
-        assert fields["ivar"] == pa.list_(pa.list_(pa.list_(pa.float32())))
-
-    def test_image_mask_type(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_hdf5(files[0])
-        img_type = table.schema.field("image").type
-        fields = {f.name: f.type for f in img_type}
-        assert fields["mask"] == pa.list_(pa.list_(pa.list_(pa.bool_())))
-
-    def test_image_roundtrip_shape(self, fake_raw_root):
-        """image[0].flux must decode to (N_FILTERS, IMAGE_SIZE, IMAGE_SIZE)."""
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_hdf5(files[0])
-        first = table.column("image")[0].as_py()
-        assert len(first["band"]) == N_FILTERS
-        # Bands should be decoded strings
-        assert first["band"][0] == "f090w"
-        flux = np.asarray(first["flux"], dtype=np.float32)
-        assert flux.shape == (N_FILTERS, build.IMAGE_SIZE, build.IMAGE_SIZE)
-        mask = np.asarray(first["mask"])
-        assert mask.dtype == bool
-        assert mask.shape == (N_FILTERS, build.IMAGE_SIZE, build.IMAGE_SIZE)
-
-    def test_image_psf_scale_length(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table = build.read_hdf5(files[0])
-        first = table.column("image")[0].as_py()
-        assert len(first["psf_fwhm"]) == N_FILTERS
-        assert len(first["scale"]) == N_FILTERS
-
-    def test_cone_all_inside(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        table_all = build.read_hdf5(files[0])
-        table_cone = build.read_hdf5(files[0], ra_center=0.0, dec_center=0.0, radius=180.0)
-        assert table_cone.num_rows == table_all.num_rows
-
-    def test_cone_all_outside(self, fake_raw_root):
-        files = build.find_raw_files(fake_raw_root)
-        result = build.read_hdf5(files[0], ra_center=42.0, dec_center=85.0, radius=0.0001)
-        assert result is None or result.num_rows < N_ROWS
-
-    def test_ngdeep_six_filters(self, tmp_path):
-        """Six-filter files (ngdeep uses f115w-f444w, no f090w) should parse correctly."""
-        hdf5_path = str(tmp_path / "ngdeep" / "healpix=0" / "001-of-001.hdf5")
-        _write_fake_jwst_hdf5(hdf5_path, n_rows=4, n_filters=6)
-        table = build.read_hdf5(hdf5_path)
-        first = table.column("image")[0].as_py()
-        assert len(first["band"]) == 6
-        flux = np.asarray(first["flux"], dtype=np.float32)
-        assert flux.shape == (6, build.IMAGE_SIZE, build.IMAGE_SIZE)
+    def test_missing_raw(self, tmp_path):
+        ret = build.main([
+            "--raw-root", str(tmp_path / "missing"),
+            "--output-root", str(tmp_path / "out"),
+            "--scratch-dir", str(tmp_path / "scratch"),
+        ])
+        assert ret == 1
