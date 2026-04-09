@@ -213,17 +213,20 @@ def process_mosaic(mosaic_name: str, mosaic_dir: str, pixel_threshold: int, scra
     for filt in available_filters:
         sci_hdu = fits.open(_sci_path(mosaic_dir, mosaic_name, filt))
         ivar_path = _wht_full_path(mosaic_dir, mosaic_name, filt)
+        ivar_mode = "full"
         if not os.path.exists(ivar_path):
             if os.path.exists(_wht_path(mosaic_dir, mosaic_name, filt)) and os.path.exists(_exp_path(mosaic_dir, mosaic_name, filt)):
                 ivar_path = build_total_inverse_variance(mosaic_name, filt, mosaic_dir)
+                ivar_mode = "full"
             else:
-                continue
-        ivar_hdu = fits.open(ivar_path)
+                ivar_mode = "synthetic"
+        ivar_hdu = fits.open(ivar_path) if ivar_mode == "full" else None
         wcs = WCS(sci_hdu[0].header)
         pix_scale = float(round(np.sqrt(np.linalg.det(np.abs(wcs.pixel_scale_matrix))) * 3600, 4))
         images[filt] = {
             "sci": sci_hdu[0],
-            "ivar": ivar_hdu[0],
+            "ivar": ivar_hdu[0] if ivar_hdu is not None else None,
+            "ivar_mode": ivar_mode,
             "wcs": wcs,
             "pix_scale": pix_scale,
         }
@@ -253,14 +256,17 @@ def process_mosaic(mosaic_name: str, mosaic_dir: str, pixel_threshold: int, scra
                 mode="partial",
                 fill_value=0,
             ).data
-            cutout_ivar = Cutout2D(
-                to_native_endian(np.asarray(img["ivar"].data, dtype=np.float32)),
-                (x, y),
-                (IMAGE_SIZE, IMAGE_SIZE),
-                wcs=img["wcs"],
-                mode="partial",
-                fill_value=0,
-            ).data
+            if img["ivar"] is not None:
+                cutout_ivar = Cutout2D(
+                    to_native_endian(np.asarray(img["ivar"].data, dtype=np.float32)),
+                    (x, y),
+                    (IMAGE_SIZE, IMAGE_SIZE),
+                    wcs=img["wcs"],
+                    mode="partial",
+                    fill_value=0,
+                ).data
+            else:
+                cutout_ivar = np.ones_like(cutout_flux, dtype=np.float32)
             cutout_flux = np.nan_to_num(cutout_flux).astype(np.float32)
             cutout_ivar = np.nan_to_num(cutout_ivar).astype(np.float32)
             flux_stack.append(cutout_flux)
@@ -290,7 +296,8 @@ def process_mosaic(mosaic_name: str, mosaic_dir: str, pixel_threshold: int, scra
 
     for img in images.values():
         img["sci"]._file.close()
-        img["ivar"]._file.close()
+        if img["ivar"] is not None:
+            img["ivar"]._file.close()
 
     if not records:
         return 0

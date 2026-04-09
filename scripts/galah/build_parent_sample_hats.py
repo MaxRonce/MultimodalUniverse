@@ -83,7 +83,9 @@ CATALOG_KEY_MAP = {
 
 
 def _dr3_root(raw_root: str) -> str:
-    return raw_root
+    if os.path.basename(os.path.normpath(raw_root)) == "dr3":
+        return raw_root
+    return os.path.join(raw_root, "dr3")
 
 
 def _allspec_path(raw_root: str) -> str:

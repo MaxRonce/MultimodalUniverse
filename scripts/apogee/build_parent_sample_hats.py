@@ -67,7 +67,7 @@ FLOAT_FEATURE_MAP = {
 
 
 def _catalog_path(raw_root: str) -> str:
-    return os.path.join(
+    direct = os.path.join(
         raw_root,
         "spectro",
         "aspcap",
@@ -75,6 +75,21 @@ def _catalog_path(raw_root: str) -> str:
         "synspec_rev1",
         "allStar-dr17-synspec_rev1.fits",
     )
+    if os.path.exists(direct):
+        return direct
+
+    sibling_v2 = os.path.join(
+        os.path.dirname(raw_root),
+        "apogee_v2",
+        "spectro",
+        "aspcap",
+        "dr17",
+        "synspec_rev1",
+        "allStar-dr17-synspec_rev1.fits",
+    )
+    if os.path.exists(sibling_v2):
+        return sibling_v2
+    return direct
 
 
 def _visit_path(raw_root: str, field: str, telescope: str, filename: str) -> str:
