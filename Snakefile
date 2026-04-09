@@ -477,22 +477,6 @@ rule build_tess:
         "{params.cmd}"
 
 
-rule build_ssl_legacysurvey:
-    output:
-        marker = catalog_marker("ssl_legacysurvey"),
-    input:
-        script = build_script("ssl_legacysurvey"),
-    params:
-        cmd = build_command("ssl_legacysurvey"),
-    resources:
-        mem_mb = 750_000,
-        runtime = 2880,           # 48h — ~10 TB image cube I/O
-        cpus_per_task = 96,
-        slurm_partition = SLURM_PARTITION,
-    shell:
-        "{params.cmd}"
-
-
 rule build_foundation:
     output:
         marker = catalog_marker("foundation"),
