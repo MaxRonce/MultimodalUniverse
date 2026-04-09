@@ -25,6 +25,7 @@ import argparse
 import os
 import shutil
 import sys
+import urllib.request
 from multiprocessing import Pool
 
 import numpy as np
@@ -92,6 +93,10 @@ def _catalog_path(raw_root: str) -> str:
     return direct
 
 
+def _default_cache_root() -> str:
+    return os.path.expanduser("~/Library/Caches/mmu_apogee_raw")
+
+
 def _visit_path(raw_root: str, field: str, telescope: str, filename: str) -> str:
     return os.path.join(
         raw_root,
@@ -126,14 +131,50 @@ def _masked_str(column) -> np.ndarray:
     return np.ma.asarray(column).filled("").astype(str)
 
 
-def load_catalog(raw_root: str) -> Table:
+def _download_file(url: str, local_path: str) -> str:
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    if not os.path.exists(local_path):
+        urllib.request.urlretrieve(url, local_path)
+    return local_path
+
+
+def ensure_catalog_path(raw_root: str, cache_root: str) -> str:
     path = _catalog_path(raw_root)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing APOGEE catalog: {path}")
+    if os.path.exists(path):
+        return path
+    filename = "allStar-dr17-synspec_rev1.fits"
+    url = f"https://data.sdss.org/sas/dr17/apogee/spectro/aspcap/dr17/synspec_rev1/{filename}"
+    cache_path = os.path.join(cache_root, "spectro", "aspcap", "dr17", "synspec_rev1", filename)
+    return _download_file(url, cache_path)
+
+
+def ensure_visit_path(raw_root: str, field: str, telescope: str, filename: str, cache_root: str) -> str:
+    path = _visit_path(raw_root, field, telescope, filename)
+    if os.path.exists(path):
+        return path
+    url = f"https://data.sdss.org/sas/dr17/apogee/spectro/redux/dr17/stars/{telescope}/{field}/{filename}"
+    cache_path = os.path.join(cache_root, "spectro", "redux", "dr17", "stars", telescope, str(field), filename)
+    return _download_file(url, cache_path)
+
+
+def ensure_continuum_path(raw_root: str, field: str, telescope: str, apogee_id: str, cache_root: str) -> str:
+    filename = f"aspcapStar-dr17-{apogee_id}.fits"
+    path = _continuum_path(raw_root, field, telescope, apogee_id)
+    if os.path.exists(path):
+        return path
+    url = f"https://data.sdss.org/sas/dr17/apogee/spectro/aspcap/dr17/synspec_rev1/{telescope}/{field}/{filename}"
+    cache_path = os.path.join(cache_root, "spectro", "aspcap", "dr17", "synspec_rev1", telescope, str(field), filename)
+    return _download_file(url, cache_path)
+
+
+def load_catalog(raw_root: str, cache_root: str | None = None) -> Table:
+    cache_root = cache_root or _default_cache_root()
+    path = ensure_catalog_path(raw_root, cache_root)
     return Table.read(path, hdu=1)
 
 
-def selection_mask(catalog: Table, raw_root: str) -> np.ndarray:
+def selection_mask(catalog: Table, raw_root: str, cache_root: str | None = None) -> np.ndarray:
+    cache_root = cache_root or _default_cache_root()
     telescope = _masked_str(catalog["TELESCOPE"])
     filename = _masked_str(catalog["FILE"])
     field = _masked_str(catalog["FIELD"])
@@ -151,9 +192,12 @@ def selection_mask(catalog: Table, raw_root: str) -> np.ndarray:
 
     existing = np.zeros(len(catalog), dtype=bool)
     for i in np.where(mask)[0]:
-        visit = _visit_path(raw_root, field[i], telescope[i], filename[i])
-        continuum = _continuum_path(raw_root, field[i], telescope[i], apogee_id[i])
-        existing[i] = os.path.exists(visit) and os.path.exists(continuum)
+        try:
+            visit = ensure_visit_path(raw_root, field[i], telescope[i], filename[i], cache_root)
+            continuum = ensure_continuum_path(raw_root, field[i], telescope[i], apogee_id[i], cache_root)
+            existing[i] = os.path.exists(visit) and os.path.exists(continuum)
+        except OSError:
+            existing[i] = False
     mask &= existing
     return mask
 
@@ -196,11 +240,15 @@ def _read_visit_and_continuum(visit_path: str, continuum_path: str) -> dict[str,
     }
 
 
-def _row_to_record(args: tuple[int, dict[str, str], str]) -> dict | None:
-    idx, row, raw_root = args
+def _row_to_record(args: tuple[int, dict[str, str], str] | tuple[int, dict[str, str], str, str]) -> dict | None:
+    if len(args) == 3:
+        idx, row, raw_root = args
+        cache_root = _default_cache_root()
+    else:
+        idx, row, raw_root, cache_root = args
     try:
-        visit_path = _visit_path(raw_root, row["FIELD"], row["TELESCOPE"], row["FILE"])
-        continuum_path = _continuum_path(raw_root, row["FIELD"], row["TELESCOPE"], row["APOGEE_ID"])
+        visit_path = ensure_visit_path(raw_root, row["FIELD"], row["TELESCOPE"], row["FILE"], cache_root)
+        continuum_path = ensure_continuum_path(raw_root, row["FIELD"], row["TELESCOPE"], row["APOGEE_ID"], cache_root)
         spectrum = _read_visit_and_continuum(visit_path, continuum_path)
     except (OSError, FileNotFoundError, KeyError, IndexError, ValueError) as exc:
         print(
@@ -280,18 +328,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--pixel-threshold", type=int, default=8192)
     parser.add_argument("--scratch-dir", default=None)
+    parser.add_argument("--cache-root", default=None)
     parser.add_argument("--ra-center", type=float, default=None)
     parser.add_argument("--dec-center", type=float, default=None)
     parser.add_argument("--radius", type=float, default=None)
     args = parser.parse_args(argv)
 
+    cache_root = args.cache_root or _default_cache_root()
+    os.makedirs(cache_root, exist_ok=True)
+
     try:
-        catalog = load_catalog(args.raw_root)
+        catalog = load_catalog(args.raw_root, cache_root)
     except FileNotFoundError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    mask = selection_mask(catalog, args.raw_root)
+    mask = selection_mask(catalog, args.raw_root, cache_root)
     catalog = catalog[mask]
 
     if args.ra_center is not None and args.dec_center is not None and args.radius is not None:
@@ -328,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
 
     shard_idx = 0
     pending: list[dict] = []
-    work = [(i, row_dicts[i], args.raw_root) for i in range(len(row_dicts))]
+    work = [(i, row_dicts[i], args.raw_root, cache_root) for i in range(len(row_dicts))]
     iterator = Pool(args.num_processes).imap_unordered(_row_to_record, work) if args.num_processes > 1 else map(_row_to_record, work)
 
     if args.num_processes > 1:
