@@ -149,3 +149,13 @@ class TestConeBoundingBox:
         assert ra_min == 0.0
         assert ra_max == 360.0
         assert dec_max == 90.0
+
+    def test_wide_equatorial_cone_returns_full_ra(self):
+        """A cone wide enough that Δra = radius/cos(|dec|) exceeds 180°
+        should return the full RA range instead of a bogus wraparound
+        interval that would silently drop real data."""
+        ra_min, ra_max, dec_min, dec_max = cone_bounding_box(0.0, 0.0, 80.0)
+        assert ra_min == 0.0
+        assert ra_max == 360.0
+        assert dec_min == -80.0
+        assert dec_max == 80.0

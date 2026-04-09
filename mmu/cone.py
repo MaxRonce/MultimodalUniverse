@@ -130,6 +130,12 @@ def cone_bounding_box(
     if cos_d < 1e-6:
         return 0.0, 360.0, dec_min, dec_max
     d_ra = radius / cos_d
+    # A wide cone near the equator can blow Δra past 180° even though the
+    # cone itself doesn't touch a pole. In that case the cone already
+    # covers the whole RA circle; return the full range rather than a
+    # bogus wraparound interval that would silently drop real data.
+    if d_ra >= 180.0:
+        return 0.0, 360.0, dec_min, dec_max
     ra_min = (ra_center - d_ra) % 360.0
     ra_max = (ra_center + d_ra) % 360.0
     return ra_min, ra_max, dec_min, dec_max
