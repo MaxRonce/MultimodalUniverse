@@ -825,27 +825,32 @@ def main(argv: list[str] | None = None) -> int:
             total = 0
             n_written = 0
             n_total = len(work)
+            sweep_start = time.time()
 
             def _report(i: int, result: tuple) -> None:
+                nonlocal sweep_start
                 basename, n_cat, n_cut, err = result
+                elapsed = time.time() - sweep_start
+                sweep_start = time.time()
                 # `err` is now a WARNING summary if the sweep had some bad
                 # bricks but also some good ones (n_cut > 0). The sweep is
                 # NOT skipped in that case; we still write its good-brick
                 # parquet. Only skip logging when n_cut == 0 AND err is set.
                 if err and n_cut == 0:
                     print(f"[shard {args.shard_idx}] [{i}/{n_total}] {basename}: "
-                          f"SKIPPED {err}", file=sys.stderr, flush=True)
+                          f"SKIPPED {err} ({elapsed:.0f}s)", file=sys.stderr, flush=True)
                     return
                 if err:
                     print(f"[shard {args.shard_idx}] [{i}/{n_total}] {basename}: "
-                          f"{n_cat} cat rows → {n_cut} cutouts (WARN: {err})",
-                          file=sys.stderr, flush=True)
+                          f"{n_cat} cat rows → {n_cut} cutouts ({elapsed:.0f}s) "
+                          f"(WARN: {err})", file=sys.stderr, flush=True)
                     return
                 if n_cut == 0:
-                    # Quiet: many DR10 sweeps are full rejects (no i-band).
                     return
+                rate = n_cut / elapsed if elapsed > 0 else 0
                 print(f"[shard {args.shard_idx}] [{i}/{n_total}] {basename}: "
-                      f"{n_cat} cat rows → {n_cut} cutouts", flush=True)
+                      f"{n_cat} cat rows → {n_cut} cutouts in {elapsed:.0f}s "
+                      f"({rate:.1f} cutouts/s)", flush=True)
 
             if args.num_processes > 1 and n_total > 1:
                 with Pool(args.num_processes) as pool:
