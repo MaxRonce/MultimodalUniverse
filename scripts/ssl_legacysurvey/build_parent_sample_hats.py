@@ -51,15 +51,23 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import shutil
 import sys
+from multiprocessing import Pool
 
 import h5py
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from mmu.cone import apply_cone_filter
 from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
-from mmu.hats_import import to_native_endian, write_hats
+from mmu.hats_import import (
+    default_scratch_dir,
+    to_native_endian,
+    write_hats,
+    write_hats_from_parquet_dir,
+)
 
 
 CATALOG_NAME = "ssl_legacysurvey"
@@ -227,6 +235,36 @@ def read_chunk(
     return pa.table(columns)
 
 
+def _process_chunk_to_parquet(args: tuple) -> tuple[str, int, str | None]:
+    """Pool worker: read one h5 chunk, build a parquet shard under ``scratch``.
+
+    Input tuple: ``(chunk_path, scratch, max_rows, ra_center, dec_center, radius)``
+    Returns ``(basename, n_rows_written, err)``. Skips chunks already on disk.
+    All exceptions caught and stringified so one bad chunk doesn't kill the pool.
+    """
+    chunk_path, scratch, max_rows, ra_center, dec_center, radius = args
+    basename = os.path.basename(chunk_path)
+    out_path = os.path.join(scratch, f"part-{basename}.parquet")
+    if os.path.exists(out_path):
+        return basename, 0, None
+    try:
+        table = read_chunk(
+            chunk_path,
+            max_rows=max_rows,
+            ra_center=ra_center,
+            dec_center=dec_center,
+            radius=radius,
+        )
+        if table is None:
+            return basename, 0, None
+        pq.write_table(table, out_path)
+        n = table.num_rows
+        del table
+        return basename, n, None
+    except BaseException as exc:  # noqa: BLE001
+        return basename, 0, f"{type(exc).__name__}: {exc}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-root", default=DATASETS[CATALOG_NAME].raw_path,
@@ -238,46 +276,131 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-rows-per-file", type=int, default=None,
                         help="Cap rows read PER chunk (useful when chunks are very large).")
     parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--num-processes", type=int, default=8,
+                        help="Per-shard multiprocessing.Pool size. Default 8 because "
+                             "each h5 chunk holds ~1M rows × (3,152,152) f32 ≈ 270 MB "
+                             "in memory; 8 workers × 270 MB ≈ 2 GB peak, well under "
+                             "the per-shard mem budget.")
+    parser.add_argument("--scratch-dir", default=None,
+                        help="Shared ceph scratch directory for per-chunk parquet "
+                             "files. REQUIRED in sharded mode (--num-shards>1 / "
+                             "--skip-ingest / --only-ingest). Single-job mode auto-"
+                             "generates a pid-namespaced dir that's wiped on exit.")
+    parser.add_argument("--shard-idx", type=int, default=0,
+                        help="This shard's stride offset (0..num-shards-1).")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Total number of shards.")
+    parser.add_argument("--skip-ingest", action="store_true",
+                        help="Only write per-chunk parquet shards.")
+    parser.add_argument("--only-ingest", action="store_true",
+                        help="Skip build phase; run only write_hats_from_parquet_dir.")
+    parser.add_argument("--ingest-workers", type=int, default=8,
+                        help="Dask workers for the ingest step.")
     parser.add_argument("--ra-center", type=float, default=None)
     parser.add_argument("--dec-center", type=float, default=None)
     parser.add_argument("--radius", type=float, default=None,
                         help="Cone radius in degrees; requires --ra-center/--dec-center.")
     args = parser.parse_args(argv)
 
-    files = find_raw_files(args.raw_root, max_files=args.max_files)
-    if not files:
-        print(f"ERROR: no images_npix152_*.h5 under {args.raw_root}", file=sys.stderr)
-        return 1
-    print(f"Found {len(files)} ssl_legacysurvey chunk(s)")
+    if args.skip_ingest and args.only_ingest:
+        print("ERROR: --skip-ingest and --only-ingest are mutually exclusive",
+              file=sys.stderr)
+        return 2
+    if args.shard_idx < 0 or args.shard_idx >= args.num_shards:
+        print(f"ERROR: shard-idx {args.shard_idx} outside [0, {args.num_shards})",
+              file=sys.stderr)
+        return 2
 
-    tables: list[pa.Table] = []
-    total = 0
-    for i, p in enumerate(files, 1):
-        t = read_chunk(
-            p,
-            max_rows=args.max_rows_per_file,
-            ra_center=args.ra_center,
-            dec_center=args.dec_center,
-            radius=args.radius,
+    sharded_mode = args.num_shards > 1 or args.skip_ingest or args.only_ingest
+    if sharded_mode and args.scratch_dir is None:
+        print("ERROR: --scratch-dir is required in sharded mode", file=sys.stderr)
+        return 2
+
+    scratch = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
+    os.makedirs(scratch, exist_ok=True)
+
+    try:
+        # ----------------------------------------------------------------- #
+        # Build phase: write per-chunk parquet shards.
+        # ----------------------------------------------------------------- #
+        if not args.only_ingest:
+            files = find_raw_files(args.raw_root, max_files=args.max_files)
+            if not files:
+                print(f"ERROR: no images_npix152_*.h5 under {args.raw_root}",
+                      file=sys.stderr)
+                return 1
+            print(f"[shard {args.shard_idx}/{args.num_shards}] "
+                  f"Found {len(files)} ssl_legacysurvey chunk(s)", flush=True)
+
+            if args.num_shards > 1:
+                files = files[args.shard_idx::args.num_shards]
+                print(f"[shard {args.shard_idx}] my stride: {len(files)} chunk(s)",
+                      flush=True)
+
+            print(f"[shard {args.shard_idx}] streaming per-chunk parquet to {scratch}",
+                  flush=True)
+
+            work = [
+                (p, scratch, args.max_rows_per_file, args.ra_center,
+                 args.dec_center, args.radius)
+                for p in files
+            ]
+            n_total = len(work)
+            n_written = 0
+            total = 0
+
+            if args.num_processes > 1 and n_total > 1:
+                with Pool(args.num_processes) as pool:
+                    for i, (basename, n, err) in enumerate(
+                        pool.imap_unordered(_process_chunk_to_parquet, work), 1
+                    ):
+                        if err:
+                            print(f"[shard {args.shard_idx}] [{i}/{n_total}] "
+                                  f"{basename}: SKIPPED {err}",
+                                  file=sys.stderr, flush=True)
+                            continue
+                        if n > 0:
+                            n_written += 1
+                            total += n
+                        print(f"[shard {args.shard_idx}] [{i}/{n_total}] "
+                              f"{basename}: {n} objects", flush=True)
+            else:
+                for i, item in enumerate(work, 1):
+                    basename, n, err = _process_chunk_to_parquet(item)
+                    if err:
+                        print(f"[shard {args.shard_idx}] [{i}/{n_total}] "
+                              f"{basename}: SKIPPED {err}",
+                              file=sys.stderr, flush=True)
+                        continue
+                    if n > 0:
+                        n_written += 1
+                        total += n
+                    print(f"[shard {args.shard_idx}] [{i}/{n_total}] "
+                          f"{basename}: {n} objects", flush=True)
+
+            print(f"[shard {args.shard_idx}] BUILD DONE: {n_written} chunks, "
+                  f"{total} total rows", flush=True)
+
+        # ----------------------------------------------------------------- #
+        # Ingest phase.
+        # ----------------------------------------------------------------- #
+        if args.skip_ingest:
+            return 0
+
+        print(f"Ingesting {scratch} → HATS catalog (workers={args.ingest_workers})",
+              flush=True)
+        catalog_dir = write_hats_from_parquet_dir(
+            scratch,
+            output_path=args.output_root,
+            catalog_name=CATALOG_NAME,
+            pixel_threshold=args.pixel_threshold,
+            n_workers=args.ingest_workers,
+            debug=False,
         )
-        if t is None:
-            continue
-        tables.append(t)
-        total += t.num_rows
-        print(f"  [{i}/{len(files)}] {os.path.basename(p)}: {t.num_rows} objects")
-
-    if not tables:
-        print("ERROR: no rows survived the cone cut", file=sys.stderr)
-        return 1
-
-    print(f"\nWriting HATS catalog: {total} rows from {len(tables)} chunks")
-    catalog_dir = write_hats(
-        tables,
-        output_path=args.output_root,
-        catalog_name=CATALOG_NAME,
-        pixel_threshold=args.pixel_threshold,
-    )
-    print(f"Done: {catalog_dir}")
+        print(f"Done: {catalog_dir}", flush=True)
+    finally:
+        if args.scratch_dir is None and not sharded_mode:
+            shutil.rmtree(scratch, ignore_errors=True)
     return 0
 
 
