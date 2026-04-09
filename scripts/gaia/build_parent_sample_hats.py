@@ -206,10 +206,14 @@ def _process_shard_to_parquet(args: tuple) -> tuple[str, int, str | None]:
         )
         if t is None:
             return name, 0, None
-        pq.write_table(t, out_path)
+        tmp_path = out_path + ".tmp"
+        pq.write_table(t, tmp_path)
+        os.rename(tmp_path, out_path)
         n = t.num_rows
         del t
         return name, n, None
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except BaseException as exc:  # noqa: BLE001
         return name, 0, f"{type(exc).__name__}: {exc}"
 
