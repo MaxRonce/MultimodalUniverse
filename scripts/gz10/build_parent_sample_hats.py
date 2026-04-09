@@ -91,7 +91,7 @@ def read_table(
     band_arr = pa.array([BANDS] * n_rows, type=pa.list_(pa.string()))
     # Nested list: list<list<list<uint8>>> with shape (N_BANDS, H, W)
     array_nested = [[[list(row) for row in images[i, c]] for c in range(N_BANDS)] for i in range(n_rows)]
-    array_arr = pa.array(array_nested, type=pa.list_(pa.list_(pa.list_(pa.uint8()))))
+    array_arr = pa.array(array_nested, type=pa.large_list(pa.large_list(pa.large_list(pa.uint8()))))
     scale_arr = pa.array(
         [[float(pxscale[i])] * N_BANDS for i in range(n_rows)],
         type=pa.list_(pa.float32()),

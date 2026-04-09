@@ -149,7 +149,7 @@ def read_split(
     # images shape: (n_rows, 63, 63, 3) → transpose to (n_rows, 3, 63, 63)
     images_chf = images.transpose(0, 3, 1, 2)
     array_nested = [[[list(row) for row in images_chf[i, v]] for v in range(3)] for i in range(n_rows)]
-    array_arr = pa.array(array_nested, type=pa.list_(pa.list_(pa.list_(pa.float32()))))
+    array_arr = pa.array(array_nested, type=pa.large_list(pa.large_list(pa.large_list(pa.float32()))))
     scale_arr = pa.array([[PIXEL_SCALE] * 3] * n_rows, type=pa.list_(pa.float32()))
     image_col = pa.StructArray.from_arrays(
             [_as_array(a) for a in [band_arr, view_arr, array_arr, scale_arr]],
