@@ -171,6 +171,11 @@ SLURM_PARTITION = _resolve("slurm_partition", "ccm")
 SHARDED_SLURM_PARTITION = _resolve("sharded_slurm_partition", SLURM_PARTITION)
 
 
+def slurm_qos(partition: str) -> str:
+    """Return the required QoS string for a partition, or empty string."""
+    return "preempt" if partition == "preempt" else ""
+
+
 # --------------------------------------------------------------------------- #
 #                         SCATTER/GATHER SHARDED BUILDS                        #
 # --------------------------------------------------------------------------- #
@@ -342,7 +347,7 @@ rule build_sharded_shard:
         runtime = lambda w: SHARDED_DATASETS[w.shard_name]["build_runtime_min"],
         cpus_per_task = 96,
         slurm_partition = SHARDED_SLURM_PARTITION,
-        qos = "preempt" if SHARDED_SLURM_PARTITION == "preempt" else None,
+        qos = slurm_qos(SHARDED_SLURM_PARTITION),
     shell:
         "mkdir -p {params.scratch} && "
         "python -u -m scripts.{wildcards.shard_name}.build_parent_sample_hats "
@@ -388,6 +393,7 @@ for _name, _cfg in SHARDED_DATASETS.items():
             # up. Scatter shards are preemptible because they're idempotent
             # and cheap to requeue.
             slurm_partition = SLURM_PARTITION,
+            qos = slurm_qos(SLURM_PARTITION),
         shell:
             "python -u -m scripts.{params.name}.build_parent_sample_hats "
             "--scratch-dir {params.scratch} "
@@ -415,6 +421,7 @@ rule build_allwise:
         runtime = 480,            # minutes (8h)
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -431,6 +438,7 @@ rule build_apogee:
         runtime = 1440,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -447,6 +455,7 @@ rule build_sdss:
         runtime = 1440,           # 24h
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -463,6 +472,7 @@ rule build_twomass:
         runtime = 480,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -479,6 +489,7 @@ rule build_sages:
         runtime = 240,            # 4h
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -495,6 +506,7 @@ rule build_galex:
         runtime = 480,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -511,6 +523,7 @@ rule build_galah:
         runtime = 1440,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -527,6 +540,7 @@ rule build_jwst:
         runtime = 1440,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -543,6 +557,7 @@ rule build_gz10:
         runtime = 480,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -559,6 +574,7 @@ rule build_btsbot:
         runtime = 480,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -578,6 +594,7 @@ rule build_desi_provabgs:
         runtime = 480,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -594,6 +611,7 @@ rule build_tess:
         runtime = 1440,           # 24h — opens 160k single-LC FITS serially
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -610,6 +628,7 @@ rule build_foundation:
         runtime = 60,             # 1h — only ~180 SNANA ASCII files
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -630,6 +649,7 @@ rule build_snls:
         runtime = 60,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -646,6 +666,7 @@ rule build_ps1_sne_ia:
         runtime = 60,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -662,6 +683,7 @@ rule build_des_y3_sne_ia:
         runtime = 60,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
 
@@ -678,5 +700,6 @@ rule build_swift_sne_ia:
         runtime = 60,
         cpus_per_task = 96,
         slurm_partition = SLURM_PARTITION,
+        qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
