@@ -146,13 +146,15 @@ def profile_build(
     os.makedirs(tmp_output, exist_ok=True)
     os.makedirs(tmp_scratch, exist_ok=True)
 
+    main_src = inspect.getsource(mod.main)
+
     argv = [
         "--output-root", tmp_output,
         "--max-files", str(n_sample),
-        "--num-processes", "1",
     ]
-
-    main_src = inspect.getsource(mod.main)
+    # Only pass --num-processes if the script accepts it
+    if "num-processes" in main_src or "num_processes" in main_src:
+        argv += ["--num-processes", "1"]
     has_scratch = "scratch-dir" in main_src or "scratch_dir" in main_src
     if has_scratch:
         argv += ["--scratch-dir", tmp_scratch, "--skip-ingest"]
@@ -249,13 +251,33 @@ def profile_build(
     # Pixel threshold
     recommended_pixel_threshold = 100_000
 
-    # Ceph file count warning
-    estimated_shard_files = n_output_rows * 1000 * 50  # very rough: total_rows * partitions_touched
-    if recommended_pixel_threshold < 10000 and estimated_shard_files > 100_000:
-        warnings.append(
-            f"Estimated ~{estimated_shard_files} intermediate shard files. "
-            f"Ceph MDS will choke. Increase pixel_threshold."
-        )
+    # Gather memory estimation: biggest partition = min(total_estimated_rows, pixel_threshold)
+    # Each row in a partition is held in memory during reduce.
+    if parquets and n_output_rows > 0:
+        avg_parquet_bytes = sum(os.path.getsize(f) for f in parquets) / len(parquets)
+        avg_rows_per_parquet = n_output_rows / len(parquets)
+        bytes_per_row = avg_parquet_bytes / max(avg_rows_per_parquet, 1)
+        # In-memory representation is typically 2-5x larger than parquet (decompression)
+        mem_per_row_mb = bytes_per_row * 3.0 / 1e6  # 3x decompression factor
+        worst_partition_rows = min(recommended_pixel_threshold, n_output_rows * 1000)  # rough total estimate
+        gather_partition_mem_mb = worst_partition_rows * mem_per_row_mb
+        if gather_partition_mem_mb > node_mem_mb / 2:
+            warnings.append(
+                f"GATHER OOM RISK: worst-case partition ({worst_partition_rows} rows × "
+                f"{mem_per_row_mb:.0f} MB/row) = {gather_partition_mem_mb/1000:.0f} GB. "
+                f"Node has {node_mem_mb/1000:.0f} GB. Reduce pixel_threshold or increase workers."
+            )
+
+    # Gather walltime estimation
+    if gather_elapsed and n_output_rows > 0:
+        gather_per_row_sec = gather_elapsed / n_output_rows
+        estimated_total_rows = n_output_rows * 1000  # rough
+        estimated_gather_h = gather_per_row_sec * estimated_total_rows / 3600
+        if estimated_gather_h > 4:
+            warnings.append(
+                f"GATHER SLOW: {gather_per_row_sec:.1f}s/row × ~{estimated_total_rows} rows "
+                f"= ~{estimated_gather_h:.0f}h. Ensure walltime is sufficient."
+            )
 
     return ProfileResult(
         dataset=dataset,
