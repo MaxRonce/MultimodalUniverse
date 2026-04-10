@@ -121,10 +121,15 @@ def _process_shard_to_parquet(args: tuple) -> tuple[str, int, str | None]:
         if table.num_rows == 0:
             return parent, 0, None
         part_name = f"part-{parent}-{seq:05d}.parquet"
-        pq.write_table(table, os.path.join(scratch, part_name))
+        out_path = os.path.join(scratch, part_name)
+        tmp_path = out_path + ".tmp"
+        pq.write_table(table, tmp_path)
+        os.rename(tmp_path, out_path)
         n = table.num_rows
         del table
         return parent, n, None
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except BaseException as exc:  # noqa: BLE001
         return parent, 0, f"{type(exc).__name__}: {exc}"
 
@@ -150,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--pixel-threshold",
         type=int,
-        default=8192,
+        default=100_000,
         help="Max rows per HATS partition.",
     )
     parser.add_argument("--ra-center", type=float, default=None)

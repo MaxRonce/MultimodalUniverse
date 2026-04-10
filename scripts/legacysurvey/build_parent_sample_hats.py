@@ -723,7 +723,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
     parser.add_argument("--max-files", type=int, default=None,
                         help="Cap on number of sweep files to process.")
-    parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--pixel-threshold", type=int, default=100_000)
     parser.add_argument("--num-processes", type=int, default=4,
                         help="Pool size for parallel sweep processing. Each worker "
                              "peaks at ~240 GB during build_table (3x copy). Default 4 "

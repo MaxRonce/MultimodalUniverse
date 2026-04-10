@@ -329,10 +329,15 @@ def _process_shard_pair_to_parquet(args: tuple) -> tuple[str, int, str | None]:
         if t is None:
             return name, 0, None
         part_name = name.replace(".hdf5", ".parquet")
-        pq.write_table(t, os.path.join(scratch, part_name))
+        out_path = os.path.join(scratch, part_name)
+        tmp_path = out_path + ".tmp"
+        pq.write_table(t, tmp_path)
+        os.rename(tmp_path, out_path)
         n = t.num_rows
         del t
         return name, n, None
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except BaseException as exc:  # noqa: BLE001
         return name, 0, f"{type(exc).__name__}: {exc}"
 
@@ -343,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
     parser.add_argument("--max-files", type=int, default=None,
                         help="Cap on number of (source, xp) shard pairs to process.")
-    parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--pixel-threshold", type=int, default=100_000)
     parser.add_argument("--ra-center", type=float, default=None)
     parser.add_argument("--dec-center", type=float, default=None)
     parser.add_argument("--radius", type=float, default=None,

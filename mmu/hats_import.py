@@ -121,7 +121,7 @@ def write_hats(
     output_path: str,
     catalog_name: str,
     *,
-    pixel_threshold: int = 8192,
+    pixel_threshold: int = 100_000,
     lowest_healpix_order: int = 4,
     margin_threshold_arcsec: float = 10.0,
     n_workers: int = 32,
@@ -188,7 +188,7 @@ def write_hats_from_parquet_dir(
     output_path: str,
     catalog_name: str,
     *,
-    pixel_threshold: int = 8192,
+    pixel_threshold: int = 100_000,
     lowest_healpix_order: int = 4,
     margin_threshold_arcsec: float = 10.0,
     chunksize: int = 500_000,
@@ -244,6 +244,19 @@ def write_hats_from_parquet_dir(
         raise FileNotFoundError(
             f"no *.parquet files under {parquet_dir} (recursive search)"
         )
+
+    # Clean stale output from a previous failed gather. hats-import's
+    # Finishing stage scans the entire dataset/ dir for parquet files; if
+    # a prior run left partial output at a different pixel_threshold, the
+    # row counts won't match and the pipeline errors with a cryptic
+    # "Number of rows does not match expectation" ValueError.
+    inner_catalog = os.path.join(output_path, catalog_name, catalog_name)
+    if os.path.isdir(inner_catalog):
+        LOGGER.warning(
+            "Cleaning stale output dir %s from a previous failed gather",
+            inner_catalog,
+        )
+        shutil.rmtree(inner_catalog)
 
     tmp_dir = tempfile.mkdtemp(prefix=f"hats_import_{catalog_name}_")
     try:
