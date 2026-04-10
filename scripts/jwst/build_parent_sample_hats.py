@@ -309,15 +309,15 @@ def process_mosaic(mosaic_name: str, mosaic_dir: str, pixel_threshold: int, scra
     band_arr = pa.array([r["image_band"] for r in records], type=pa.list_(pa.string()))
     flux_arr = pa.array(
         [[[list(row) for row in band] for band in r["image_flux"]] for r in records],
-        type=pa.list_(pa.list_(pa.list_(pa.float32()))),
+        type=pa.large_list(pa.large_list(pa.large_list(pa.float32()))),
     )
     ivar_arr = pa.array(
         [[[list(row) for row in band] for band in r["image_ivar"]] for r in records],
-        type=pa.list_(pa.list_(pa.list_(pa.float32()))),
+        type=pa.large_list(pa.large_list(pa.large_list(pa.float32()))),
     )
     mask_arr = pa.array(
         [[[list(map(bool, row)) for row in band] for band in r["image_mask"]] for r in records],
-        type=pa.list_(pa.list_(pa.list_(pa.bool_()))),
+        type=pa.large_list(pa.large_list(pa.large_list(pa.bool_()))),
     )
     psf_arr = pa.array([r["image_psf_fwhm"].tolist() for r in records], type=pa.list_(pa.float32()))
     scale_arr = pa.array([r["image_scale"].tolist() for r in records], type=pa.list_(pa.float32()))
