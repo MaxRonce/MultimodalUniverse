@@ -61,8 +61,10 @@ MMU v2 stores all datasets as [HATS](https://hats.readthedocs.io/) catalogs (HEA
 from mmu.data import HATSDataset, mmu_collate
 from torch.utils.data import DataLoader
 
-galaxies = HATSDataset("MultimodalUniverse_v2_hats/desi_provabgs/desi_provabgs/desi_provabgs")
-supernovae = HATSDataset("MultimodalUniverse_v2_hats/snls/snls/snls")
+HATS = "path/to/MultimodalUniverse_v2_hats"
+
+galaxies = HATSDataset(f"{HATS}/desi_provabgs/desi_provabgs/desi_provabgs")
+supernovae = HATSDataset(f"{HATS}/snls/snls/snls")
 
 matched = galaxies.crossmatch(supernovae, radius_arcsec=10.0,
                                suffixes=("_galaxy", "_sn"))
@@ -89,8 +91,8 @@ Or use [LSDB](https://lsdb.readthedocs.io/) directly for lazy dask-backed querie
 ```python
 import lsdb
 
-desi = lsdb.read_hats("MultimodalUniverse_v2_hats/desi/desi")
-gaia = lsdb.read_hats("MultimodalUniverse_v2_hats/gaia_xp/gaia_xp")
+desi = lsdb.read_hats(f"{HATS}/desi/desi")
+gaia = lsdb.read_hats(f"{HATS}/gaia_xp/gaia_xp")
 
 df = desi.crossmatch(gaia, radius_arcsec=1.0).compute()
 ```
