@@ -294,3 +294,40 @@ def _python_to_torch(value: T.Any) -> T.Any:
     if value is None:
         return value
     return value
+
+
+def mmu_collate(batch: list[dict]) -> dict:
+    """Custom collate function for ``DataLoader`` that handles the mixed types
+    produced by :func:`_arrow_row_to_torch`.
+
+    PyTorch's ``default_collate`` chokes on strings, ``None``, and numpy
+    object arrays (which arise from variable-length list columns). This
+    collate:
+
+    - Stacks tensors normally (like ``default_collate``)
+    - Collects strings into plain Python lists
+    - Recursively collates nested dicts (from struct columns)
+    - Passes ``None`` through as a list of Nones
+    """
+    keys = batch[0].keys()
+    result = {}
+    for k in keys:
+        values = [d[k] for d in batch]
+        first = values[0]
+        if isinstance(first, torch.Tensor):
+            try:
+                result[k] = torch.stack(values)
+            except (RuntimeError, TypeError):
+                result[k] = values
+        elif isinstance(first, dict):
+            result[k] = mmu_collate(values)
+        elif isinstance(first, (str, type(None))):
+            result[k] = values
+        elif isinstance(first, np.ndarray):
+            try:
+                result[k] = torch.from_numpy(np.stack(values))
+            except (ValueError, TypeError):
+                result[k] = values
+        else:
+            result[k] = values
+    return result
