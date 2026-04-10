@@ -229,6 +229,58 @@ class CrossMatchedHATSDataset(Dataset):
                 result[col] = _python_to_torch(val)
         return result
 
+    def crossmatch(
+        self,
+        other: "HATSDataset",
+        radius_arcsec: float = 1.0,
+        n_neighbors: int = 1,
+        suffixes: tuple[str, str] = ("_left", "_right"),
+        ra_col: str | None = None,
+        dec_col: str | None = None,
+    ) -> "CrossMatchedHATSDataset":
+        """Chain a crossmatch against another HATSDataset.
+
+        The matched DataFrame is converted to a temporary HATS catalog via
+        LSDB so we can run another spatial join. The ``ra_col``/``dec_col``
+        args select which ra/dec columns from the current matched result to
+        use as the spatial key (defaults to the first ``ra*``/``dec*`` column
+        found).
+
+        Args:
+            other: The next HATSDataset to match against.
+            radius_arcsec: Maximum match radius.
+            n_neighbors: Nearest neighbors per object.
+            suffixes: Suffixes for the new match (applied to overlapping cols
+                between the current result and ``other``).
+            ra_col: Which RA column to use from this result. Auto-detected
+                if not given.
+            dec_col: Which Dec column. Auto-detected if not given.
+        """
+        df = self.df.copy()
+
+        if ra_col is None:
+            ra_col = next(c for c in df.columns if c.startswith("ra"))
+        if dec_col is None:
+            dec_col = next(c for c in df.columns if c.startswith("dec"))
+
+        # Rename to plain ra/dec so LSDB can use them as the spatial key
+        df = df.rename(columns={ra_col: "ra", dec_col: "dec"})
+
+        left_cat = lsdb.from_dataframe(
+            df,
+            ra_column="ra",
+            dec_column="dec",
+            threshold=100_000,
+        )
+        result = left_cat.crossmatch(
+            other.lsdb_catalog,
+            n_neighbors=n_neighbors,
+            radius_arcsec=radius_arcsec,
+            suffixes=suffixes,
+        )
+        out_df = result.compute()
+        return CrossMatchedHATSDataset(out_df, suffixes=suffixes)
+
     @property
     def matched_count(self) -> int:
         return len(self.df)

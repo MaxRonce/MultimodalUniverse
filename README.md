@@ -97,21 +97,26 @@ for batch in loader:
     # ... your multimodal model here
 ```
 
-### 3-way crossmatch
+### N-way crossmatch
 
-Chain crossmatches with descriptive suffixes:
+Chain crossmatches — each step adds columns with descriptive suffixes:
 
 ```python
 spectra = HATSDataset("path/to/desi/desi/desi")
 images = HATSDataset("path/to/gz10/gz10/gz10")
 lightcurves = HATSDataset("path/to/tess/tess/tess")
 
-# First match: spectra × images
+# spectra × images
 step1 = spectra.crossmatch(images, radius_arcsec=1.0,
                            suffixes=("_desi", "_gz10"))
 
-# TODO: chain a second crossmatch for 3-way (not yet supported on
-# CrossMatchedHATSDataset — needs wrapping back into HATSDataset)
+# (spectra × images) × lightcurves
+step2 = step1.crossmatch(lightcurves, radius_arcsec=5.0,
+                         suffixes=("", "_tess"))
+
+# Now step2 has columns from all three:
+#   spectrum_desi, image_gz10, lightcurve_tess, ...
+loader = DataLoader(step2, batch_size=32, collate_fn=mmu_collate)
 ```
 
 ### Direct LSDB access (no PyTorch)
