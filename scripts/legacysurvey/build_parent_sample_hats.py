@@ -550,18 +550,18 @@ def _build_image_struct(records: list[dict]) -> pa.StructArray:
 
     flux_arr = pa.array(
         nest_4d([r["image_flux"] for r in records]),
-        type=pa.list_(pa.list_(pa.list_(pa.float32()))),
+        type=pa.large_list(pa.large_list(pa.large_list(pa.float32()))),
     )
     ivar_arr = pa.array(
         nest_4d([r["image_ivar"] for r in records]),
-        type=pa.list_(pa.list_(pa.list_(pa.float32()))),
+        type=pa.large_list(pa.large_list(pa.large_list(pa.float32()))),
     )
     mask_arr = pa.array(
         [
             [[list(row) for row in band_img] for band_img in r["image_mask"]]
             for r in records
         ],
-        type=pa.list_(pa.list_(pa.list_(pa.bool_()))),
+        type=pa.large_list(pa.large_list(pa.large_list(pa.bool_()))),
     )
     psf_arr = pa.array(
         [list(r["image_psf_fwhm"]) for r in records], type=pa.list_(pa.float32())
@@ -582,12 +582,12 @@ def _build_jpeg_column(records: list[dict], key: str) -> pa.Array:
         [[list(row) for row in channel] for channel in r[key]]
         for r in records
     ]
-    return pa.array(nested, type=pa.list_(pa.list_(pa.list_(pa.uint8()))))
+    return pa.array(nested, type=pa.large_list(pa.large_list(pa.large_list(pa.uint8()))))
 
 
 def _build_object_mask_column(records: list[dict]) -> pa.Array:
     nested = [[list(row) for row in r["object_mask"]] for r in records]
-    return pa.array(nested, type=pa.list_(pa.list_(pa.uint8())))
+    return pa.array(nested, type=pa.large_list(pa.large_list(pa.uint8())))
 
 
 def _build_nearby_catalog_struct(records: list[dict]) -> pa.StructArray:
