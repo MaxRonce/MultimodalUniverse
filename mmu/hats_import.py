@@ -112,8 +112,34 @@ def _client_ctx(client: Client | None, n_workers: int, debug: bool):
         kwargs = {"n_workers": 1, "threads_per_worker": 1, "processes": False}
     else:
         kwargs = {"n_workers": n_workers, "threads_per_worker": 1}
-    with Client(**kwargs) as c:
-        yield c
+    with Client(**kwargs, dashboard_address=None) as c:
+        # Log memory pressure periodically so we can see OOM coming
+        import threading
+        import psutil
+
+        def _mem_monitor():
+            proc = psutil.Process()
+            while not _stop_monitor.is_set():
+                mem = proc.memory_info()
+                children_rss = sum(
+                    ch.memory_info().rss for ch in proc.children(recursive=True)
+                )
+                total_gb = (mem.rss + children_rss) / 1e9
+                avail_gb = psutil.virtual_memory().available / 1e9
+                LOGGER.info(
+                    "Memory: process+children=%.1f GB, system_available=%.1f GB",
+                    total_gb, avail_gb,
+                )
+                _stop_monitor.wait(60)  # log every 60s
+
+        _stop_monitor = threading.Event()
+        monitor = threading.Thread(target=_mem_monitor, daemon=True)
+        monitor.start()
+        try:
+            yield c
+        finally:
+            _stop_monitor.set()
+            monitor.join(timeout=5)
 
 
 def write_hats(
