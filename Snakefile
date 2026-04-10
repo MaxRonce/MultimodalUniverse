@@ -82,7 +82,6 @@ PORTED = [
     "desi",      # raw DESI coadd FITS files, merged via desispec.coadd_cameras
     "gz10",      # raw Galaxy10 DECals HDF5
     "tess",      # raw TESS-SPOC FFI lightcurves (one file per TIC, sector)
-    "ssl_legacysurvey",  # raw Stein-et-al DECaLS image chunks (h5 per 1M objects)
     "gaia",      # raw Gaia DR3 GaiaSource, full ~1.8B source catalog
     "gaia_xp",   # raw Gaia DR3, GaiaSource ∩ XpContinuousMeanSpectrum (~220M)
     "galah",     # raw GALAH DR3 catalogs + spectra tarball
@@ -281,19 +280,6 @@ SHARDED_DATASETS = {
         num_shards=8,
         num_processes=32,
         build_mem_mb=400_000,
-        build_runtime_min=240,
-        ingest_mem_mb=400_000,
-        ingest_runtime_min=180,
-        ingest_workers=8,
-    ),
-    # ssl_legacysurvey = Stein-et-al DECaLS image chunks. Each h5 chunk is
-    # up to 1M objects × (3, 152, 152) f32 ≈ 270 MB in memory. Pool(8)
-    # workers × 270 MB ≈ 2 GB peak per worker, well under the per-shard
-    # mem budget. ~360 raw chunks total → 8 shards × ~45 chunks each.
-    "ssl_legacysurvey": dict(
-        num_shards=8,
-        num_processes=8,
-        build_mem_mb=200_000,
         build_runtime_min=240,
         ingest_mem_mb=400_000,
         ingest_runtime_min=180,
