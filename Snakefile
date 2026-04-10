@@ -263,7 +263,7 @@ SHARDED_DATASETS = {
         build_mem_mb=500_000,
         build_runtime_min=240,
         ingest_mem_mb=900_000,
-        ingest_runtime_min=240,
+        ingest_runtime_min=720,   # 12h — 2 workers × 10735 items at ~3.5s/item
         # manga rows are ~500 MB each (native-shape IFU cubes + griz images
         # + DAP maps). With only ~10k objects, 2 workers × 450 GB each is
         # the safest config. 8 workers OOMed repeatedly — each reduce task
