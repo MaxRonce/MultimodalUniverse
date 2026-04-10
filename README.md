@@ -53,6 +53,62 @@ dset = dset.with_format('numpy')
 example = next(iter(dset))
 ```
 
+## HATS Data Access (v2)
+
+MMU v2 stores all datasets as [HATS](https://hats.readthedocs.io/) catalogs (HEALPix-partitioned Parquet). This enables spatial cross-matching across surveys without downloading everything, and plugs directly into PyTorch for multimodal ML.
+
+### Load a catalog
+
+```python
+from mmu.data import HATSDataset
+
+desi = HATSDataset("path/to/MultimodalUniverse_v2_hats/desi/desi/desi")
+print(len(desi))  # number of objects
+```
+
+### Spatial filtering
+
+```python
+# Cone search: COSMOS field, 30 arcmin radius
+cosmos_desi = desi.filter_by_cone(ra=150.0, dec=2.0, radius_arcsec=1800)
+```
+
+### Cross-modal crossmatch + PyTorch DataLoader
+
+```python
+from mmu.data import HATSDataset, mmu_collate
+from torch.utils.data import DataLoader
+
+# Load a SN-Ia lightcurve catalog and a galaxy image catalog
+sne = HATSDataset("path/to/foundation/foundation/foundation")
+galaxies = HATSDataset("path/to/gz10/gz10/gz10")
+
+# Spatial crossmatch: find galaxies near each supernova
+matched = sne.crossmatch(galaxies, radius_arcsec=10.0)
+
+# Iterate as a PyTorch DataLoader
+loader = DataLoader(matched, batch_size=32, collate_fn=mmu_collate)
+
+for batch in loader:
+    lightcurve = batch["lightcurve_left"]   # dict: {band, time, flux, flux_err}
+    image = batch["image_right"]            # dict: {band, array, scale}
+    separation = batch["_dist_arcsec"]      # angular distance in arcsec
+    # ... your multimodal model here
+```
+
+### Direct LSDB access (no PyTorch)
+
+```python
+import lsdb
+
+desi = lsdb.read_hats("path/to/desi/desi")
+gaia = lsdb.read_hats("path/to/gaia_xp/gaia_xp")
+
+# Crossmatch returns a lazy dask DataFrame
+matched = desi.crossmatch(gaia, radius_arcsec=1.0)
+df = matched.compute()  # materialize
+```
+
 ## Datasets
 The Multimodal Universe currently contains data from the following surveys/modalities:
 | **Survey**             | **Modality**        | **Science Use Case** | **# samples** |
