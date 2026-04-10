@@ -264,12 +264,12 @@ SHARDED_DATASETS = {
         build_runtime_min=240,
         ingest_mem_mb=900_000,
         ingest_runtime_min=240,
-        # manga rows are ~500 MB each (9216×4563 spaxel cube + griz images
-        # + DAP maps), so dask ingest workers need to be fat. 96 workers
-        # at the default 5 GB per-worker limit OOM-thrash in the splitting
-        # stage — the first manga gather attempt crawled to 2% in 1h43m
-        # with constant worker restarts. 8 workers × ~100 GB each fits.
-        ingest_workers=8,
+        # manga rows are ~500 MB each (native-shape IFU cubes + griz images
+        # + DAP maps). With only ~10k objects, 2 workers × 450 GB each is
+        # the safest config. 8 workers OOMed repeatedly — each reduce task
+        # that touches a dense healpix pixel with multiple IFU cubes can
+        # easily exceed 100 GB.
+        ingest_workers=2,
     ),
     # hsc = HSC SSP PDR3 Deep/UltraDeep, 477k objects across ~600 (tract,
     # patch) groups. Each pool worker opens 5 calexp FITS HDUs (~150 MB

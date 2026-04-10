@@ -447,10 +447,14 @@ def _process_cube_to_parquet(args: tuple) -> tuple[str, int, str | None]:
         row_table = Table({k: [v] for k, v in row_dict.items()})
         table = build_table([rec], row_table)
         out_path = os.path.join(scratch, f"part-{plateifu}.parquet")
-        pq.write_table(table, out_path)
+        tmp_path = out_path + ".tmp"
+        pq.write_table(table, tmp_path)
+        os.rename(tmp_path, out_path)
         n_maps = len(rec["maps"])
         del rec, table, row_table
         return plateifu, n_maps, None
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except BaseException as exc:  # noqa: BLE001
         return plateifu, 0, f"{type(exc).__name__}: {exc}"
 
@@ -461,7 +465,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", default=os.path.join(MMU_V2_HATS_ROOT, CATALOG_NAME))
     parser.add_argument("--max-files", type=int, default=None,
                         help="Cap on number of plate-ifus to process.")
-    parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--pixel-threshold", type=int, default=100_000,
+                        help="Max rows per HATS partition. Default 100k — manga has "
+                             "only ~10k objects so this produces ~1 partition, which "
+                             "avoids the massive reduce overhead of 8192.")
     parser.add_argument("--num-processes", type=int, default=32,
                         help="Per-shard multiprocessing.Pool size. Default 32 "
                              "(not 96) because each worker holds a full IFU cube ~500 MB.")
