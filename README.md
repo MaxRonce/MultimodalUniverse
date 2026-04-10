@@ -67,14 +67,15 @@ galaxies = HATSDataset(f"{HATS}/desi_provabgs/desi_provabgs/desi_provabgs")
 supernovae = HATSDataset(f"{HATS}/snls/snls/snls")
 
 matched = galaxies.crossmatch(supernovae, radius_arcsec=10.0,
-                               suffixes=("_galaxy", "_sn"))
+                               suffixes=("_host", "_sn"))
 
-for batch in DataLoader(matched, batch_size=8, shuffle=True, collate_fn=mmu_collate):
-    stellar_mass  = batch["PROVABGS_LOGMSTAR_BF_galaxy"]   # tensor [8]
-    mcmc_samples  = batch["PROVABGS_MCMC_galaxy"]           # tensor [8, 100, 13]
-    lightcurve    = batch["lightcurve_sn"]                  # struct {band, time, flux, flux_err}
-    redshift      = batch["redshift_sn"]                    # tensor [8]
-    separation    = batch["_dist_arcsec"]                   # tensor [8]
+train = DataLoader(matched, batch_size=8, shuffle=True, collate_fn=mmu_collate)
+
+for batch in train:
+    stellar_mass = batch["PROVABGS_LOGMSTAR_BF_host"]   # tensor [8]
+    redshift     = batch["Z_HP_host"]                    # tensor [8]
+    lightcurve   = batch["lightcurve_sn"]                # {band, time, flux, flux_err}
+    separation   = batch["_dist_arcsec"]                 # tensor [8]
 ```
 
 Crossmatches are chainable for N-way joins:
