@@ -57,79 +57,42 @@ example = next(iter(dset))
 
 MMU v2 stores all datasets as [HATS](https://hats.readthedocs.io/) catalogs (HEALPix-partitioned Parquet). This enables spatial cross-matching across surveys without downloading everything, and plugs directly into PyTorch for multimodal ML.
 
-### Load a catalog
-
-```python
-from mmu.data import HATSDataset
-
-desi = HATSDataset("path/to/MultimodalUniverse_v2_hats/desi/desi/desi")
-print(len(desi))  # number of objects
-```
-
-### Spatial filtering
-
-```python
-# Cone search: COSMOS field, 30 arcmin radius
-cosmos_desi = desi.filter_by_cone(ra=150.0, dec=2.0, radius_arcsec=1800)
-```
-
-### Cross-modal crossmatch + PyTorch DataLoader
-
 ```python
 from mmu.data import HATSDataset, mmu_collate
 from torch.utils.data import DataLoader
 
-# Load a SN-Ia lightcurve catalog and a galaxy image catalog
-sne = HATSDataset("path/to/foundation/foundation/foundation")
-galaxies = HATSDataset("path/to/gz10/gz10/gz10")
+galaxies = HATSDataset("MultimodalUniverse_v2_hats/desi_provabgs/desi_provabgs/desi_provabgs")
+supernovae = HATSDataset("MultimodalUniverse_v2_hats/snls/snls/snls")
 
-# Spatial crossmatch — use suffixes to name columns by dataset
-matched = sne.crossmatch(galaxies, radius_arcsec=10.0,
-                         suffixes=("_sne", "_gz10"))
+matched = galaxies.crossmatch(supernovae, radius_arcsec=10.0,
+                               suffixes=("_galaxy", "_sn"))
 
-# Iterate as a PyTorch DataLoader
-loader = DataLoader(matched, batch_size=32, collate_fn=mmu_collate)
-
-for batch in loader:
-    lightcurve = batch["lightcurve_sne"]    # dict: {band, time, flux, flux_err}
-    image = batch["image_gz10"]             # dict: {band, array, scale}
-    separation = batch["_dist_arcsec"]      # angular distance in arcsec
-    # ... your multimodal model here
+for batch in DataLoader(matched, batch_size=8, shuffle=True, collate_fn=mmu_collate):
+    stellar_mass  = batch["PROVABGS_LOGMSTAR_BF_galaxy"]   # tensor [8]
+    mcmc_samples  = batch["PROVABGS_MCMC_galaxy"]           # tensor [8, 100, 13]
+    lightcurve    = batch["lightcurve_sn"]                  # struct {band, time, flux, flux_err}
+    redshift      = batch["redshift_sn"]                    # tensor [8]
+    separation    = batch["_dist_arcsec"]                   # tensor [8]
 ```
 
-### N-way crossmatch
-
-Chain crossmatches — each step adds columns with descriptive suffixes:
+Crossmatches are chainable for N-way joins:
 
 ```python
-spectra = HATSDataset("path/to/desi/desi/desi")
-images = HATSDataset("path/to/gz10/gz10/gz10")
-lightcurves = HATSDataset("path/to/tess/tess/tess")
-
-# spectra × images
-step1 = spectra.crossmatch(images, radius_arcsec=1.0,
-                           suffixes=("_desi", "_gz10"))
-
-# (spectra × images) × lightcurves
-step2 = step1.crossmatch(lightcurves, radius_arcsec=5.0,
-                         suffixes=("", "_tess"))
-
-# Now step2 has columns from all three:
-#   spectrum_desi, image_gz10, lightcurve_tess, ...
-loader = DataLoader(step2, batch_size=32, collate_fn=mmu_collate)
+step1 = galaxies.crossmatch(supernovae, radius_arcsec=10.0,
+                             suffixes=("_galaxy", "_sn"))
+step2 = step1.crossmatch(images, radius_arcsec=5.0,
+                          suffixes=("", "_img"))
 ```
 
-### Direct LSDB access (no PyTorch)
+Or use [LSDB](https://lsdb.readthedocs.io/) directly for lazy dask-backed queries:
 
 ```python
 import lsdb
 
-desi = lsdb.read_hats("path/to/desi/desi")
-gaia = lsdb.read_hats("path/to/gaia_xp/gaia_xp")
+desi = lsdb.read_hats("MultimodalUniverse_v2_hats/desi/desi")
+gaia = lsdb.read_hats("MultimodalUniverse_v2_hats/gaia_xp/gaia_xp")
 
-# Crossmatch returns a lazy dask DataFrame
-matched = desi.crossmatch(gaia, radius_arcsec=1.0)
-df = matched.compute()  # materialize
+df = desi.crossmatch(gaia, radius_arcsec=1.0).compute()
 ```
 
 ## Datasets
