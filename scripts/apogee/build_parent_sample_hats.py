@@ -398,28 +398,34 @@ def main(argv: list[str] | None = None) -> int:
     pending: list[dict] = []
     work = [(i, row_dicts[i], args.raw_root, cache_root) for i in range(len(row_dicts))]
 
+    n_total = len(work)
+    n_done = 0
+
+    def _process(record):
+        nonlocal pending, shard_idx, n_done
+        n_done += 1
+        if n_done % 500 == 0 or n_done == n_total:
+            print(f"  [{n_done}/{n_total}] {len(pending)} pending, "
+                  f"{shard_idx} shards written", flush=True)
+        if record is None:
+            return
+        pending.append(record)
+        if len(pending) >= args.batch_size:
+            table = build_arrow_table(pending)
+            out = os.path.join(scratch_dir, f"part-{shard_idx:04d}.parquet")
+            tmp = out + ".tmp"
+            pq.write_table(table, tmp)
+            os.rename(tmp, out)
+            shard_idx += 1
+            pending = []
+
     if args.num_processes > 1:
         with Pool(args.num_processes) as pool:
-            iterator = pool.imap_unordered(_row_to_record, work)
-            for record in iterator:
-                if record is None:
-                    continue
-                pending.append(record)
-                if len(pending) >= args.batch_size:
-                    table = build_arrow_table(pending)
-                    pq.write_table(table, os.path.join(scratch_dir, f"part-{shard_idx:04d}.parquet"))
-                    shard_idx += 1
-                    pending = []
+            for record in pool.imap_unordered(_row_to_record, work):
+                _process(record)
     else:
-        for record in iterator:
-            if record is None:
-                continue
-            pending.append(record)
-            if len(pending) >= args.batch_size:
-                table = build_arrow_table(pending)
-                pq.write_table(table, os.path.join(scratch_dir, f"part-{shard_idx:04d}.parquet"))
-                shard_idx += 1
-                pending = []
+        for item in work:
+            _process(_row_to_record(item))
 
     if pending:
         table = build_arrow_table(pending)

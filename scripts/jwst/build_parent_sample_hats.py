@@ -236,7 +236,8 @@ def process_mosaic(mosaic_name: str, mosaic_dir: str, pixel_threshold: int, scra
 
     survey_hash = zlib.crc32(mosaic_name.encode())
     records = []
-    for row in catalog:
+    n_cat = len(catalog)
+    for ri, row in enumerate(catalog):
         ra = float(row["ra"])
         dec = float(row["dec"])
         flux_stack = []
@@ -293,6 +294,9 @@ def process_mosaic(mosaic_name: str, mosaic_dir: str, pixel_threshold: int, scra
         for feat in FLOAT_FEATURES:
             record[feat] = np.float32(row[feat])
         records.append(record)
+        if (ri + 1) % 1000 == 0 or ri == n_cat - 1:
+            print(f"  {mosaic_name}: [{ri+1}/{n_cat}] {len(records)} cutouts",
+                  flush=True)
 
     for img in images.values():
         img["sci"]._file.close()
