@@ -262,8 +262,8 @@ def _ndarray_to_nested_array(array: np.ndarray, value_type: pa.DataType) -> pa.A
     values = pa.array(arr.reshape(-1), type=value_type)
     nested: pa.Array = values
     for dim in reversed(arr.shape):
-        offsets = np.arange(0, len(nested) + 1, dim, dtype=np.int32)
-        nested = pa.ListArray.from_arrays(offsets, nested)
+        offsets = np.arange(0, len(nested) + 1, dim, dtype=np.int64)
+        nested = pa.LargeListArray.from_arrays(offsets, nested)
     return nested
 
 
