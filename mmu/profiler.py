@@ -127,6 +127,7 @@ def profile_build(
     argv = [
         "--output-root", tmp_output,
         "--max-files", str(n_sample),
+        "--num-processes", "1",  # serial mode — avoids pickle issues with dynamic import
     ]
 
     # Add scratch-dir if the script supports it (sharded datasets)
