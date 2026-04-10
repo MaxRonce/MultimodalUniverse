@@ -95,7 +95,7 @@ def _catalog_path(raw_root: str) -> str:
 
 
 def _default_cache_root() -> str:
-    return os.path.expanduser("~/Library/Caches/mmu_apogee_raw")
+    return os.path.expanduser("~/ceph/general_data/mmu_apogee_raw")
 
 
 def _is_readable_fits_table(path: str) -> bool:
