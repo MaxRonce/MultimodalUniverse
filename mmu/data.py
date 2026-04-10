@@ -270,7 +270,7 @@ class CrossMatchedHATSDataset(Dataset):
             df,
             ra_column="ra",
             dec_column="dec",
-            threshold=100_000,
+            partition_rows=100_000,
         )
         result = left_cat.crossmatch(
             other.lsdb_catalog,
