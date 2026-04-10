@@ -245,6 +245,13 @@ def write_hats_from_parquet_dir(
             f"no *.parquet files under {parquet_dir} (recursive search)"
         )
 
+    LOGGER.info(
+        "write_hats_from_parquet_dir: %d input parquets, pixel_threshold=%d, "
+        "n_workers=%d, chunksize=%d, output=%s/%s",
+        len(parquet_files), pixel_threshold, n_workers, chunksize,
+        output_path, catalog_name,
+    )
+
     # Clean stale output from a previous failed gather. hats-import's
     # Finishing stage scans the entire dataset/ dir for parquet files; if
     # a prior run left partial output at a different pixel_threshold, the

@@ -586,6 +586,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.skip_ingest:
             return 0
 
+        import glob as _glob
+        n_parquets = len(_glob.glob(os.path.join(scratch, "*.parquet")))
+        print(f"=== MANGA GATHER CONFIG ===", flush=True)
+        print(f"  scratch: {scratch} ({n_parquets} parquets)", flush=True)
+        print(f"  output: {args.output_root}", flush=True)
+        print(f"  pixel_threshold: {args.pixel_threshold}", flush=True)
+        print(f"  ingest_workers: {args.ingest_workers}", flush=True)
+        print(f"  mem alloc: {os.environ.get('SLURM_MEM_PER_NODE', 'unknown')} MB", flush=True)
+        print(f"  time limit: {os.environ.get('SLURM_TIMELIMIT', 'unknown')}", flush=True)
+        print(f"===========================", flush=True)
+
         print(f"Ingesting {scratch} → HATS catalog (workers={args.ingest_workers})",
               flush=True)
         catalog_dir = write_hats_from_parquet_dir(
