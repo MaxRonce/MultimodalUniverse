@@ -173,7 +173,7 @@ def _open_patch_images(raw_root: str, tract: int, patch: int) -> dict | None:
             image_hdu = hdul[1].copy()
             mask_hdu = hdul[2].copy()
             var_hdu = hdul[3].copy()
-        mask_hdu.data = _clean_mask(mask_hdu.data)
+        mask_hdu.data = _clean_mask(mask_hdu.data).astype(mask_hdu.data.dtype)
         images[band] = {"image": image_hdu, "var": var_hdu, "mask": mask_hdu}
     return images
 
@@ -334,10 +334,14 @@ def _process_patch_to_parquet(args: tuple) -> tuple[str, int, str | None]:
         if not records:
             return label, 0, None
         table = build_table(records)
-        pq.write_table(table, out_path)
+        tmp_path = out_path + ".tmp"
+        pq.write_table(table, tmp_path)
+        os.rename(tmp_path, out_path)
         n = table.num_rows
         del records, table
         return label, n, None
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except BaseException as exc:  # noqa: BLE001
         return label, 0, f"{type(exc).__name__}: {exc}"
 
