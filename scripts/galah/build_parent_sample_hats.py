@@ -361,8 +361,9 @@ def main(argv: list[str] | None = None) -> int:
         nonlocal pending, shard_idx, n_done
         n_done += 1
         if n_done % 500 == 0 or n_done == n_total:
-            print(f"  [{n_done}/{n_total}] {len(pending)} pending, "
-                  f"{shard_idx} shards written", flush=True)
+            sys.stderr.write(f"  [{n_done}/{n_total}] {len(pending)} pending, "
+                           f"{shard_idx} shards written\n")
+            sys.stderr.flush()
         if record is None:
             return
         pending.append(record)
