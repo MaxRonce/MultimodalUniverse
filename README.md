@@ -83,17 +83,35 @@ from torch.utils.data import DataLoader
 sne = HATSDataset("path/to/foundation/foundation/foundation")
 galaxies = HATSDataset("path/to/gz10/gz10/gz10")
 
-# Spatial crossmatch: find galaxies near each supernova
-matched = sne.crossmatch(galaxies, radius_arcsec=10.0)
+# Spatial crossmatch — use suffixes to name columns by dataset
+matched = sne.crossmatch(galaxies, radius_arcsec=10.0,
+                         suffixes=("_sne", "_gz10"))
 
 # Iterate as a PyTorch DataLoader
 loader = DataLoader(matched, batch_size=32, collate_fn=mmu_collate)
 
 for batch in loader:
-    lightcurve = batch["lightcurve_left"]   # dict: {band, time, flux, flux_err}
-    image = batch["image_right"]            # dict: {band, array, scale}
+    lightcurve = batch["lightcurve_sne"]    # dict: {band, time, flux, flux_err}
+    image = batch["image_gz10"]             # dict: {band, array, scale}
     separation = batch["_dist_arcsec"]      # angular distance in arcsec
     # ... your multimodal model here
+```
+
+### 3-way crossmatch
+
+Chain crossmatches with descriptive suffixes:
+
+```python
+spectra = HATSDataset("path/to/desi/desi/desi")
+images = HATSDataset("path/to/gz10/gz10/gz10")
+lightcurves = HATSDataset("path/to/tess/tess/tess")
+
+# First match: spectra × images
+step1 = spectra.crossmatch(images, radius_arcsec=1.0,
+                           suffixes=("_desi", "_gz10"))
+
+# TODO: chain a second crossmatch for 3-way (not yet supported on
+# CrossMatchedHATSDataset — needs wrapping back into HATSDataset)
 ```
 
 ### Direct LSDB access (no PyTorch)
