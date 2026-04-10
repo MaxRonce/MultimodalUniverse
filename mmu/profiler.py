@@ -1,40 +1,26 @@
 """Pre-flight profiler for HATS build scripts.
 
-Processes a small sample of rows from a dataset's build script, measures peak
-RSS and throughput, and recommends resource parameters (workers, walltime,
-pixel_threshold) for the full production run.
+Processes a small sample of rows, runs a mini gather, measures peak RSS
+and throughput, checks for common pitfalls, and recommends resource
+parameters (workers, walltime, pixel_threshold) for production.
 
 Usage::
 
-    from mmu.profiler import profile_build
-    result = profile_build("manga", n_sample=50)
-    print(result)
-    # ProfileResult(
-    #   dataset='manga',
-    #   n_sample=50,
-    #   peak_rss_mb=24310,
-    #   rss_per_row_mb=486,
-    #   rows_per_sec=2.3,
-    #   total_rows=10735,
-    #   recommended_workers=4,
-    #   recommended_walltime_h=12,
-    #   recommended_pixel_threshold=100000,
-    # )
-
-Run from CLI::
-
-    python -m mmu.profiler manga --n-sample 50
-    python -m mmu.profiler legacysurvey --n-sample 10
+    python -m mmu.profiler manga --n-sample 3
+    python -m mmu.profiler legacysurvey --n-sample 5
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import importlib
+import inspect
 import os
+import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import psutil
 
@@ -43,36 +29,49 @@ import psutil
 class ProfileResult:
     dataset: str
     n_sample: int
-    peak_rss_mb: float
-    rss_per_row_mb: float
-    rows_per_sec: float
-    total_rows: int | None
-    recommended_workers: int
-    recommended_walltime_h: float
-    recommended_pixel_threshold: int
+    n_output_rows: int
+    scatter_peak_rss_mb: float
+    scatter_rss_per_row_mb: float
+    scatter_rows_per_sec: float
+    scatter_elapsed_sec: float
+    gather_peak_rss_mb: float | None
+    gather_elapsed_sec: float | None
+    warnings: list[str] = field(default_factory=list)
+    recommended_workers: int = 1
+    recommended_scatter_walltime_h: float = 48
+    recommended_gather_walltime_h: float = 48
+    recommended_pixel_threshold: int = 100_000
 
     def __str__(self) -> str:
         lines = [
-            f"=== Profile: {self.dataset} ({self.n_sample} sample rows) ===",
-            f"  Peak RSS:           {self.peak_rss_mb:.0f} MB",
-            f"  RSS per row:        {self.rss_per_row_mb:.0f} MB",
-            f"  Throughput:         {self.rows_per_sec:.2f} rows/sec",
+            f"=== Profile: {self.dataset} ({self.n_sample} sample files → {self.n_output_rows} rows) ===",
+            f"  Scatter:",
+            f"    Peak RSS:        {self.scatter_peak_rss_mb:.0f} MB",
+            f"    RSS per row:     {self.scatter_rss_per_row_mb:.0f} MB",
+            f"    Throughput:      {self.scatter_rows_per_sec:.2f} rows/sec",
+            f"    Elapsed:         {self.scatter_elapsed_sec:.1f}s",
         ]
-        if self.total_rows is not None:
-            scatter_h = self.total_rows / max(self.rows_per_sec, 0.01) / 3600
-            lines.append(f"  Total rows:         {self.total_rows}")
-            lines.append(f"  Est. scatter time:  {scatter_h:.1f}h (single worker)")
+        if self.gather_peak_rss_mb is not None:
+            lines += [
+                f"  Gather (mini):",
+                f"    Peak RSS:        {self.gather_peak_rss_mb:.0f} MB",
+                f"    Elapsed:         {self.gather_elapsed_sec:.1f}s",
+            ]
         lines += [
-            f"  --- Recommendations (for 900 GB node) ---",
-            f"  Workers:            {self.recommended_workers}",
-            f"  Walltime:           {self.recommended_walltime_h:.0f}h",
-            f"  pixel_threshold:    {self.recommended_pixel_threshold}",
+            f"  Recommendations (900 GB node):",
+            f"    Workers:         {self.recommended_workers}",
+            f"    Scatter wall:    {self.recommended_scatter_walltime_h:.0f}h",
+            f"    Gather wall:     {self.recommended_gather_walltime_h:.0f}h",
+            f"    pixel_threshold: {self.recommended_pixel_threshold}",
         ]
+        if self.warnings:
+            lines.append(f"  WARNINGS:")
+            for w in self.warnings:
+                lines.append(f"    ⚠ {w}")
         return "\n".join(lines)
 
 
 def _measure_rss_mb() -> float:
-    """Current process RSS in MB including all children."""
     proc = psutil.Process()
     rss = proc.memory_info().rss
     for child in proc.children(recursive=True):
@@ -83,30 +82,54 @@ def _measure_rss_mb() -> float:
     return rss / 1e6
 
 
+def _check_schema_warnings(parquet_path: str) -> list[str]:
+    """Check a parquet file's schema for common pitfalls."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    warnings = []
+    schema = pq.read_schema(parquet_path)
+
+    def _check_type(name: str, t: pa.DataType, depth: int = 0):
+        if pa.types.is_list(t) and not pa.types.is_large_list(t):
+            inner = t.value_type
+            if pa.types.is_list(inner) or pa.types.is_large_list(inner):
+                warnings.append(
+                    f"Column '{name}' uses pa.list_ for nested arrays. "
+                    f"Will overflow on >30k rows. Use pa.large_list instead."
+                )
+        if pa.types.is_struct(t):
+            for i in range(t.num_fields):
+                _check_type(f"{name}.{t.field(i).name}", t.field(i).type, depth + 1)
+        if pa.types.is_list(t) or pa.types.is_large_list(t):
+            _check_type(name, t.value_type, depth + 1)
+
+    for i in range(len(schema)):
+        _check_type(schema.field(i).name, schema.field(i).type)
+
+    if "ra" not in schema.names:
+        warnings.append("No 'ra' column — hats-import will fail")
+    if "dec" not in schema.names:
+        warnings.append("No 'dec' column — hats-import will fail")
+
+    return warnings
+
+
 def profile_build(
     dataset: str,
-    n_sample: int = 50,
+    n_sample: int = 5,
     node_mem_mb: int = 900_000,
-    safety_factor: float = 2.0,
+    safety_factor: float = 2.5,
+    run_gather: bool = True,
 ) -> ProfileResult:
-    """Profile a dataset's build script on a small sample.
+    """Profile a dataset's build script on a small sample."""
+    import pyarrow.parquet as pq
 
-    Imports the build script, finds its processing function, runs it on
-    ``n_sample`` rows, and measures RSS + throughput.
-
-    This is intentionally simple and dataset-agnostic: it calls ``main()``
-    with ``--max-files {n_sample}`` (or equivalent) and measures the process.
-    For sharded datasets, it runs a single shard (shard 0 of 1).
-    """
-    rss_before = _measure_rss_mb()
-
-    # Build the CLI args for a small test run
     from mmu.hats_configs import DATASETS, MMU_V2_HATS_ROOT
 
     if dataset not in DATASETS:
         raise ValueError(f"Unknown dataset: {dataset}. Known: {list(DATASETS.keys())}")
 
-    # Import the build module
     script_path = os.path.join(
         os.path.dirname(__file__), "..", "scripts", dataset,
         "build_parent_sample_hats.py",
@@ -118,7 +141,6 @@ def profile_build(
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    # Run with --max-files to limit scope, write to /tmp
     tmp_output = f"/tmp/mmu_profile_{dataset}_{os.getpid()}"
     tmp_scratch = f"/tmp/mmu_profile_scratch_{dataset}_{os.getpid()}"
     os.makedirs(tmp_output, exist_ok=True)
@@ -127,83 +149,128 @@ def profile_build(
     argv = [
         "--output-root", tmp_output,
         "--max-files", str(n_sample),
-        "--num-processes", "1",  # serial mode — avoids pickle issues with dynamic import
+        "--num-processes", "1",
     ]
 
-    # Add scratch-dir if the script supports it (sharded datasets)
-    import inspect
-    main_sig = inspect.signature(mod.main)
     main_src = inspect.getsource(mod.main)
-    if "scratch-dir" in main_src or "scratch_dir" in main_src:
+    has_scratch = "scratch-dir" in main_src or "scratch_dir" in main_src
+    if has_scratch:
         argv += ["--scratch-dir", tmp_scratch, "--skip-ingest"]
 
-    # Measure
-    rss_samples = [_measure_rss_mb()]
+    # === SCATTER PHASE ===
+    rss_before = _measure_rss_mb()
     t0 = time.time()
-
     try:
         rc = mod.main(argv)
     except SystemExit as e:
         rc = e.code or 0
+    scatter_elapsed = time.time() - t0
+    scatter_peak_rss = _measure_rss_mb()
 
-    elapsed = time.time() - t0
-    peak_rss = _measure_rss_mb()
-    rss_after = peak_rss  # approximate — real peak may have been higher
-
-    # Count output rows
-    import glob
-    import pyarrow.parquet as pq
-    parquets = glob.glob(os.path.join(tmp_scratch, "*.parquet")) or \
-               glob.glob(os.path.join(tmp_output, "**/*.parquet"), recursive=True)
+    parquets = sorted(glob.glob(os.path.join(tmp_scratch, "**/*.parquet"), recursive=True)) or \
+               sorted(glob.glob(os.path.join(tmp_output, "**/*.parquet"), recursive=True))
     n_output_rows = sum(pq.read_metadata(f).num_rows for f in parquets) if parquets else 0
 
+    warnings = []
+
+    # Check: did we produce any output?
+    if n_output_rows == 0:
+        warnings.append(
+            f"ZERO output rows from {n_sample} sample files! "
+            f"The build script is silently failing. Do NOT launch at scale."
+        )
+
+    # Check: schema pitfalls
+    if parquets:
+        warnings.extend(_check_schema_warnings(parquets[0]))
+
+    # Check: stale output at production path
+    prod_output = os.path.join(MMU_V2_HATS_ROOT, dataset, dataset, dataset)
+    if os.path.isdir(prod_output):
+        existing = glob.glob(os.path.join(prod_output, "dataset", "**/*.parquet"), recursive=True)
+        if existing:
+            warnings.append(
+                f"Production output dir has {len(existing)} existing parquets. "
+                f"Pre-gather cleanup will wipe them, but verify this is intended."
+            )
+
+    # === GATHER PHASE (mini) ===
+    gather_peak_rss = None
+    gather_elapsed = None
+    if run_gather and parquets and n_output_rows > 0:
+        from mmu.hats_import import write_hats_from_parquet_dir
+
+        gather_input = tmp_scratch if has_scratch else tmp_output
+        gather_output = f"/tmp/mmu_profile_gather_{dataset}_{os.getpid()}"
+        os.makedirs(gather_output, exist_ok=True)
+
+        rss_before_gather = _measure_rss_mb()
+        t1 = time.time()
+        try:
+            write_hats_from_parquet_dir(
+                gather_input,
+                output_path=gather_output,
+                catalog_name=dataset,
+                pixel_threshold=100_000,
+                n_workers=1,
+                debug=True,
+            )
+        except Exception as e:
+            warnings.append(f"Mini gather FAILED: {type(e).__name__}: {e}")
+        gather_elapsed = time.time() - t1
+        gather_peak_rss = _measure_rss_mb()
+        shutil.rmtree(gather_output, ignore_errors=True)
+
     # Clean up
-    import shutil
     shutil.rmtree(tmp_output, ignore_errors=True)
     shutil.rmtree(tmp_scratch, ignore_errors=True)
 
-    # Calculate recommendations
-    rss_delta = max(peak_rss - rss_before, 100)  # MB used by the sample
+    # === RECOMMENDATIONS ===
+    rss_delta = max(scatter_peak_rss - rss_before, 50)
     rss_per_row = rss_delta / max(n_output_rows, 1)
-    rows_per_sec = n_output_rows / max(elapsed, 0.01)
+    rows_per_sec = n_output_rows / max(scatter_elapsed, 0.01)
 
-    # Try to estimate total rows from the dataset
-    total_rows = None
-    if hasattr(mod, "load_catalog"):
-        try:
-            # Don't actually load — just check if there's a known count
-            pass
-        except Exception:
-            pass
+    # Workers: fit in node memory with safety factor
+    worker_mem = rss_delta * safety_factor  # MB per worker at peak
+    recommended_workers = max(1, min(32, int(node_mem_mb / max(worker_mem, 100))))
 
-    # Recommendations
-    # Workers: each worker holds ~pixel_threshold rows at peak during reduce
-    # For scatter: each worker holds 1 unit of work
-    worker_mem_budget = node_mem_mb / safety_factor  # usable MB
-    recommended_workers = max(1, int(worker_mem_budget / max(rss_delta, 100)))
-    recommended_workers = min(recommended_workers, 32)  # cap at 32
+    # Scatter walltime
+    recommended_scatter_h = 48.0  # safe default
 
-    # Walltime: scatter time / n_workers * safety_factor + gather overhead
-    if total_rows and rows_per_sec > 0:
-        scatter_sec = total_rows / rows_per_sec / recommended_workers
-        gather_sec = total_rows * 0.01  # rough: 10ms per row for hats-import
-        recommended_walltime_h = (scatter_sec + gather_sec) / 3600 * safety_factor
-    else:
-        recommended_walltime_h = 48  # safe default
+    # Gather walltime: extrapolate from mini gather
+    recommended_gather_h = 48.0
+    if gather_elapsed and n_output_rows > 0:
+        gather_per_row = gather_elapsed / n_output_rows
+        # Estimate total rows (rough: n_output_rows / n_sample * total_files)
+        # We don't know total_files here, so just use a generous multiplier
+        recommended_gather_h = max(4, gather_per_row * n_output_rows * 1000 / 3600 * safety_factor)
+        recommended_gather_h = min(recommended_gather_h, 48)
 
-    # pixel_threshold: for datasets with <100k rows, just use 100k
-    # For larger datasets, use 100k (our proven default)
+    # Pixel threshold
     recommended_pixel_threshold = 100_000
+
+    # Ceph file count warning
+    estimated_shard_files = n_output_rows * 1000 * 50  # very rough: total_rows * partitions_touched
+    if recommended_pixel_threshold < 10000 and estimated_shard_files > 100_000:
+        warnings.append(
+            f"Estimated ~{estimated_shard_files} intermediate shard files. "
+            f"Ceph MDS will choke. Increase pixel_threshold."
+        )
 
     return ProfileResult(
         dataset=dataset,
         n_sample=n_sample,
-        peak_rss_mb=peak_rss,
-        rss_per_row_mb=rss_per_row,
-        rows_per_sec=rows_per_sec,
-        total_rows=total_rows,
+        n_output_rows=n_output_rows,
+        scatter_peak_rss_mb=scatter_peak_rss,
+        scatter_rss_per_row_mb=rss_per_row,
+        scatter_rows_per_sec=rows_per_sec,
+        scatter_elapsed_sec=scatter_elapsed,
+        gather_peak_rss_mb=gather_peak_rss,
+        gather_elapsed_sec=gather_elapsed,
+        warnings=warnings,
         recommended_workers=recommended_workers,
-        recommended_walltime_h=max(recommended_walltime_h, 4),
+        recommended_scatter_walltime_h=recommended_scatter_h,
+        recommended_gather_walltime_h=recommended_gather_h,
         recommended_pixel_threshold=recommended_pixel_threshold,
     )
 
@@ -211,14 +278,17 @@ def profile_build(
 def main():
     parser = argparse.ArgumentParser(description="Profile a HATS build script")
     parser.add_argument("dataset", help="Dataset name (e.g., manga, legacysurvey)")
-    parser.add_argument("--n-sample", type=int, default=50,
-                        help="Number of sample rows/files to process")
-    parser.add_argument("--node-mem-mb", type=int, default=900_000,
-                        help="Node memory in MB (default 900 GB)")
+    parser.add_argument("--n-sample", type=int, default=5)
+    parser.add_argument("--no-gather", action="store_true", help="Skip mini gather test")
+    parser.add_argument("--node-mem-mb", type=int, default=900_000)
     args = parser.parse_args()
 
-    result = profile_build(args.dataset, n_sample=args.n_sample,
-                           node_mem_mb=args.node_mem_mb)
+    result = profile_build(
+        args.dataset,
+        n_sample=args.n_sample,
+        node_mem_mb=args.node_mem_mb,
+        run_gather=not args.no_gather,
+    )
     print(result)
 
 
