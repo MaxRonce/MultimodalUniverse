@@ -230,6 +230,7 @@ def prepare_rows(raw_root: str, nside: int, max_files: int | None, ra_center: fl
             "vac": vac[i],
             "healpix": int(healpix[i]),
             "tar_path": tar_path,
+            "extract_dir": None,  # set by main() after extraction
             "resolution_maps": resolution_maps,
         })
     return rows
@@ -237,17 +238,19 @@ def prepare_rows(raw_root: str, nside: int, max_files: int | None, ra_center: fl
 
 def _process_object(row: dict) -> dict | None:
     sobject_id = int(row["catalog"]["sobject_id"])
-    tar_path = row["tar_path"]
+    extract_dir = row["extract_dir"]
     spectra = {}
 
     try:
-        with tarfile.open(tar_path, "r:gz") as tar:
-            for band, suffix in zip(BANDS, [1, 2, 3, 4]):
-                member = tar.getmember(f"galah/dr3/spectra/hermes/{sobject_id}{suffix}.fits")
-                with tar.extractfile(member) as fh:
-                    spectra[band] = _process_band_fits(fh)
-                spectra[band]["lsf"], spectra[band]["lsf_sigma"] = row["resolution_maps"][band]
-    except (KeyError, OSError, FileNotFoundError, tarfile.TarError, ValueError) as exc:
+        for band, suffix in zip(BANDS, [1, 2, 3, 4]):
+            fits_path = os.path.join(
+                extract_dir, "galah", "dr3", "spectra", "hermes",
+                f"{sobject_id}{suffix}.fits",
+            )
+            with open(fits_path, "rb") as fh:
+                spectra[band] = _process_band_fits(fh)
+            spectra[band]["lsf"], spectra[band]["lsf_sigma"] = row["resolution_maps"][band]
+    except (KeyError, OSError, FileNotFoundError, ValueError) as exc:
         print(f"WARNING: skipping GALAH {sobject_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return None
 
@@ -328,7 +331,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--num-processes", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--pixel-threshold", type=int, default=8192)
+    parser.add_argument("--pixel-threshold", type=int, default=100_000)
+    parser.add_argument("--extract-dir", default="/dev/shm/galah_spectra",
+                        help="Directory to extract the spectra tarball into. "
+                             "Defaults to /dev/shm for fast RAM-backed I/O. "
+                             "Cleaned up on exit.")
     parser.add_argument("--nside", type=int, default=16)
     parser.add_argument("--ra-center", type=float, default=None)
     parser.add_argument("--dec-center", type=float, default=None)
@@ -346,6 +353,28 @@ def main(argv: list[str] | None = None) -> int:
     if not rows:
         print("ERROR: no GALAH rows selected", file=sys.stderr)
         return 1
+
+    # Extract the spectra tarball to a fast local directory (default /dev/shm).
+    # The tarball is 229 GB compressed with ~1.3M individual FITS files.
+    # Opening it per-star via tarfile.open("r:gz") decompresses the whole
+    # archive each time — completely unusable. Extracting once to RAM-backed
+    # /dev/shm makes individual file reads instant.
+    tar_path = rows[0]["tar_path"]
+    extract_dir = args.extract_dir
+    os.makedirs(extract_dir, exist_ok=True)
+    spectra_check = os.path.join(extract_dir, "galah", "dr3", "spectra", "hermes")
+    if not os.path.isdir(spectra_check):
+        print(f"Extracting {tar_path} → {extract_dir} ...", flush=True)
+        import tarfile as _tf
+        with _tf.open(tar_path, "r:gz") as tf:
+            tf.extractall(extract_dir)
+        print(f"Extraction complete.", flush=True)
+    else:
+        print(f"Using existing extraction at {extract_dir}", flush=True)
+
+    # Patch all rows with the extract dir
+    for row in rows:
+        row["extract_dir"] = extract_dir
 
     scratch_dir = args.scratch_dir or default_scratch_dir(CATALOG_NAME)
     os.makedirs(scratch_dir, exist_ok=True)
@@ -399,6 +428,10 @@ def main(argv: list[str] | None = None) -> int:
         debug=True,
     )
     shutil.rmtree(scratch_dir, ignore_errors=True)
+    # Clean up the extracted spectra from /dev/shm (or wherever --extract-dir pointed)
+    if os.path.isdir(extract_dir):
+        print(f"Cleaning up {extract_dir}...", flush=True)
+        shutil.rmtree(extract_dir, ignore_errors=True)
     print(f"Done: {catalog_dir}", flush=True)
     return 0
 
