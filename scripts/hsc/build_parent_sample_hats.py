@@ -350,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--raw-root",
-        default=os.path.join(DATASETS[CATALOG_NAME].raw_path, "pdr3_dud"),
+        default=DATASETS[CATALOG_NAME].raw_path,
         help="Per-band calexp FITS root, containing HSC-{G,R,I,Z,Y}/<tract>/<x,y>/.",
     )
     parser.add_argument(
