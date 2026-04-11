@@ -724,10 +724,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-files", type=int, default=None,
                         help="Cap on number of sweep files to process.")
     parser.add_argument("--pixel-threshold", type=int, default=100_000)
-    parser.add_argument("--num-processes", type=int, default=4,
-                        help="Pool size for parallel sweep processing. Each worker "
-                             "peaks at ~240 GB during build_table (3x copy). Default 4 "
-                             "keeps total RSS under ~960 GB nominal on a 900 GB node.")
+    parser.add_argument("--num-processes", type=int, default=1,
+                        help="Pool size. Default 1 — big sweeps peak at 588 GB in "
+                             "build_table (196k cutouts × 1 MB × 3x). Pool(2)+ OOMs.")
     parser.add_argument("--scratch-dir", default=None,
                         help="Shared ceph scratch directory for per-sweep parquet "
                              "shards. REQUIRED when running sharded — all shard "

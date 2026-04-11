@@ -208,9 +208,9 @@ SHARDED_SCRATCH_ROOT = f"{HATS_ROOT}_scratch"
 SHARDED_DATASETS = {
     "legacysurvey": dict(
         num_shards=128,
-        num_processes=4,    # Pool(4) processes sweeps in parallel. Each worker peaks at
-                            # ~240 GB during build_table (3x copy: records→lists→pa.Array).
-                            # 4 × 240 GB = 960 GB nominal but peaks don't align; fits 900 GB.
+        num_processes=1,    # Pool(1) — one sweep at a time. Big sweeps peak at 588 GB
+                            # during build_table (196k cutouts × 1 MB × 3x copy).
+                            # Pool(2)+ OOMs when multiple workers hit build_table.
         build_mem_mb=900_000,
         # Sweeps are sequential: ~11 sweeps/shard × ~20 min/sweep = ~220 min nominal.
         # 480 min gives 2× headroom for slow sweeps (some have 200k+ objects).
