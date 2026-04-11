@@ -425,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
         output_path=args.output_root,
         catalog_name=CATALOG_NAME,
         pixel_threshold=args.pixel_threshold,
-        debug=True,
+        debug=False,
     )
     shutil.rmtree(scratch_dir, ignore_errors=True)
     # Clean up the extracted spectra from /dev/shm (or wherever --extract-dir pointed)
