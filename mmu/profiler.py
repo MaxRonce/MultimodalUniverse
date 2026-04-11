@@ -232,9 +232,55 @@ def profile_build(
     rss_per_row = rss_delta / max(n_output_rows, 1)
     rows_per_sec = n_output_rows / max(scatter_elapsed, 0.01)
 
-    # Workers: fit in node memory with safety factor
-    worker_mem = rss_delta * safety_factor  # MB per worker at peak
-    recommended_workers = max(1, min(32, int(node_mem_mb / max(worker_mem, 100))))
+    # Scatter OOM prediction: build_table triples memory (records → lists → arrow).
+    # With num_processes workers, worst case = all workers in build_table simultaneously.
+    # Estimate per-worker peak from sample parquet sizes.
+    BUILD_TABLE_MULTIPLIER = 3
+    if parquets and n_output_rows > 0:
+        avg_parquet_bytes = sum(os.path.getsize(f) for f in parquets) / len(parquets)
+        avg_rows_per_parquet = n_output_rows / len(parquets)
+        bytes_per_row_on_disk = avg_parquet_bytes / max(avg_rows_per_parquet, 1)
+        in_mem_per_row_mb = bytes_per_row_on_disk * 2.0 / 1e6  # parquet → in-memory ~2x
+
+        # Get num_processes from script default
+        num_processes = 4  # fallback
+        if "num_processes" in main_src or "num-processes" in main_src:
+            import re
+            m = re.search(r'default\s*=\s*(\d+)',
+                          main_src[main_src.find("num-processes"):main_src.find("num-processes")+100]
+                          if "num-processes" in main_src else
+                          main_src[main_src.find("num_processes"):main_src.find("num_processes")+100])
+            if m:
+                num_processes = int(m.group(1))
+
+        # Estimate max rows per work unit (sweep/chunk/plate-ifu)
+        # From the sample: n_output_rows from n_sample files
+        max_rows_per_unit = n_output_rows  # conservative: assume one unit had all rows
+        if len(parquets) > 1:
+            max_rows_per_unit = max(pq.read_metadata(f).num_rows for f in parquets)
+
+        # Peak per worker during build_table
+        peak_per_worker_mb = max_rows_per_unit * in_mem_per_row_mb * BUILD_TABLE_MULTIPLIER
+        # All workers hitting build_table simultaneously (worst case)
+        peak_total_mb = num_processes * peak_per_worker_mb
+
+        if peak_total_mb > node_mem_mb * 0.9:
+            safe_workers = max(1, int(node_mem_mb * 0.8 / max(peak_per_worker_mb, 1)))
+            warnings.append(
+                f"SCATTER OOM RISK: build_table triples memory. "
+                f"With Pool({num_processes}), worst case = {num_processes} × "
+                f"{peak_per_worker_mb/1000:.0f} GB/worker = {peak_total_mb/1000:.0f} GB "
+                f"(node has {node_mem_mb/1000:.0f} GB). "
+                f"Recommend Pool({safe_workers})."
+            )
+            recommended_workers = safe_workers
+        else:
+            recommended_workers = num_processes
+    else:
+        recommended_workers = 1
+
+    # Cap workers
+    recommended_workers = max(1, min(32, recommended_workers))
 
     # Scatter walltime
     recommended_scatter_h = 48.0  # safe default
