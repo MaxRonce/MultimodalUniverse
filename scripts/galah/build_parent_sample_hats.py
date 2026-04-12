@@ -367,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Extracting {tar_path} → {extract_dir} ...", flush=True)
         import tarfile as _tf
         with _tf.open(tar_path, "r:gz") as tf:
-            tf.extractall(extract_dir, filter="data")
+            tf.extractall(extract_dir)
         if not os.path.isdir(spectra_check):
             print(f"ERROR: extraction produced no files at {spectra_check}",
                   file=sys.stderr, flush=True)
