@@ -54,7 +54,9 @@ Live tracker for the raw → HATS port of v1 MMU. Every non-skipped dataset in `
 
 ## Ported + tests passing, but no production build yet
 
-(none right now — every script with green tests has either landed or is in flight above.)
+| Dataset | Modality | Notes |
+|---|---|---|
+| **ztf** | timeseries | ZTF DR23 public HATS light-curve-series product converted to MMU jagged schema. Preserves every series/epoch, keeps `ztf_objectid` as provenance, writes quality masks/counters plus `aion_training_candidate = pass_relaxed_ge30`. Full-scale path uses direct HATS partition-preserving scatter plus metadata finalization, avoiding `hats_import` spatial repartition of the 8 TB input. |
 
 ---
 
@@ -96,7 +98,7 @@ These have no `scripts/<dataset>/build_parent_sample_hats.py` yet. Six left.
 - `Snakefile`
   - Per-dataset `build_<name>` rules, each declaring its build script as an `input:` (auto-rerun on edit)
   - `SHARDED_DATASETS` dict + generic `build_sharded_shard` wildcard rule + loop-generated gather rules
-  - Currently sharded: legacysurvey (128), desi (16), gaia (16), gaia_xp (8), manga (8), ssl_legacysurvey (8)
+  - Currently sharded: legacysurvey (128), desi (16), gaia (16), gaia_xp (8), manga (8), ssl_legacysurvey (8), ztf (128 direct-HATS finalize)
   - `SHARDED_SLURM_PARTITION` for scatter (preempt), gather always runs on `SLURM_PARTITION` (ccm, guaranteed)
   - `qos="preempt"` resource for preempt scatter, `--slurm-requeue` auto-requeue on preemption
   - Cone args + `--max-files` threaded through `build_sharded_shard` so `profile=cosmos` actually produces a cosmos slice

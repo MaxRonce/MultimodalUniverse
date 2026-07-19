@@ -62,6 +62,7 @@ DATASETS: dict[str, DatasetConfig] = {
     # --- Time series ---
     "plasticc":     DatasetConfig("plasticc", "timeseries", "PLAsTiCC",
                                   skip=True, skip_reason="raw dir empty on cluster"),
+    "ztf":          DatasetConfig("ztf", "timeseries", "ZTF_DR23/ztf_dr23_lc_hats_full/ztf_dr23_lc-hats"),
     "tess":         DatasetConfig("tess", "timeseries", "tess"),
     "kepler":       DatasetConfig("kepler", "timeseries", "Kepler",
                                   skip=True,

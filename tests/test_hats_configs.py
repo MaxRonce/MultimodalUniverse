@@ -9,7 +9,7 @@ EXPECTED_NON_SKIPPED = {
     "sdss", "desi", "vipers", "galah", "apogee", "chandra",
     "gaia", "gaia_xp", "desi_provabgs",
     "legacysurvey", "hsc", "jwst", "btsbot", "gz10",
-    "tess", "foundation", "snls",
+    "ztf", "tess", "foundation", "snls",
     "ps1_sne_ia", "des_y3_sne_ia", "swift_sne_ia",
     "allwise", "twomass", "galex", "sages",
     "manga",

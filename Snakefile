@@ -81,6 +81,7 @@ PORTED = [
     "galex",     # multi-FITS GUVCat shards (latitude-partitioned)
     "desi",      # raw DESI coadd FITS files, merged via desispec.coadd_cameras
     "gz10",      # raw Galaxy10 DECals HDF5
+    "ztf",       # ZTF DR23 public HATS light-curve-series, converted to MMU jagged time-series schema
     "tess",      # raw TESS-SPOC FFI lightcurves (one file per TIC, sector)
     "gaia",      # raw Gaia DR3 GaiaSource, full ~1.8B source catalog
     "gaia_xp",   # raw Gaia DR3, GaiaSource ∩ XpContinuousMeanSpectrum (~220M)
@@ -182,7 +183,9 @@ def slurm_qos(partition: str) -> str | None:
 # scatter the work across N independent sbatch jobs ("shards"), each of
 # which writes per-unit parquet files into a shared ceph scratch dir. A
 # single "gather" job then runs ``write_hats_from_parquet_dir`` against
-# that scratch to produce the final HATS catalog.
+# that scratch to produce the final HATS catalog. Datasets whose input is
+# already HATS may opt into direct partition-preserving output; their gather
+# step only finalizes metadata.
 #
 # Snakemake natively manages this via two rules per sharded dataset:
 #   1. ``build_<name>_shard`` — one sbatch job per shard_idx, writes
@@ -285,6 +288,23 @@ SHARDED_DATASETS = {
         ingest_runtime_min=180,
         ingest_workers=8,
     ),
+    # ztf = public ZTF DR23 light-curve HATS product. The input is already
+    # partitioned parquet with nested lightcurve arrays (~9,933 files, ~8 TB,
+    # ~4.97B series rows, ~741B epochs). Scatter converts each input HATS
+    # partition directly into the corresponding MMU HATS partition. There is
+    # no spatial split/reduce gather for ZTF; the final job writes metadata.
+    "ztf": dict(
+        num_shards=128,
+        num_processes=16,
+        build_mem_mb=250_000,
+        build_runtime_min=720,
+        ingest_mem_mb=250_000,
+        ingest_runtime_min=240,
+        ingest_workers=1,
+        direct_hats=True,
+        build_extra_args="--direct-hats",
+        gather_extra_args="--finalize-direct-hats",
+    ),
 }
 
 
@@ -330,6 +350,7 @@ rule build_sharded_shard:
             else ""
         ),
         max_files_arg = f"--max-files {MAX_FILES}" if MAX_FILES is not None else "",
+        build_extra_args = lambda w: SHARDED_DATASETS[w.shard_name].get("build_extra_args", ""),
     resources:
         mem_mb = lambda w: SHARDED_DATASETS[w.shard_name]["build_mem_mb"],
         runtime = lambda w: SHARDED_DATASETS[w.shard_name]["build_runtime_min"],
@@ -345,6 +366,7 @@ rule build_sharded_shard:
         "--num-shards {params.num_shards} "
         "--shard-idx {wildcards.shard_idx} "
         "--num-processes {params.num_processes} "
+        "{params.build_extra_args} "
         "--skip-ingest && "
         "touch {output.done}"
 
@@ -371,6 +393,7 @@ for _name, _cfg in SHARDED_DATASETS.items():
             ingest_workers = _cfg["ingest_workers"],
             num_shards = _cfg["num_shards"],
             name = _name,
+            gather_extra_args = _cfg.get("gather_extra_args", "--only-ingest"),
         resources:
             mem_mb = _cfg["ingest_mem_mb"],
             runtime = _cfg["ingest_runtime_min"],
@@ -388,7 +411,7 @@ for _name, _cfg in SHARDED_DATASETS.items():
             "--output-root {params.output_root} "
             "--num-shards {params.num_shards} "
             "--shard-idx 0 "
-            "--only-ingest "
+            "{params.gather_extra_args} "
             "--ingest-workers {params.ingest_workers}"
 
 
