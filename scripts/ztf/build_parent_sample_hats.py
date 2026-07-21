@@ -36,7 +36,6 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from mmu.hats_configs import MMU_V2_HATS_ROOT
-from mmu.hats_import import default_scratch_dir, write_hats_from_parquet_dir
 
 
 CATALOG_NAME = "ztf"
@@ -45,6 +44,12 @@ DEFAULT_ZTF_INPUT = (
     "/lustre/fsn1/projects/rech/jrx/urx63nr/"
     "ztf_dr23_lc_hats_full/ztf_dr23_lc-hats"
 )
+DEFAULT_LEGACY_SCRATCH_ROOT = "/mnt/ceph/users/polymathic/MultimodalUniverse_v2_hats_scratch"
+
+
+def default_scratch_dir(catalog_name: str) -> str:
+    """Return the legacy hats-import scratch path without importing hats-import."""
+    return os.path.join(DEFAULT_LEGACY_SCRATCH_ROOT, f"{catalog_name}_{os.getpid()}")
 
 BAND_LABELS: dict[int, str] = {
     1: "ztf_g",
@@ -406,6 +411,8 @@ def main(argv: list[str] | None = None) -> int:
             f"(workers={args.ingest_workers}, chunksize={args.ingest_chunksize})",
             flush=True,
         )
+        from mmu.hats_import import write_hats_from_parquet_dir
+
         catalog_dir = write_hats_from_parquet_dir(
             scratch,
             output_path=args.output_root,
