@@ -19,11 +19,16 @@ INPUT_DIR="${INPUT_DIR:-/lustre/fsn1/projects/rech/jrx/urx63nr/ztf_dr23_lc_hats_
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRATCH:?SCRATCH is not set}/TimeSeries/local/ztf}"
 MANIFEST_DIR="${MANIFEST_DIR:-${SCRATCH}/TimeSeries/build/ztf_direct_manifests}"
 SHARDS="${SHARDS:-512}"
+NUM_PROCESSES="${NUM_PROCESSES:-${SLURM_CPUS_PER_TASK}}"
 
 [[ -x "${PYTHON}" ]] || { echo "Missing MMU Python environment: ${PYTHON}" >&2; exit 2; }
 [[ -d "${INPUT_DIR}/dataset" ]] || { echo "Missing input HATS dataset: ${INPUT_DIR}/dataset" >&2; exit 2; }
 [[ "${SLURM_ARRAY_TASK_COUNT}" -eq "${SHARDS}" ]] || {
   echo "Slurm array has ${SLURM_ARRAY_TASK_COUNT} tasks but SHARDS=${SHARDS}" >&2
+  exit 2
+}
+[[ "${NUM_PROCESSES}" -ge 1 && "${NUM_PROCESSES}" -le "${SLURM_CPUS_PER_TASK}" ]] || {
+  echo "NUM_PROCESSES=${NUM_PROCESSES} must be between 1 and SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK}" >&2
   exit 2
 }
 mkdir -p "${OUTPUT_ROOT}" "${MANIFEST_DIR}"
@@ -37,7 +42,7 @@ export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_MMU="${SETUPTOOLS_SCM_PRETEND_VERSION_
   --direct-hats \
   --num-shards "${SHARDS}" \
   --shard-idx "${SLURM_ARRAY_TASK_ID}" \
-  --num-processes "${SLURM_CPUS_PER_TASK}" \
+  --num-processes "${NUM_PROCESSES}" \
   --arrow-threads 1 \
   --batch-size 10000 \
   --aion-relaxed-threshold 30 \
