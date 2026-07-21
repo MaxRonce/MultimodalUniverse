@@ -14,7 +14,7 @@
 set -Eeuo pipefail
 
 REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:?Submit this job from the MMU repository root}}"
-PYTHON="${PYTHON:-${REPO_DIR}/.venv/bin/python}"
+PYTHON="${PYTHON:-/lustre/fswork/projects/rech/jrx/commun/aion/bin/python}"
 INPUT_DIR="${INPUT_DIR:-/lustre/fsn1/projects/rech/jrx/urx63nr/ztf_dr23_lc_hats_full/ztf_dr23_lc-hats}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRATCH:?SCRATCH is not set}/TimeSeries/local/ztf}"
 MANIFEST_DIR="${MANIFEST_DIR:-${SCRATCH}/TimeSeries/build/ztf_direct_manifests}"
