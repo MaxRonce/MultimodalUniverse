@@ -4,11 +4,10 @@ import pytest
 
 from mmu.hats_configs import DATASETS, get_dataset, list_datasets
 
-
 EXPECTED_NON_SKIPPED = {
     "sdss", "desi", "vipers", "galah", "apogee", "chandra",
     "gaia", "gaia_xp", "desi_provabgs",
-    "legacysurvey", "hsc", "jwst", "btsbot", "gz10",
+    "legacysurvey", "hsc", "lsst_dp2", "jwst", "btsbot", "gz10",
     "ztf", "tess", "foundation", "snls",
     "ps1_sne_ia", "des_y3_sne_ia", "swift_sne_ia",
     "allwise", "twomass", "galex", "sages",
@@ -80,6 +79,7 @@ class TestListDatasets:
         images = set(list_datasets("image"))
         assert "legacysurvey" in images
         assert "hsc" in images
+        assert "lsst_dp2" in images
         assert "sdss" not in images
 
         tabular = set(list_datasets("tabular"))

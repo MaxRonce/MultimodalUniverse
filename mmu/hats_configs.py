@@ -55,6 +55,7 @@ DATASETS: dict[str, DatasetConfig] = {
     # --- Images ---
     "legacysurvey":     DatasetConfig("legacysurvey", "image", "legacysurvey"),
     "hsc":              DatasetConfig("hsc", "image", "hsc/pdr3_dud"),
+    "lsst_dp2":         DatasetConfig("lsst_dp2", "image", "lsst_dp2"),
     "jwst":             DatasetConfig("jwst", "image", "JWST"),
     "btsbot":           DatasetConfig("btsbot", "image", "btsbot"),
     "gz10":             DatasetConfig("gz10", "image", "Galaxy10_DECals.h5"),
