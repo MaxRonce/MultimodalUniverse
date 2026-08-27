@@ -173,6 +173,16 @@ def catalog_psf_fwhm(catalog: Table, row, band: str) -> float | None:
     return float(2.354820045 * determinant ** 0.25 * PIXEL_SCALE_ARCSEC)
 
 
+def patch_psf_fwhm(catalog: Table, rows: Table) -> dict[str, float | None]:
+    """Return robust per-band PSF fallbacks from valid Object moments in a patch."""
+    result = {}
+    for band in BANDS:
+        values = [catalog_psf_fwhm(catalog, row, band) for row in rows]
+        valid = [value for value in values if value is not None and value > 0]
+        result[band] = float(np.median(valid)) if valid else None
+    return result
+
+
 def load_manifest(path: str, verify_checksums: bool = False) -> dict[tuple[int, int, str], dict]:
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
@@ -278,6 +288,7 @@ def _make_records(
 ) -> list[dict]:
     records = []
     n = len(rows)
+    patch_psf = patch_psf_fwhm(catalog, rows)
     for row in rows:
         flux = np.zeros((len(BANDS), IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
         ivar = np.zeros_like(flux)
@@ -307,7 +318,14 @@ def _make_records(
             if catalog_psf is not None:
                 psf_fwhm[band_index] = catalog_psf
                 psf_source[band_index] = "dp2.Object moments"
-            elif info.get("s_resolution") is not None:
+            elif patch_psf[band] is not None:
+                psf_fwhm[band_index] = patch_psf[band]
+                psf_source[band_index] = "patch median dp2.Object moments"
+            elif (
+                info.get("s_resolution") is not None
+                and np.isfinite(info["s_resolution"])
+                and float(info["s_resolution"]) > 0
+            ):
                 psf_fwhm[band_index] = float(info["s_resolution"])
                 psf_source[band_index] = "SIA s_resolution"
 

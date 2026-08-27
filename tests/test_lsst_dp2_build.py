@@ -109,6 +109,14 @@ def test_query_column_discovery_and_polygon():
     assert query.build_query(columns, "1=1", None, 4).startswith("SELECT TOP 4 ")
 
 
+def test_patch_psf_fallback_ignores_invalid_object_moments(tmp_path):
+    catalog = _catalog(tmp_path / "objects.parquet")
+    catalog["u_ixxPSF"][0] = np.nan
+    expected = build.catalog_psf_fwhm(catalog, catalog[1], "u")
+    result = build.patch_psf_fwhm(catalog, catalog)
+    assert result["u"] == pytest.approx(expected)
+
+
 def test_manifest_is_restartable(tmp_path):
     catalog_path = tmp_path / "objects.parquet"
     _catalog(catalog_path)
