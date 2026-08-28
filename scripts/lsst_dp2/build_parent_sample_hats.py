@@ -45,7 +45,7 @@ from scripts.lsst_dp2.common import (
 
 PHOTOMETRY_SUFFIXES = ("psfFlux", "psfFluxErr", "cModelFlux", "cModelFluxErr")
 PSF_SIZE = 35
-OUTPUT_SCHEMA_VERSION = 2
+OUTPUT_SCHEMA_VERSION = 3
 CORE_REQUIRED_MASK_PLANES = ("SAT", "NO_DATA")
 MASK_PLANE_ALIASES = {
     "SAT": ("SAT", "SATURATED"),
@@ -125,8 +125,8 @@ def open_maskedimage(path: str):
         }
 
 
-def psf_kernel_at(coadd: dict, ra: float, dec: float) -> np.ndarray:
-    """Return the normalized CellPointSpreadFunction kernel at a sky position."""
+def psf_kernel_at(coadd: dict, ra: float, dec: float) -> tuple[np.ndarray, bool]:
+    """Return the local normalized PSF kernel and whether that cell is valid."""
     x, y = coadd["wcs"].world_to_pixel_values(ra, dec)
     absolute_y = y + coadd["image_yx0"][0]
     absolute_x = x + coadd["image_yx0"][1]
@@ -138,11 +138,13 @@ def psf_kernel_at(coadd: dict, ra: float, dec: float) -> np.ndarray:
     if not (0 <= iy < psf_array.shape[0] and 0 <= ix < psf_array.shape[1]):
         raise ValueError(f"source is outside PSF grid: cell={(iy, ix)}")
     kernel = np.asarray(psf_array[iy, ix], dtype=np.float32).copy()
+    if not np.isfinite(kernel).all():
+        return np.zeros((PSF_SIZE, PSF_SIZE), dtype=np.float32), False
     total = float(np.sum(kernel, dtype=np.float64))
-    if not np.isfinite(kernel).all() or not np.isfinite(total) or total <= 0:
-        raise ValueError(f"invalid PSF kernel at cell {(iy, ix)}")
+    if not np.isfinite(total) or total <= 0:
+        return np.zeros((PSF_SIZE, PSF_SIZE), dtype=np.float32), False
     kernel /= total
-    return kernel
+    return kernel, True
 
 
 def make_stamp(
@@ -272,6 +274,7 @@ def build_image_struct(records: list[dict]) -> pa.StructArray:
             _nested_column([r["mask"] for r in records], pa.bool_()),
             _nested_column([r["mask_bits"] for r in records], pa.int32()),
             _nested_column([r["psf_image"] for r in records], pa.float32()),
+            _nested_column([r["psf_image_valid"] for r in records], pa.bool_()),
             _nested_column([r["psf_fwhm"] for r in records], pa.float32()),
             _nested_column([r["scale"] for r in records], pa.float32()),
             _nested_column([r["band_present"] for r in records], pa.bool_()),
@@ -284,7 +287,7 @@ def build_image_struct(records: list[dict]) -> pa.StructArray:
         ],
         names=[
             "band", "flux", "ivar", "mask", "mask_bits", "psf_image",
-            "psf_fwhm", "scale",
+            "psf_image_valid", "psf_fwhm", "scale",
             "band_present", "psf_source", "dataset_id", "sha256", "mask_plane_map",
             "flux_unit", "ivar_unit",
         ],
@@ -342,6 +345,7 @@ def _make_records(
         mask = np.zeros(flux.shape, dtype=bool)
         mask_bits = np.zeros(flux.shape, dtype=np.int32)
         psf_image = np.zeros((len(BANDS), PSF_SIZE, PSF_SIZE), dtype=np.float32)
+        psf_image_valid = np.zeros(len(BANDS), dtype=bool)
         psf_fwhm = np.zeros(len(BANDS), dtype=np.float32)
         band_present = np.zeros(len(BANDS), dtype=bool)
         psf_source = ["missing"] * len(BANDS)
@@ -362,7 +366,9 @@ def _make_records(
             dataset_ids[band_index] = info.get("dataset_id") or ""
             checksums[band_index] = info.get("sha256") or ""
             plane_maps[band_index] = json.dumps(coadd["mask_mapping"], sort_keys=True)
-            psf_image[band_index] = psf_kernel_at(coadd, ra, dec)
+            psf_image[band_index], psf_image_valid[band_index] = psf_kernel_at(
+                coadd, ra, dec
+            )
             catalog_psf = catalog_psf_fwhm(catalog, row, band)
             if catalog_psf is not None:
                 psf_fwhm[band_index] = catalog_psf
@@ -402,6 +408,7 @@ def _make_records(
             "mask": mask,
             "mask_bits": mask_bits,
             "psf_image": psf_image,
+            "psf_image_valid": psf_image_valid,
             "psf_fwhm": psf_fwhm,
             "scale": np.full(len(BANDS), PIXEL_SCALE_ARCSEC, dtype=np.float32),
             "band_present": band_present,

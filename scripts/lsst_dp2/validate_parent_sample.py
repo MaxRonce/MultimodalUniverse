@@ -96,6 +96,7 @@ def _validate_parquet(scratch_dir: str, expected_ids: set[str]) -> dict:
     checked_rows = 0
     min_clean_fraction = 1.0
     max_clean_fraction = 0.0
+    psf_valid_counts = np.zeros(len(BANDS), dtype=np.int64)
     for path in paths:
         table = pq.read_table(path)
         for index in range(table.num_rows):
@@ -111,16 +112,22 @@ def _validate_parquet(scratch_dir: str, expected_ids: set[str]) -> dict:
             mask = np.asarray(image["mask"], dtype=bool)
             mask_bits = np.asarray(image["mask_bits"], dtype=np.int32)
             psf_image = np.asarray(image["psf_image"], dtype=np.float32)
+            psf_image_valid = np.asarray(image["psf_image_valid"], dtype=bool)
             expected_shape = (len(BANDS), IMAGE_SIZE, IMAGE_SIZE)
             if any(array.shape != expected_shape for array in (flux, ivar, mask, mask_bits)):
                 raise ValueError(f"invalid image shape for {object_id}")
             if psf_image.shape != (len(BANDS), PSF_SIZE, PSF_SIZE):
                 raise ValueError(f"invalid PSF image shape for {object_id}")
+            if psf_image_valid.shape != (len(BANDS),):
+                raise ValueError(f"invalid PSF validity shape for {object_id}")
             if not np.isfinite(psf_image).all():
                 raise ValueError(f"non-finite PSF image for {object_id}")
             psf_sums = psf_image.sum(axis=(-2, -1), dtype=np.float64)
-            if not np.allclose(psf_sums, 1.0, rtol=1e-5, atol=1e-5):
+            if not np.allclose(psf_sums[psf_image_valid], 1.0, rtol=1e-5, atol=1e-5):
                 raise ValueError(f"PSF image is not normalized for {object_id}: {psf_sums}")
+            if np.any(psf_sums[~psf_image_valid] != 0):
+                raise ValueError(f"invalid PSF image is not zero-filled for {object_id}")
+            psf_valid_counts += psf_image_valid
             if not np.isfinite(flux).all() or not np.isfinite(ivar).all():
                 raise ValueError(f"non-finite flux/ivar for {object_id}")
             if (ivar < 0).any() or (ivar[~mask] != 0).any():
@@ -153,6 +160,10 @@ def _validate_parquet(scratch_dir: str, expected_ids: set[str]) -> dict:
         "unique_object_ids": len(found_ids),
         "min_clean_fraction": min_clean_fraction,
         "max_clean_fraction": max_clean_fraction,
+        "psf_valid_counts": dict(zip(BANDS, psf_valid_counts.tolist())),
+        "psf_valid_fractions": dict(
+            zip(BANDS, (psf_valid_counts / checked_rows).tolist())
+        ),
     }
 
 

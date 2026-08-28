@@ -199,6 +199,17 @@ def test_mask_decode_and_stamp(tmp_path):
     assert np.count_nonzero(~mask) == 1
 
 
+def test_missing_psf_cell_is_explicit(tmp_path):
+    path = tmp_path / "masked.fits"
+    _write_maskedimage(path, 3.0)
+    with build.open_maskedimage(str(path)) as coadd:
+        coadd["psf_array"][0, 0] = np.nan
+        kernel, valid = build.psf_kernel_at(coadd, 150.0, 2.0)
+    assert valid is False
+    assert kernel.shape == (build.PSF_SIZE, build.PSF_SIZE)
+    assert not kernel.any()
+
+
 def test_dp2_mask_header_decode_and_sat_alias():
     header = fits.Header()
     header["MSKN0000"] = "NO_DATA"
@@ -241,6 +252,7 @@ def test_end_to_end_parquet_and_hats(tmp_path):
     psf_image = np.asarray(image["psf_image"])
     assert psf_image.shape == (6, build.PSF_SIZE, build.PSF_SIZE)
     assert np.allclose(psf_image.sum(axis=(-2, -1)), 1.0)
+    assert image["psf_image_valid"] == [True] * len(BANDS)
     assert table.schema.field("image").type.field("mask_bits").type.value_type.value_type.value_type == build.pa.int32()
     assert all(image["band_present"])
     assert image["dataset_id"][3] == "ivo://dp2/i"
@@ -276,6 +288,7 @@ def test_missing_band_is_explicitly_padded(tmp_path):
     assert not np.asarray(image["mask"])[0].any()
     assert not np.asarray(image["ivar"])[0].any()
     assert not np.asarray(image["psf_image"])[0].any()
+    assert image["psf_image_valid"][0] is False
 
 
 def test_build_contract_rejects_changed_manifest(tmp_path):

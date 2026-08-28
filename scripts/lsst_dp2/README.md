@@ -15,6 +15,7 @@ Each source has a six-band `image` struct in `u,g,r,i,z,y` order:
 | `mask` | `(6,160,160) bool` | `True` only for usable, finite pixels |
 | `mask_bits` | `(6,160,160) int32` | unmodified Rubin mask bit field |
 | `psf_image` | `(6,35,35) float32` | normalized local CellPointSpreadFunction convolution kernel |
+| `psf_image_valid` | `(6,) bool` | whether the Rubin PSF cell exists and contains a valid kernel |
 | `psf_fwhm` | `(6,) float32` | arcsec; Object moments, then SIA fallback |
 | `scale` | `(6,) float32` | 0.2 arcsec/pixel |
 | `band_present` | `(6,) bool` | whether the patch-band was mirrored |
@@ -30,6 +31,8 @@ coadd cell. The builder maps each source position to its cell using the FITS
 WCS and archive JSON bounds, extracts the local kernel, normalizes it to unit
 sum, and stores it in `psf_image`. The scalar `psf_fwhm` is retained as a
 convenient summary, but morphology-aware consumers should use `psf_image`.
+Rubin may explicitly mark cells as missing; these are zero-filled with
+`psf_image_valid=False` rather than imputed from a neighboring cell.
 
 ## 1. Query the parent sample
 
