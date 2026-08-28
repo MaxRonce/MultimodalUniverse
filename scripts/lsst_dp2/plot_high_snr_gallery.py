@@ -9,6 +9,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy.visualization import make_lupton_rgb
+from scipy.ndimage import gaussian_filter
 
 from mmu.data import HATSDataset
 
@@ -17,22 +18,43 @@ def _scalar(value) -> float:
     return float(value.item()) if hasattr(value, "item") else float(value)
 
 
-def _rgb(image: dict) -> np.ndarray:
+def _rgb(
+    image: dict,
+    crop_size: int = 80,
+    smooth_sigma: float = 1.2,
+    display_sigma: float = 1.5,
+) -> np.ndarray:
     flux = image["flux"].numpy().astype(np.float32)
     mask = image["mask"].numpy().astype(bool)
+    size = flux.shape[-1]
+    if crop_size <= 0 or crop_size > size:
+        raise ValueError(f"crop size must be in [1, {size}]")
+    start = (size - crop_size) // 2
+    stop = start + crop_size
+    flux = flux[:, start:stop, start:stop]
+    mask = mask[:, start:stop, start:stop]
+
+    yy, xx = np.indices((crop_size, crop_size))
+    radius = np.hypot(xx - (crop_size - 1) / 2, yy - (crop_size - 1) / 2)
+    sky = radius >= 0.38 * crop_size
     # Lupton order is red, green, blue; use LSST i, r, g respectively.
     planes = []
     common_mask = mask[3] & mask[2] & mask[1]
     for index in (3, 2, 1):
         plane = flux[index].copy()
         valid = common_mask & np.isfinite(plane)
-        background = np.median(plane[valid]) if valid.any() else 0.0
-        plane -= background
-        plane[~valid] = 0.0
+        sky_valid = valid & sky
+        background = np.median(plane[sky_valid]) if sky_valid.any() else np.median(plane[valid])
+        plane[~valid] = background
+        plane = gaussian_filter(plane, smooth_sigma) if smooth_sigma > 0 else plane
+        residual = plane[sky_valid] - np.median(plane[sky_valid])
+        noise = 1.4826 * np.median(np.abs(residual)) if residual.size else 0.0
+        plane = np.maximum(plane - background - display_sigma * noise, 0.0)
         planes.append(plane)
-    positive = np.concatenate([plane[plane > 0] for plane in planes])
-    scale = np.percentile(positive, 90) if positive.size else 1.0
-    return make_lupton_rgb(*planes, stretch=max(0.1 * scale, 1e-6), Q=8)
+    intensity = sum(planes) / len(planes)
+    positive = intensity[intensity > 0]
+    scale = np.percentile(positive, 99) if positive.size else 1.0
+    return make_lupton_rgb(*planes, stretch=max(0.2 * scale, 1e-6), Q=5)
 
 
 def main() -> None:
@@ -42,6 +64,9 @@ def main() -> None:
     parser.add_argument("--count", type=int, default=12)
     parser.add_argument("--min-snr", type=float, default=30.0)
     parser.add_argument("--max-snr", type=float, default=1000.0)
+    parser.add_argument("--crop-size", type=int, default=80)
+    parser.add_argument("--smooth-sigma", type=float, default=1.2)
+    parser.add_argument("--display-sigma", type=float, default=1.5)
     args = parser.parse_args()
 
     columns = [
@@ -74,7 +99,15 @@ def main() -> None:
     axes = np.atleast_1d(axes).reshape(-1)
     for axis, (snr, index) in zip(axes, selected):
         sample = dataset[index]
-        axis.imshow(_rgb(sample["image"]), origin="lower")
+        axis.imshow(
+            _rgb(
+                sample["image"],
+                crop_size=args.crop_size,
+                smooth_sigma=args.smooth_sigma,
+                display_sigma=args.display_sigma,
+            ),
+            origin="lower",
+        )
         axis.set_title(f"{sample['object_id']}  S/N$_i$={snr:.0f}", fontsize=10)
         axis.set_axis_off()
     for axis in axes[len(selected):]:
