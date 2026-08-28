@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -49,7 +50,33 @@ def _write_maskedimage(path: Path, value: float, size: int = 256) -> None:
     mask_hdu.header["MP_UNMASKEDNAN"] = 4
     variance_hdu = fits.ImageHDU(variance, header=_wcs_header(size), name="VARIANCE")
     variance_hdu.header["BUNIT"] = "nJy2"
-    fits.HDUList([fits.PrimaryHDU(), image_hdu, mask_hdu, variance_hdu]).writeto(path)
+    yy, xx = np.indices((build.PSF_SIZE, build.PSF_SIZE), dtype=np.float32)
+    center = (build.PSF_SIZE - 1) / 2
+    kernel = np.exp(-0.5 * ((xx - center) ** 2 + (yy - center) ** 2) / 2.0**2)
+    kernel /= kernel.sum()
+    psf = np.broadcast_to(kernel, (2, 2, build.PSF_SIZE, build.PSF_SIZE)).copy()
+    psf_hdu = fits.ImageHDU(psf.astype(np.float32), name="PSF")
+    metadata = {
+        "image": {"yx0": [0, 0]},
+        "psf": {
+            "bounds": {
+                "grid": {
+                    "bbox": {
+                        "y": {"start": 0, "stop": size},
+                        "x": {"start": 0, "stop": size},
+                    },
+                    "cell_shape": [size // 2, size // 2],
+                }
+            }
+        },
+    }
+    payload = np.frombuffer(json.dumps(metadata).encode("ascii"), dtype=np.uint8)
+    json_hdu = fits.BinTableHDU.from_columns([
+        fits.Column(name="JSON", format=f"PB({len(payload)})", array=[payload])
+    ], name="JSON")
+    fits.HDUList([
+        fits.PrimaryHDU(), image_hdu, mask_hdu, variance_hdu, psf_hdu, json_hdu,
+    ]).writeto(path)
 
 
 def _catalog(path: Path) -> Table:
@@ -211,6 +238,9 @@ def test_end_to_end_parquet_and_hats(tmp_path):
     assert image["band"] == list(BANDS)
     assert np.asarray(image["flux"]).shape == (6, IMAGE_SIZE, IMAGE_SIZE)
     assert np.asarray(image["ivar"]).shape == (6, IMAGE_SIZE, IMAGE_SIZE)
+    psf_image = np.asarray(image["psf_image"])
+    assert psf_image.shape == (6, build.PSF_SIZE, build.PSF_SIZE)
+    assert np.allclose(psf_image.sum(axis=(-2, -1)), 1.0)
     assert table.schema.field("image").type.field("mask_bits").type.value_type.value_type.value_type == build.pa.int32()
     assert all(image["band_present"])
     assert image["dataset_id"][3] == "ivo://dp2/i"
@@ -245,6 +275,7 @@ def test_missing_band_is_explicitly_padded(tmp_path):
     assert image["band_present"][0] is False
     assert not np.asarray(image["mask"])[0].any()
     assert not np.asarray(image["ivar"])[0].any()
+    assert not np.asarray(image["psf_image"])[0].any()
 
 
 def test_build_contract_rejects_changed_manifest(tmp_path):

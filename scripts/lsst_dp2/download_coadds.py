@@ -189,6 +189,8 @@ def validate_maskedimage(path: str) -> list[str]:
         "image": {"IMAGE", "SCI", "SCIENCE"},
         "mask": {"MASK"},
         "variance": {"VARIANCE", "VAR"},
+        "psf": {"PSF"},
+        "archive metadata": {"JSON"},
     }
     missing = [label for label, choices in aliases.items() if not names.intersection(choices)]
     if missing:

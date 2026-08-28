@@ -14,6 +14,7 @@ Each source has a six-band `image` struct in `u,g,r,i,z,y` order:
 | `ivar` | `(6,160,160) float32` | inverse variance in nJy^-2 |
 | `mask` | `(6,160,160) bool` | `True` only for usable, finite pixels |
 | `mask_bits` | `(6,160,160) int32` | unmodified Rubin mask bit field |
+| `psf_image` | `(6,35,35) float32` | normalized local CellPointSpreadFunction convolution kernel |
 | `psf_fwhm` | `(6,) float32` | arcsec; Object moments, then SIA fallback |
 | `scale` | `(6,) float32` | 0.2 arcsec/pixel |
 | `band_present` | `(6,) bool` | whether the patch-band was mirrored |
@@ -23,10 +24,12 @@ and `UNMASKEDNAN`. The original bits and per-file mask-plane mapping remain in
 the row, so a different policy can be reconstructed without downloading DP2
 again.
 
-The MMU image schema represents the PSF as one FWHM per band. The complete
-Rubin exposure mirrored on disk retains the serialized spatial PSF and native
-provenance; producing per-source PSF pixel stamps would require a separate
-LSST-stack transformation and is not part of this catalog schema.
+Each downloaded DP2 FITS contains a `CellPointSpreadFunction`: a 4-d grid of
+35x35 convolution kernels that is approximately constant within each 150x150
+coadd cell. The builder maps each source position to its cell using the FITS
+WCS and archive JSON bounds, extracts the local kernel, normalizes it to unit
+sum, and stores it in `psf_image`. The scalar `psf_fwhm` is retained as a
+convenient summary, but morphology-aware consumers should use `psf_image`.
 
 ## 1. Query the parent sample
 
@@ -213,9 +216,10 @@ jobs are still writing Parquet files.
 
 A six-band 3400x3400 patch requires about 0.83 GB just for float32 image and
 variance plus int32 mask planes, before the additional ExposureF extensions and
-compression. The MMU row payload is about 2.0 MB/source uncompressed when
-including flux, ivar, boolean clean mask, and raw int32 mask bits; 5,000 sources
-are therefore about 10 GB before Parquet/Zstandard compression. Network volume
+compression. The MMU row payload is about 2.03 MB/source uncompressed when
+including flux, ivar, boolean clean mask, raw int32 mask bits, and six 35x35
+PSF kernels; 5,000 sources are therefore about 10.2 GB before
+Parquet/Zstandard compression. Network volume
 scales with unique patches, while final HATS volume scales with source count.
 
 ### 5,000-galaxy Jean-Zay pilot

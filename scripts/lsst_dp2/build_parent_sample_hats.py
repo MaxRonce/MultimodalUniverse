@@ -44,6 +44,8 @@ from scripts.lsst_dp2.common import (
 )
 
 PHOTOMETRY_SUFFIXES = ("psfFlux", "psfFluxErr", "cModelFlux", "cModelFluxErr")
+PSF_SIZE = 35
+OUTPUT_SCHEMA_VERSION = 2
 CORE_REQUIRED_MASK_PLANES = ("SAT", "NO_DATA")
 MASK_PLANE_ALIASES = {
     "SAT": ("SAT", "SATURATED"),
@@ -58,6 +60,11 @@ def _find_hdu(hdul: fits.HDUList, names: set[str]):
         if str(hdu.header.get("EXTNAME", "")).upper() in names:
             return hdu
     raise ValueError(f"missing FITS extension in {sorted(names)}")
+
+
+def _read_archive_json(hdul: fits.HDUList) -> dict:
+    json_hdu = _find_hdu(hdul, {"JSON"})
+    return json.loads(bytes(json_hdu.data["JSON"][0]))
 
 
 def clean_mask_from_bits(
@@ -85,11 +92,23 @@ def clean_mask_from_bits(
 
 @contextlib.contextmanager
 def open_maskedimage(path: str):
-    """Open one mirrored SODA product and expose its three pixel planes."""
+    """Open one mirrored SIA product and expose pixels and the cell PSF model."""
     with fits.open(path, memmap=True, lazy_load_hdus=True) as hdul:
         image_hdu = _find_hdu(hdul, {"IMAGE", "SCI", "SCIENCE"})
         mask_hdu = _find_hdu(hdul, {"MASK"})
         variance_hdu = _find_hdu(hdul, {"VARIANCE", "VAR"})
+        psf_hdu = _find_hdu(hdul, {"PSF"})
+        archive = _read_archive_json(hdul)
+        psf_metadata = archive.get("psf", {})
+        grid = psf_metadata.get("bounds", {}).get("grid", {})
+        grid_bbox = grid.get("bbox", {})
+        cell_shape = tuple(grid.get("cell_shape", ()))
+        image_yx0 = tuple(archive.get("image", {}).get("yx0", ()))
+        psf_array = native_array(np.asarray(psf_hdu.data, dtype=np.float32))
+        if psf_array.ndim != 4 or psf_array.shape[-2:] != (PSF_SIZE, PSF_SIZE):
+            raise ValueError(f"unexpected cell PSF shape in {path}: {psf_array.shape}")
+        if len(cell_shape) != 2 or len(image_yx0) != 2:
+            raise ValueError(f"incomplete cell PSF metadata in {path}")
         mapping = mask_plane_mapping(hdul[0].header, image_hdu.header, mask_hdu.header)
         yield {
             "image": image_hdu.data,
@@ -97,7 +116,33 @@ def open_maskedimage(path: str):
             "mask_bits": mask_hdu.data,
             "wcs": WCS(image_hdu.header),
             "mask_mapping": mapping,
+            "psf_array": psf_array,
+            "psf_grid_start_yx": (
+                int(grid_bbox["y"]["start"]), int(grid_bbox["x"]["start"])
+            ),
+            "psf_cell_shape_yx": (int(cell_shape[0]), int(cell_shape[1])),
+            "image_yx0": (int(image_yx0[0]), int(image_yx0[1])),
         }
+
+
+def psf_kernel_at(coadd: dict, ra: float, dec: float) -> np.ndarray:
+    """Return the normalized CellPointSpreadFunction kernel at a sky position."""
+    x, y = coadd["wcs"].world_to_pixel_values(ra, dec)
+    absolute_y = y + coadd["image_yx0"][0]
+    absolute_x = x + coadd["image_yx0"][1]
+    grid_y0, grid_x0 = coadd["psf_grid_start_yx"]
+    cell_y, cell_x = coadd["psf_cell_shape_yx"]
+    iy = int(np.floor((absolute_y - grid_y0) / cell_y))
+    ix = int(np.floor((absolute_x - grid_x0) / cell_x))
+    psf_array = coadd["psf_array"]
+    if not (0 <= iy < psf_array.shape[0] and 0 <= ix < psf_array.shape[1]):
+        raise ValueError(f"source is outside PSF grid: cell={(iy, ix)}")
+    kernel = np.asarray(psf_array[iy, ix], dtype=np.float32).copy()
+    total = float(np.sum(kernel, dtype=np.float64))
+    if not np.isfinite(kernel).all() or not np.isfinite(total) or total <= 0:
+        raise ValueError(f"invalid PSF kernel at cell {(iy, ix)}")
+    kernel /= total
+    return kernel
 
 
 def make_stamp(
@@ -226,6 +271,7 @@ def build_image_struct(records: list[dict]) -> pa.StructArray:
             _nested_column([r["ivar"] for r in records], pa.float32()),
             _nested_column([r["mask"] for r in records], pa.bool_()),
             _nested_column([r["mask_bits"] for r in records], pa.int32()),
+            _nested_column([r["psf_image"] for r in records], pa.float32()),
             _nested_column([r["psf_fwhm"] for r in records], pa.float32()),
             _nested_column([r["scale"] for r in records], pa.float32()),
             _nested_column([r["band_present"] for r in records], pa.bool_()),
@@ -237,7 +283,8 @@ def build_image_struct(records: list[dict]) -> pa.StructArray:
             pa.array([["nJy^-2"] * len(BANDS)] * len(records), type=pa.list_(pa.string())),
         ],
         names=[
-            "band", "flux", "ivar", "mask", "mask_bits", "psf_fwhm", "scale",
+            "band", "flux", "ivar", "mask", "mask_bits", "psf_image",
+            "psf_fwhm", "scale",
             "band_present", "psf_source", "dataset_id", "sha256", "mask_plane_map",
             "flux_unit", "ivar_unit",
         ],
@@ -294,6 +341,7 @@ def _make_records(
         ivar = np.zeros_like(flux)
         mask = np.zeros(flux.shape, dtype=bool)
         mask_bits = np.zeros(flux.shape, dtype=np.int32)
+        psf_image = np.zeros((len(BANDS), PSF_SIZE, PSF_SIZE), dtype=np.float32)
         psf_fwhm = np.zeros(len(BANDS), dtype=np.float32)
         band_present = np.zeros(len(BANDS), dtype=bool)
         psf_source = ["missing"] * len(BANDS)
@@ -314,6 +362,7 @@ def _make_records(
             dataset_ids[band_index] = info.get("dataset_id") or ""
             checksums[band_index] = info.get("sha256") or ""
             plane_maps[band_index] = json.dumps(coadd["mask_mapping"], sort_keys=True)
+            psf_image[band_index] = psf_kernel_at(coadd, ra, dec)
             catalog_psf = catalog_psf_fwhm(catalog, row, band)
             if catalog_psf is not None:
                 psf_fwhm[band_index] = catalog_psf
@@ -352,6 +401,7 @@ def _make_records(
             "ivar": ivar,
             "mask": mask,
             "mask_bits": mask_bits,
+            "psf_image": psf_image,
             "psf_fwhm": psf_fwhm,
             "scale": np.full(len(BANDS), PIXEL_SCALE_ARCSEC, dtype=np.float32),
             "band_present": band_present,
@@ -455,6 +505,7 @@ def ensure_build_contract(
         "pixel_scale_arcsec": PIXEL_SCALE_ARCSEC,
         "objects_per_shard": objects_per_shard,
         "reject_mask_planes": list(reject_planes),
+        "output_schema_version": OUTPUT_SCHEMA_VERSION,
     }
     path = Path(scratch_dir) / "build_contract.json"
     with FileLock(str(path) + ".lock"):
