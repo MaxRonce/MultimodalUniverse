@@ -5,6 +5,7 @@ import os
 
 ROOT = os.environ["LSST_DP2_ROOT"]
 HATS_BASE = os.environ["MMU_HATS_ROOT"]
+PYTHON = os.environ["MMU_PYTHON"]
 CATALOG = f"{ROOT}/catalog/objects.parquet"
 MANIFEST = f"{ROOT}/download_manifest.sqlite"
 MIRROR = f"{ROOT}/coadds"
@@ -34,7 +35,7 @@ rule download_coadds:
     retries:
         5
     shell:
-        "python -u -m scripts.lsst_dp2.download_coadds "
+        "{PYTHON} -u -m scripts.lsst_dp2.download_coadds "
         "--catalog {input.catalog} --mirror-root {MIRROR} --manifest {MANIFEST} "
         "--workers 4 >> {log} 2>&1"
 
@@ -52,7 +53,7 @@ rule build_parquet:
     log:
         f"{ROOT}/logs/build_parquet.log",
     shell:
-        "python -u -m scripts.lsst_dp2.build_parent_sample_hats "
+        "{PYTHON} -u -m scripts.lsst_dp2.build_parent_sample_hats "
         "--catalog {input.catalog} --manifest {MANIFEST} --scratch-dir {PARQUET} "
         "--output-root {HATS_OUTER} --objects-per-shard 64 "
         "--verify-checksums --require-all-bands --skip-ingest >> {log} 2>&1"
@@ -69,7 +70,7 @@ rule ingest_hats:
     log:
         f"{ROOT}/logs/ingest_hats.log",
     shell:
-        "python -u -m scripts.lsst_dp2.build_parent_sample_hats "
+        "{PYTHON} -u -m scripts.lsst_dp2.build_parent_sample_hats "
         "--catalog {input.catalog} --manifest {MANIFEST} --scratch-dir {PARQUET} "
         "--output-root {HATS_OUTER} --objects-per-shard 64 --pixel-threshold 8192 "
         "--ingest-workers {INGEST_WORKERS} --verify-checksums --only-ingest "
@@ -88,7 +89,7 @@ rule validate:
     log:
         f"{ROOT}/logs/validate.log",
     shell:
-        "python -u -m scripts.lsst_dp2.validate_parent_sample "
+        "{PYTHON} -u -m scripts.lsst_dp2.validate_parent_sample "
         "--catalog {input.catalog} --manifest {MANIFEST} --scratch-dir {PARQUET} "
         "--hats-root {HATS_OUTER} --verify-checksums --report {output} "
         ">> {log} 2>&1"
