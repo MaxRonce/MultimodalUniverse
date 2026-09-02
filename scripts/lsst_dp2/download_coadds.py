@@ -34,6 +34,7 @@ from scripts.lsst_dp2.common import (
 )
 
 DEFAULT_SIA_URL = "https://data.lsst.cloud/api/sia/dp2/query"
+MANIFEST_SCHEMA_VERSION = 2
 _THREAD_LOCAL = threading.local()
 
 
@@ -80,6 +81,14 @@ def connect_manifest(path: str) -> sqlite3.Connection:
         )
         """
     )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
     columns = {row[1] for row in con.execute("PRAGMA table_info(coadds)")}
     if "datalink_url" not in columns:
         con.execute("ALTER TABLE coadds ADD COLUMN datalink_url TEXT")
@@ -87,7 +96,10 @@ def connect_manifest(path: str) -> sqlite3.Connection:
     return con
 
 
-def initialize_tasks(con: sqlite3.Connection, catalog_path: str, mirror_root: str) -> int:
+def initialize_tasks(
+    con: sqlite3.Connection, catalog_path: str, mirror_root: str
+) -> int:
+    """Bind a manifest to one catalog and populate its immutable task set."""
     catalog = read_catalog(catalog_path)
     columns = validate_catalog(catalog)
     tract_col = columns["tract"]
@@ -102,10 +114,58 @@ def initialize_tasks(con: sqlite3.Connection, catalog_path: str, mirror_root: st
             continue
         seen.add(key)
         for band in BANDS:
-            rows.append((
-                key[0], key[1], band, float(row[ra_col]), float(row[dec_col]),
-                str(coadd_path(mirror_root, key[0], key[1], band)), utcnow(),
-            ))
+            rows.append(
+                (
+                    key[0],
+                    key[1],
+                    band,
+                    float(row[ra_col]),
+                    float(row[dec_col]),
+                    str(coadd_path(mirror_root, key[0], key[1], band)),
+                    utcnow(),
+                )
+            )
+    expected_keys = {(row[0], row[1], row[2]) for row in rows}
+    expected_paths = {(row[0], row[1], row[2]): row[5] for row in rows}
+    metadata = dict(con.execute("SELECT key, value FROM metadata").fetchall())
+    identity = {
+        "schema_version": str(MANIFEST_SCHEMA_VERSION),
+        "catalog_path": str(Path(catalog_path).resolve()),
+        "catalog_sha256": sha256_file(catalog_path),
+        "mirror_root": str(Path(mirror_root).resolve()),
+    }
+
+    if metadata:
+        mismatches = {
+            key: (metadata.get(key), value)
+            for key, value in identity.items()
+            if metadata.get(key) != value
+        }
+        if mismatches:
+            raise RuntimeError(
+                "manifest identity differs from requested inputs; use a new manifest "
+                f"or remove it explicitly: {mismatches}"
+            )
+    else:
+        existing = {
+            (int(tract), int(patch), str(band)): str(output_path)
+            for tract, patch, band, output_path in con.execute(
+                "SELECT tract, patch, band, output_path FROM coadds"
+            )
+        }
+        if existing and (
+            set(existing) != expected_keys
+            or any(existing[key] != expected_paths[key] for key in existing)
+        ):
+            raise RuntimeError(
+                "legacy manifest tasks differ from the requested catalog or mirror; "
+                "use a new manifest or remove it explicitly"
+            )
+
+    con.executemany(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+        identity.items(),
+    )
     con.executemany(
         """
         INSERT INTO coadds (tract, patch, band, ra, dec, output_path, updated_at)
@@ -117,6 +177,20 @@ def initialize_tasks(con: sqlite3.Connection, catalog_path: str, mirror_root: st
     )
     con.commit()
     return len(rows)
+
+
+def reset_failed_tasks(con: sqlite3.Connection) -> int:
+    """Reset attempt counters for incomplete tasks after an operator decision."""
+    cursor = con.execute(
+        """
+        UPDATE coadds
+        SET status='pending', attempts=0, error=NULL, updated_at=?
+        WHERE status != 'complete'
+        """,
+        (utcnow(),),
+    )
+    con.commit()
+    return cursor.rowcount
 
 
 def pending_tasks(con: sqlite3.Connection, max_attempts: int) -> list[Task]:
@@ -192,9 +266,13 @@ def validate_maskedimage(path: str) -> list[str]:
         "psf": {"PSF"},
         "archive metadata": {"JSON"},
     }
-    missing = [label for label, choices in aliases.items() if not names.intersection(choices)]
+    missing = [
+        label for label, choices in aliases.items() if not names.intersection(choices)
+    ]
     if missing:
-        raise RuntimeError(f"downloaded FITS lacks planes {missing}; extensions={sorted(names)}")
+        raise RuntimeError(
+            f"downloaded FITS lacks planes {missing}; extensions={sorted(names)}"
+        )
     return mask_plane_names(path)
 
 
@@ -295,7 +373,7 @@ def download_after_delay(
     retry_base_seconds: float,
 ) -> dict:
     if task.attempts:
-        time.sleep(min(retry_base_seconds * (2 ** task.attempts), 60.0))
+        time.sleep(min(retry_base_seconds * (2**task.attempts), 60.0))
     print(
         f"START tract={task.tract} patch={task.patch} band={task.band} "
         f"attempt={task.attempts + 1}",
@@ -304,13 +382,20 @@ def download_after_delay(
     return download_one(task, token, sia_url)
 
 
-def print_status(con: sqlite3.Connection) -> None:
-    counts = dict(
+def status_counts(con: sqlite3.Connection) -> dict[str, int]:
+    return dict(
         con.execute(
             "SELECT status, COUNT(*) FROM coadds GROUP BY status ORDER BY status"
         ).fetchall()
     )
-    print("Manifest status: " + ", ".join(f"{key}={value}" for key, value in counts.items()))
+
+
+def print_status(con: sqlite3.Connection) -> dict[str, int]:
+    counts = status_counts(con)
+    print(
+        "Manifest status: "
+        + ", ".join(f"{key}={value}" for key, value in counts.items())
+    )
     failures = con.execute(
         """
         SELECT tract, patch, band, attempts, error
@@ -322,24 +407,74 @@ def print_status(con: sqlite3.Connection) -> None:
     ).fetchall()
     for tract, patch, band, attempts, error in failures:
         print(f"FAILED {tract}/{patch}/{band} attempts={attempts}: {error}")
+    return counts
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--catalog", required=True)
-    parser.add_argument("--mirror-root", required=True)
-    parser.add_argument("--manifest", required=True)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--max-attempts", type=int, default=5)
-    parser.add_argument("--retry-base-seconds", type=float, default=5.0)
-    parser.add_argument("--sia-url", default=DEFAULT_SIA_URL)
-    parser.add_argument("--token-env", default="RSP_TOKEN")
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--status-only", action="store_true")
+    parser.add_argument(
+        "--catalog", required=True, help="DP2 Object catalog in Parquet"
+    )
+    parser.add_argument(
+        "--mirror-root", required=True, help="destination for full coadd FITS"
+    )
+    parser.add_argument("--manifest", required=True, help="restartable SQLite manifest")
+    parser.add_argument(
+        "--workers", type=int, default=4, help="concurrent SIA downloads"
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=5,
+        help="maximum attempts per task across command reruns",
+    )
+    parser.add_argument(
+        "--retry-base-seconds",
+        type=float,
+        default=5.0,
+        help="backoff base applied to tasks attempted by earlier runs",
+    )
+    parser.add_argument(
+        "--sia-url", default=DEFAULT_SIA_URL, help="Rubin DP2 SIA endpoint"
+    )
+    parser.add_argument(
+        "--token-env",
+        default="RSP_TOKEN",
+        help="environment variable holding the RSP token",
+    )
+    parser.add_argument(
+        "--task-limit",
+        "--limit",
+        dest="task_limit",
+        type=int,
+        default=None,
+        help="process at most this many patch-band tasks (debugging only)",
+    )
+    parser.add_argument(
+        "--status-only",
+        action="store_true",
+        help="print manifest state without authentication",
+    )
+    parser.add_argument(
+        "--reset-failed",
+        action="store_true",
+        help="reset attempts for every incomplete task before downloading",
+    )
     args = parser.parse_args(argv)
 
-    con = connect_manifest(args.manifest)
-    initialized = initialize_tasks(con, args.catalog, args.mirror_root)
+    if args.workers <= 0 or args.max_attempts <= 0:
+        parser.error("--workers and --max-attempts must be positive")
+    if args.task_limit is not None and args.task_limit <= 0:
+        parser.error("--task-limit must be positive")
+
+    try:
+        con = connect_manifest(args.manifest)
+        initialized = initialize_tasks(con, args.catalog, args.mirror_root)
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    if args.reset_failed:
+        print(f"Reset {reset_failed_tasks(con)} incomplete tasks", flush=True)
     if args.status_only:
         print(f"Manifest has {initialized} tasks")
         print_status(con)
@@ -348,12 +483,14 @@ def main(argv: list[str] | None = None) -> int:
 
     token = os.environ.get(args.token_env)
     if not token:
-        print(f"ERROR: environment variable {args.token_env} is not set", file=sys.stderr)
+        print(
+            f"ERROR: environment variable {args.token_env} is not set", file=sys.stderr
+        )
         con.close()
         return 2
     tasks = pending_tasks(con, args.max_attempts)
-    if args.limit is not None:
-        tasks = tasks[:args.limit]
+    if args.task_limit is not None:
+        tasks = tasks[: args.task_limit]
     print(f"Manifest has {initialized} tasks; {len(tasks)} scheduled", flush=True)
 
     failed = 0
@@ -388,9 +525,17 @@ def main(argv: list[str] | None = None) -> int:
                     WHERE tract=? AND patch=? AND band=?
                     """,
                     (
-                        result["bytes"], result["sha256"], result["dataset_id"],
-                        result["datalink_url"], result["access_url"], result["s_resolution"],
-                        result["mask_planes"], utcnow(), task.tract, task.patch, task.band,
+                        result["bytes"],
+                        result["sha256"],
+                        result["dataset_id"],
+                        result["datalink_url"],
+                        result["access_url"],
+                        result["s_resolution"],
+                        result["mask_planes"],
+                        utcnow(),
+                        task.tract,
+                        task.patch,
+                        task.band,
                     ),
                 )
                 size_mib = result["bytes"] / (1024 * 1024)
@@ -404,7 +549,13 @@ def main(argv: list[str] | None = None) -> int:
                 con.execute(
                     "UPDATE coadds SET status='failed', error=?, updated_at=? "
                     "WHERE tract=? AND patch=? AND band=?",
-                    (f"{type(exc).__name__}: {exc}", utcnow(), task.tract, task.patch, task.band),
+                    (
+                        f"{type(exc).__name__}: {exc}",
+                        utcnow(),
+                        task.tract,
+                        task.patch,
+                        task.band,
+                    ),
                 )
                 print(
                     f"FAILED [{done}/{len(futures)}] tract={task.tract} "
@@ -412,9 +563,14 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
             con.commit()
-    print(f"Finished {len(futures)} tasks; failed={failed}", flush=True)
+    counts = status_counts(con)
+    incomplete = sum(value for key, value in counts.items() if key != "complete")
+    print(
+        f"Finished {len(futures)} tasks; failed={failed}; incomplete={incomplete}",
+        flush=True,
+    )
     con.close()
-    return 1 if failed else 0
+    return 1 if failed or incomplete else 0
 
 
 if __name__ == "__main__":

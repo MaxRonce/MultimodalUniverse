@@ -1,0 +1,94 @@
+"""Restartable LSST DP2 pilot workflow for one allocated Jean-Zay node."""
+
+import os
+
+
+ROOT = os.environ["LSST_DP2_ROOT"]
+HATS_BASE = os.environ["MMU_HATS_ROOT"]
+CATALOG = f"{ROOT}/catalog/objects.parquet"
+MANIFEST = f"{ROOT}/download_manifest.sqlite"
+MIRROR = f"{ROOT}/coadds"
+PARQUET = f"{ROOT}/parquet"
+HATS_OUTER = f"{HATS_BASE}/lsst_dp2"
+HATS_PROPERTIES = f"{HATS_OUTER}/lsst_dp2/lsst_dp2/hats.properties"
+REPORT = f"{ROOT}/validation_report.json"
+DOWNLOAD_DONE = f"{ROOT}/.download.complete"
+PARQUET_DONE = f"{ROOT}/.parquet.complete"
+INGEST_WORKERS = int(os.environ.get("LSST_DP2_INGEST_WORKERS", "4"))
+
+
+rule all:
+    input:
+        REPORT,
+
+
+rule download_coadds:
+    input:
+        catalog=CATALOG,
+        downloader="scripts/lsst_dp2/download_coadds.py",
+        common="scripts/lsst_dp2/common.py",
+    output:
+        touch(DOWNLOAD_DONE),
+    log:
+        f"{ROOT}/logs/download.log",
+    retries:
+        5
+    shell:
+        "python -u -m scripts.lsst_dp2.download_coadds "
+        "--catalog {input.catalog} --mirror-root {MIRROR} --manifest {MANIFEST} "
+        "--workers 4 >> {log} 2>&1"
+
+
+rule build_parquet:
+    input:
+        catalog=CATALOG,
+        downloads=DOWNLOAD_DONE,
+        builder="scripts/lsst_dp2/build_parent_sample_hats.py",
+        coadd="scripts/lsst_dp2/coadd.py",
+        schema="scripts/lsst_dp2/schema.py",
+        common="scripts/lsst_dp2/common.py",
+    output:
+        touch(PARQUET_DONE),
+    log:
+        f"{ROOT}/logs/build_parquet.log",
+    shell:
+        "python -u -m scripts.lsst_dp2.build_parent_sample_hats "
+        "--catalog {input.catalog} --manifest {MANIFEST} --scratch-dir {PARQUET} "
+        "--output-root {HATS_OUTER} --objects-per-shard 64 "
+        "--verify-checksums --require-all-bands --skip-ingest >> {log} 2>&1"
+
+
+rule ingest_hats:
+    input:
+        catalog=CATALOG,
+        parquet=PARQUET_DONE,
+        builder="scripts/lsst_dp2/build_parent_sample_hats.py",
+        schema="scripts/lsst_dp2/schema.py",
+    output:
+        HATS_PROPERTIES,
+    log:
+        f"{ROOT}/logs/ingest_hats.log",
+    shell:
+        "python -u -m scripts.lsst_dp2.build_parent_sample_hats "
+        "--catalog {input.catalog} --manifest {MANIFEST} --scratch-dir {PARQUET} "
+        "--output-root {HATS_OUTER} --objects-per-shard 64 --pixel-threshold 8192 "
+        "--ingest-workers {INGEST_WORKERS} --verify-checksums --only-ingest "
+        ">> {log} 2>&1"
+
+
+rule validate:
+    input:
+        catalog=CATALOG,
+        downloads=DOWNLOAD_DONE,
+        parquet=PARQUET_DONE,
+        hats=HATS_PROPERTIES,
+        validator="scripts/lsst_dp2/validate_parent_sample.py",
+    output:
+        REPORT,
+    log:
+        f"{ROOT}/logs/validate.log",
+    shell:
+        "python -u -m scripts.lsst_dp2.validate_parent_sample "
+        "--catalog {input.catalog} --manifest {MANIFEST} --scratch-dir {PARQUET} "
+        "--hats-root {HATS_OUTER} --verify-checksums --report {output} "
+        ">> {log} 2>&1"

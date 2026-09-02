@@ -48,13 +48,21 @@ def select_columns(available: set[str]) -> list[str]:
 
     wanted = required + ["refBand", "refExtendedness", "detect_isIsolated"]
     for band in BANDS:
-        wanted.extend([
-            f"{band}_psfFlux", f"{band}_psfFluxErr",
-            f"{band}_cModelFlux", f"{band}_cModelFluxErr",
-            f"{band}_ixx", f"{band}_iyy", f"{band}_ixy",
-            f"{band}_ixxPSF", f"{band}_iyyPSF", f"{band}_ixyPSF",
-            f"{band}_pixelFlags_inexact_psfCenter",
-        ])
+        wanted.extend(
+            [
+                f"{band}_psfFlux",
+                f"{band}_psfFluxErr",
+                f"{band}_cModelFlux",
+                f"{band}_cModelFluxErr",
+                f"{band}_ixx",
+                f"{band}_iyy",
+                f"{band}_ixy",
+                f"{band}_ixxPSF",
+                f"{band}_iyyPSF",
+                f"{band}_ixyPSF",
+                f"{band}_pixelFlags_inexact_psfCenter",
+            ]
+        )
     return [name for name in wanted if name in available]
 
 
@@ -86,30 +94,47 @@ def build_query(
     if where:
         clauses.append(f"({where})")
     top = f"TOP {limit} " if limit is not None else ""
-    return (
+    query = (
         f"SELECT {top}{', '.join(columns)}\n"
         "FROM dp2.Object AS obj\n"
         f"WHERE {' AND '.join(clauses)}"
     )
+    if limit is not None:
+        query += "\nORDER BY objectId"
+    return query
 
 
 def write_catalog(table: Table, output: str) -> None:
     path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
-    table.write(path, format="parquet", overwrite=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    table.write(temporary, format="parquet", overwrite=True)
+    os.replace(temporary, path)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--ra", type=float)
-    parser.add_argument("--dec", type=float)
-    parser.add_argument("--radius-deg", type=float)
-    parser.add_argument("--polygon", help="Whitespace/comma-separated RA Dec vertex pairs")
-    parser.add_argument("--where", help="Additional ADQL selection applied after the spatial cut")
+    parser.add_argument("--output", required=True, help="destination Parquet catalog")
+    parser.add_argument(
+        "--ra", type=float, help="cone center right ascension in degrees"
+    )
+    parser.add_argument("--dec", type=float, help="cone center declination in degrees")
+    parser.add_argument("--radius-deg", type=float, help="cone radius in degrees")
+    parser.add_argument(
+        "--polygon", help="Whitespace/comma-separated RA Dec vertex pairs"
+    )
+    parser.add_argument(
+        "--where", help="Additional ADQL selection applied after the spatial cut"
+    )
     parser.add_argument("--limit", type=int, help="Maximum number of catalog rows")
-    parser.add_argument("--tap-url", default=DEFAULT_TAP_URL)
-    parser.add_argument("--token-env", default="RSP_TOKEN")
+    parser.add_argument(
+        "--tap-url", default=DEFAULT_TAP_URL, help="Rubin DP2 TAP endpoint"
+    )
+    parser.add_argument(
+        "--token-env",
+        default="RSP_TOKEN",
+        help="environment variable holding the RSP token",
+    )
     args = parser.parse_args(argv)
 
     if args.limit is not None and args.limit <= 0:
@@ -117,7 +142,9 @@ def main(argv: list[str] | None = None) -> int:
 
     token = os.environ.get(args.token_env)
     if not token:
-        print(f"ERROR: environment variable {args.token_env} is not set", file=sys.stderr)
+        print(
+            f"ERROR: environment variable {args.token_env} is not set", file=sys.stderr
+        )
         return 2
     try:
         service = _authenticated_tap(args.tap_url, token)
@@ -130,7 +157,10 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(f"TAP job ended in phase {job.phase}")
         table = job.fetch_result().to_table()
         write_catalog(table, args.output)
-        Path(args.output + ".adql").write_text(query + "\n", encoding="ascii")
+        adql_path = Path(args.output + ".adql")
+        adql_tmp = adql_path.with_suffix(adql_path.suffix + ".tmp")
+        adql_tmp.write_text(query + "\n", encoding="ascii")
+        os.replace(adql_tmp, adql_path)
         print(f"Wrote {len(table)} objects to {args.output}", flush=True)
         return 0
     except Exception as exc:  # noqa: BLE001

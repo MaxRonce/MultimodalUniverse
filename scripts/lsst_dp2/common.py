@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 
 import numpy as np
-import pyarrow.parquet as pq
 from astropy.table import Table
 
 CATALOG_NAME = "lsst_dp2"
@@ -48,27 +47,33 @@ def read_catalog(path: str | os.PathLike[str]) -> Table:
     """Read a parent catalog from Parquet or any Astropy-supported format."""
     path = str(path)
     if path.lower().endswith((".parquet", ".pq")):
-        return Table.from_pandas(pq.read_table(path).to_pandas())
+        return Table.read(path, format="parquet")
     return Table.read(path)
 
 
-def resolve_column(table: Table, canonical_name: str, *, required: bool = True) -> str | None:
+def resolve_column(
+    table: Table, canonical_name: str, *, required: bool = True
+) -> str | None:
     """Resolve one canonical parent-catalog field against supported aliases."""
     for candidate in _COLUMN_ALIASES.get(canonical_name, (canonical_name,)):
         if candidate in table.colnames:
             return candidate
     if required:
         aliases = ", ".join(_COLUMN_ALIASES.get(canonical_name, (canonical_name,)))
-        raise ValueError(f"catalog is missing {canonical_name!r}; expected one of: {aliases}")
+        raise ValueError(
+            f"catalog is missing {canonical_name!r}; expected one of: {aliases}"
+        )
     return None
 
 
 def validate_catalog(table: Table) -> dict[str, str | None]:
     """Return the resolved core columns after validating row identifiers."""
     columns = {
-        name: resolve_column(table, name, required=name not in {
-            "ref_band", "ref_extendedness", "detect_is_isolated"
-        })
+        name: resolve_column(
+            table,
+            name,
+            required=name not in {"ref_band", "ref_extendedness", "detect_is_isolated"},
+        )
         for name in _COLUMN_ALIASES
     }
     if len(table) == 0:

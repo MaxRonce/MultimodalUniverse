@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from astropy.io import fits
@@ -71,12 +72,20 @@ def _write_maskedimage(path: Path, value: float, size: int = 256) -> None:
         },
     }
     payload = np.frombuffer(json.dumps(metadata).encode("ascii"), dtype=np.uint8)
-    json_hdu = fits.BinTableHDU.from_columns([
-        fits.Column(name="JSON", format=f"PB({len(payload)})", array=[payload])
-    ], name="JSON")
-    fits.HDUList([
-        fits.PrimaryHDU(), image_hdu, mask_hdu, variance_hdu, psf_hdu, json_hdu,
-    ]).writeto(path)
+    json_hdu = fits.BinTableHDU.from_columns(
+        [fits.Column(name="JSON", format=f"PB({len(payload)})", array=[payload])],
+        name="JSON",
+    )
+    fits.HDUList(
+        [
+            fits.PrimaryHDU(),
+            image_hdu,
+            mask_hdu,
+            variance_hdu,
+            psf_hdu,
+            json_hdu,
+        ]
+    ).writeto(path)
 
 
 def _catalog(path: Path) -> Table:
@@ -114,9 +123,15 @@ def _manifest(path: Path, mirror: Path) -> None:
             ) VALUES (?, ?, ?, 150.0, 2.0, ?, 'complete', 1, ?, ?, ?, 0.7, ?, ?)
             """,
             (
-                1234, 56, band, str(image_path), image_path.stat().st_size,
-                build.sha256_file(image_path), f"ivo://dp2/{band}",
-                "BAD,NO_DATA,SAT,SUSPECT,UNMASKEDNAN", download.utcnow(),
+                1234,
+                56,
+                band,
+                str(image_path),
+                image_path.stat().st_size,
+                build.sha256_file(image_path),
+                f"ivo://dp2/{band}",
+                "BAD,NO_DATA,SAT,SUSPECT,UNMASKEDNAN",
+                download.utcnow(),
             ),
         )
     con.commit()
@@ -125,15 +140,29 @@ def _manifest(path: Path, mirror: Path) -> None:
 
 def test_query_column_discovery_and_polygon():
     available = {
-        "objectId", "coord_ra", "coord_dec", "tract", "patch", "refBand",
-        "i_psfFlux", "i_ixxPSF", "i_iyyPSF", "i_ixyPSF",
+        "objectId",
+        "coord_ra",
+        "coord_dec",
+        "tract",
+        "patch",
+        "refBand",
+        "i_psfFlux",
+        "i_ixxPSF",
+        "i_iyyPSF",
+        "i_ixyPSF",
     }
     columns = query.select_columns(available)
     assert columns[:5] == ["objectId", "coord_ra", "coord_dec", "tract", "patch"]
     assert "i_ixxPSF" in columns
-    args = query.argparse.Namespace(polygon="0,0 1,0 1,1", ra=None, dec=None, radius_deg=None)
-    assert "POLYGON('ICRS', 0.0, 0.0, 1.0, 0.0, 1.0, 1.0)" in query.spatial_predicate(args)
-    assert query.build_query(columns, "1=1", None, 4).startswith("SELECT TOP 4 ")
+    args = query.argparse.Namespace(
+        polygon="0,0 1,0 1,1", ra=None, dec=None, radius_deg=None
+    )
+    assert "POLYGON('ICRS', 0.0, 0.0, 1.0, 0.0, 1.0, 1.0)" in query.spatial_predicate(
+        args
+    )
+    limited_query = query.build_query(columns, "1=1", None, 4)
+    assert limited_query.startswith("SELECT TOP 4 ")
+    assert limited_query.endswith("ORDER BY objectId")
 
 
 def test_patch_psf_fallback_ignores_invalid_object_moments(tmp_path):
@@ -148,9 +177,27 @@ def test_manifest_is_restartable(tmp_path):
     catalog_path = tmp_path / "objects.parquet"
     _catalog(catalog_path)
     con = download.connect_manifest(str(tmp_path / "manifest.sqlite"))
-    assert download.initialize_tasks(con, str(catalog_path), str(tmp_path / "mirror")) == 6
-    assert download.initialize_tasks(con, str(catalog_path), str(tmp_path / "mirror")) == 6
+    assert (
+        download.initialize_tasks(con, str(catalog_path), str(tmp_path / "mirror")) == 6
+    )
+    assert (
+        download.initialize_tasks(con, str(catalog_path), str(tmp_path / "mirror")) == 6
+    )
     assert con.execute("SELECT COUNT(*) FROM coadds").fetchone()[0] == 6
+    con.close()
+
+
+def test_manifest_rejects_a_changed_catalog(tmp_path):
+    catalog_path = tmp_path / "objects.parquet"
+    catalog = _catalog(catalog_path)
+    manifest_path = tmp_path / "manifest.sqlite"
+    con = download.connect_manifest(str(manifest_path))
+    download.initialize_tasks(con, str(catalog_path), str(tmp_path / "mirror"))
+
+    catalog["objectId"][0] = 999
+    catalog.write(catalog_path, format="parquet", overwrite=True)
+    with pytest.raises(RuntimeError, match="manifest identity differs"):
+        download.initialize_tasks(con, str(catalog_path), str(tmp_path / "mirror"))
     con.close()
 
 
@@ -158,30 +205,39 @@ def test_manifest_status_does_not_require_token(tmp_path, monkeypatch, capsys):
     catalog_path = tmp_path / "objects.parquet"
     _catalog(catalog_path)
     monkeypatch.delenv("RSP_TOKEN", raising=False)
-    result = download.main([
-        "--catalog", str(catalog_path),
-        "--mirror-root", str(tmp_path / "mirror"),
-        "--manifest", str(tmp_path / "manifest.sqlite"),
-        "--status-only",
-    ])
+    result = download.main(
+        [
+            "--catalog",
+            str(catalog_path),
+            "--mirror-root",
+            str(tmp_path / "mirror"),
+            "--manifest",
+            str(tmp_path / "manifest.sqlite"),
+            "--status-only",
+        ]
+    )
     assert result == 0
     assert "pending=6" in capsys.readouterr().out
 
 
 def test_select_sia_record_requires_exact_identity():
-    table = Table({
-        "lsst_tract": [1234, 1234],
-        "lsst_patch": [55, 56],
-        "lsst_band": ["i", "i"],
-    })
+    table = Table(
+        {
+            "lsst_tract": [1234, 1234],
+            "lsst_patch": [55, 56],
+            "lsst_band": ["i", "i"],
+        }
+    )
     assert download.select_sia_record(table, 1234, 56, "i") == 1
 
 
 def test_select_full_product_url_requires_this_semantics():
-    datalink = Table({
-        "semantics": ["#preview", "#this"],
-        "access_url": ["https://example/preview", "https://example/deep-coadd"],
-    })
+    datalink = Table(
+        {
+            "semantics": ["#preview", "#this"],
+            "access_url": ["https://example/preview", "https://example/deep-coadd"],
+        }
+    )
     assert download.select_full_product_url(datalink) == "https://example/deep-coadd"
 
 
@@ -231,16 +287,25 @@ def test_end_to_end_parquet_and_hats(tmp_path):
     scratch = tmp_path / "scratch"
     output = tmp_path / "hats"
 
-    result = build.main([
-        "--catalog", str(catalog_path),
-        "--manifest", str(manifest_path),
-        "--scratch-dir", str(scratch),
-        "--output-root", str(output),
-        "--objects-per-shard", "1",
-        "--pixel-threshold", "32",
-        "--ingest-workers", "1",
-        "--verify-checksums",
-    ])
+    result = build.main(
+        [
+            "--catalog",
+            str(catalog_path),
+            "--manifest",
+            str(manifest_path),
+            "--scratch-dir",
+            str(scratch),
+            "--output-root",
+            str(output),
+            "--objects-per-shard",
+            "1",
+            "--pixel-threshold",
+            "32",
+            "--ingest-workers",
+            "1",
+            "--verify-checksums",
+        ]
+    )
     assert result == 0
     shards = sorted(scratch.glob("*.parquet"))
     assert len(shards) == 2
@@ -253,17 +318,31 @@ def test_end_to_end_parquet_and_hats(tmp_path):
     assert psf_image.shape == (6, build.PSF_SIZE, build.PSF_SIZE)
     assert np.allclose(psf_image.sum(axis=(-2, -1)), 1.0)
     assert image["psf_image_valid"] == [True] * len(BANDS)
-    assert table.schema.field("image").type.field("mask_bits").type.value_type.value_type.value_type == build.pa.int32()
+    assert (
+        table.schema.field("image")
+        .type.field("mask_bits")
+        .type.value_type.value_type.value_type
+        == pa.int32()
+    )
     assert all(image["band_present"])
     assert image["dataset_id"][3] == "ivo://dp2/i"
     assert list(output.rglob("hats.properties"))
-    assert validate.main([
-        "--catalog", str(catalog_path),
-        "--manifest", str(manifest_path),
-        "--scratch-dir", str(scratch),
-        "--hats-root", str(output),
-        "--verify-checksums",
-    ]) == 0
+    assert (
+        validate.main(
+            [
+                "--catalog",
+                str(catalog_path),
+                "--manifest",
+                str(manifest_path),
+                "--scratch-dir",
+                str(scratch),
+                "--hats-root",
+                str(output),
+                "--verify-checksums",
+            ]
+        )
+        == 0
+    )
 
 
 def test_missing_band_is_explicitly_padded(tmp_path):
@@ -279,8 +358,14 @@ def test_missing_band_is_explicitly_padded(tmp_path):
     manifest = build.load_manifest(str(manifest_path))
     rows = build.grouped_rows(catalog, columns)[0]
     build.process_patch(
-        catalog, rows, columns, manifest, str(tmp_path / "scratch"), 2,
-        build.DEFAULT_REJECT_MASK_PLANES, False,
+        catalog,
+        rows,
+        columns,
+        manifest,
+        str(tmp_path / "scratch"),
+        2,
+        build.DEFAULT_REJECT_MASK_PLANES,
+        False,
     )
     table = pq.read_table(next((tmp_path / "scratch").glob("*.parquet")))
     image = table.column("image")[0].as_py()
@@ -299,7 +384,10 @@ def test_build_contract_rejects_changed_manifest(tmp_path):
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     build.ensure_build_contract(
-        str(scratch), str(catalog_path), str(manifest_path), 64,
+        str(scratch),
+        str(catalog_path),
+        str(manifest_path),
+        64,
         build.DEFAULT_REJECT_MASK_PLANES,
     )
     con = sqlite3.connect(manifest_path)
@@ -308,6 +396,9 @@ def test_build_contract_rejects_changed_manifest(tmp_path):
     con.close()
     with pytest.raises(RuntimeError, match="contract differs"):
         build.ensure_build_contract(
-            str(scratch), str(catalog_path), str(manifest_path), 64,
+            str(scratch),
+            str(catalog_path),
+            str(manifest_path),
+            64,
             build.DEFAULT_REJECT_MASK_PLANES,
         )

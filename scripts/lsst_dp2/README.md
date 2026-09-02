@@ -1,306 +1,303 @@
-# LSST DP2 image ingestion
+# LSST DP2 images in MMU
 
-This pipeline mirrors complete Rubin DP2 `deep_coadd` exposures for the
-patches intersecting a parent Object catalog, then creates fixed-size MMU image
-rows and a HATS catalog.
+This pipeline builds an MMU HATS image catalog from Rubin LSST DP2
+`deep_coadd` products. It mirrors each useful complete `(tract, patch, band)`
+FITS once, then extracts all source cutouts locally.
 
-## Output contract
+The implementation is split by responsibility:
 
-Each source has a six-band `image` struct in `u,g,r,i,z,y` order:
+- `query_catalog.py`: authenticated DP2 Object TAP query;
+- `download_coadds.py`: resumable SIA/DataLink mirror with a SQLite manifest;
+- `coadd.py`: calibrated FITS, mask, WCS, and local cell-PSF extraction;
+- `schema.py`: nested Arrow representation of the MMU image contract;
+- `build_parent_sample_hats.py`: restartable patch processing and HATS ingest;
+- `validate_parent_sample.py`: fail-closed catalog-to-HATS validation;
+- `Snakefile`: single-node Jean-Zay workflow with durable stage markers.
 
-| Field | Shape/type | Meaning |
-|---|---|---|
-| `flux` | `(6,160,160) float32` | calibrated sky flux in nJy |
-| `ivar` | `(6,160,160) float32` | inverse variance in nJy^-2 |
-| `mask` | `(6,160,160) bool` | `True` only for usable, finite pixels |
-| `mask_bits` | `(6,160,160) int32` | unmodified Rubin mask bit field |
-| `psf_image` | `(6,35,35) float32` | normalized local CellPointSpreadFunction convolution kernel |
-| `psf_image_valid` | `(6,) bool` | whether the Rubin PSF cell exists and contains a valid kernel |
-| `psf_fwhm` | `(6,) float32` | arcsec; Object moments, then SIA fallback |
-| `scale` | `(6,) float32` | 0.2 arcsec/pixel |
-| `band_present` | `(6,) bool` | whether the patch-band was mirrored |
+## Data contract
 
-The default clean-pixel policy rejects `BAD`, `SAT`, `NO_DATA`, `SUSPECT`,
-and `UNMASKEDNAN`. The original bits and per-file mask-plane mapping remain in
-the row, so a different policy can be reconstructed without downloading DP2
-again.
+Each source has a fixed `160 x 160` cutout centered from its DP2 Object
+`coord_ra`, `coord_dec`. Band order is always `u, g, r, i, z, y`.
 
-Each downloaded DP2 FITS contains a `CellPointSpreadFunction`: a 4-d grid of
-35x35 convolution kernels that is approximately constant within each 150x150
-coadd cell. The builder maps each source position to its cell using the FITS
-WCS and archive JSON bounds, extracts the local kernel, normalizes it to unit
-sum, and stores it in `psf_image`. The scalar `psf_fwhm` is retained as a
-convenient summary, but morphology-aware consumers should use `psf_image`.
-Rubin may explicitly mark cells as missing; these are zero-filled with
-`psf_image_valid=False` rather than imputed from a neighboring cell.
+The `image` struct contains:
 
-## 1. Query the parent sample
+| Field | Shape | Meaning |
+| --- | --- | --- |
+| `flux` | `(6,160,160)` float32 | calibrated coadd surface pixels in `nJy` |
+| `ivar` | `(6,160,160)` float32 | inverse variance in `nJy^-2` |
+| `mask` | `(6,160,160)` bool | valid pixel after Rubin mask rejection |
+| `mask_bits` | `(6,160,160)` int32 | original Rubin integer bit mask |
+| `psf_image` | `(6,35,35)` float32 | normalized local DP2 cell PSF |
+| `psf_image_valid` | `(6,)` bool | whether the local PSF cell is usable |
+| `psf_fwhm` | `(6,)` float32 | catalog/SIA scalar PSF summary in arcsec |
+| `scale` | `(6,)` float32 | pixel scale, currently `0.2` arcsec/pixel |
+| `band_present` | `(6,)` bool | availability of each deep coadd |
+| provenance | `(6,)` | dataset ID, SHA-256, mask-plane map, PSF source |
 
-Install the API dependencies and expose a Rubin token with `read:image` and
-catalog access. Do not put the token in a file or command-line argument.
+Invalid pixels have `ivar=0` and `mask=False`. Non-finite input flux is stored
+as zero only where the mask rejects that pixel. A missing or non-finite Rubin
+PSF cell is stored as a zero kernel with `psf_image_valid=False`; it is never
+replaced with a neighboring PSF.
+
+The default rejected mask planes are `BAD,SAT,NO_DATA,SUSPECT,UNMASKEDNAN`.
+The raw mask bits and their plane mapping remain in the output, so downstream
+users can define a different policy.
+
+## Local verification
+
+From the repository root:
 
 ```bash
-uv pip install pyvo requests
-export RSP_TOKEN='...'
-
-uv run python -m scripts.lsst_dp2.query_catalog \
-  --ra 53.1246023 --dec -27.7404715 --radius-deg 0.05 \
-  --where "refExtendedness = 1 AND detect_isIsolated = 1 AND i_cModelFlux / i_cModelFluxErr >= 10" \
-  --output "$WORK/lsst_dp2/catalog/objects.parquet"
+uv sync --frozen --extra dev --extra viz
+uv run pytest -q tests/test_lsst_dp2_build.py tests/test_hats_configs.py
+uvx ruff check scripts/lsst_dp2 tests/test_lsst_dp2_build.py
 ```
 
-Here `refExtendedness = 1` selects extended sources (galaxy candidates), while
-the `i`-band S/N cut avoids filling a pilot sample with threshold detections.
-This is a morphological selection, not a spectroscopically confirmed label.
+The tests use synthetic FITS files and do not contact Rubin services.
 
-For a polygon, replace the cone arguments with, for example:
+## Jean-Zay installation
+
+Everything below, including the repository, virtual environment, caches,
+temporary files, logs, coadds, Parquet, and HATS output, lives under `$SCRATCH`.
+Run the setup on a `prepost` allocation, not on a login node.
 
 ```bash
---polygon "53.0,-28.0 53.3,-28.0 53.3,-27.7 53.0,-27.7"
+srun \
+  --account=jrx@cpu \
+  --partition=prepost \
+  --nodes=1 \
+  --ntasks=1 \
+  --cpus-per-task=8 \
+  --time=20:00:00 \
+  --pty bash -i
 ```
 
-The exact ADQL is saved beside the catalog as `objects.parquet.adql`.
-
-### Four-source authenticated smoke
-
-From the repository root, create an isolated work area and provide a Rubin API
-token without storing it in the repository:
+Inside the allocation:
 
 ```bash
-cd /path/to/MultimodalUniverse
-uv pip install --python .venv/bin/python pyvo requests
+set -euo pipefail
 
-export RSP_TOKEN='...'
-export LSST_SMOKE="$PWD/.local/lsst_dp2_smoke4"
-mkdir -p "$LSST_SMOKE/catalog"
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+mkdir -p "$MMU_JZ_ROOT"
+cd "$MMU_JZ_ROOT"
+
+# First installation only. For an existing checkout, use git pull --ff-only.
+git clone --branch feat/lsst-dp2 \
+  https://github.com/MaxRonce/MultimodalUniverse.git
+cd MultimodalUniverse
+
+export LSST_DP2_RUN_NAME="pilot5000_clean"
+source scripts/lsst_dp2/jeanzay_env.sh
+
+# Bootstrap uv itself under SCRATCH when it is not already available.
+if ! command -v uv >/dev/null 2>&1; then
+  python3 -m venv "$MMU_JZ_ROOT/venvs/uv"
+  "$MMU_JZ_ROOT/venvs/uv/bin/pip" install --upgrade pip uv
+  export PATH="$MMU_JZ_ROOT/venvs/uv/bin:$PATH"
+fi
+
+uv sync --frozen --extra dev --extra viz
+"$MMU_PYTHON" -c \
+  "import mmu, astropy, pyarrow, pyvo, hats, lsdb; print('installation OK')"
 ```
 
-Query exactly four Object rows in one small sky region:
+On subsequent sessions, restore the same environment with:
 
 ```bash
-.venv/bin/python -m scripts.lsst_dp2.query_catalog \
-  --ra 53.1246023 --dec -27.7404715 --radius-deg 0.02 \
-  --limit 4 \
-  --output "$LSST_SMOKE/catalog/objects.parquet"
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export LSST_DP2_RUN_NAME="pilot5000_clean"
+cd "$MMU_JZ_ROOT/MultimodalUniverse"
+source scripts/lsst_dp2/jeanzay_env.sh
 ```
 
-Inspect the saved ADQL and verify the row count before downloading images:
+## Build a 5,000-galaxy validation sample
+
+### 1. Authenticate
+
+Create a fresh token at the Rubin Science Platform. Do not write it to a file
+or place it directly in shell history.
 
 ```bash
-cat "$LSST_SMOKE/catalog/objects.parquet.adql"
-.venv/bin/python -c \
-  "import pyarrow.parquet as p; print(p.read_metadata('$LSST_SMOKE/catalog/objects.parquet').num_rows)"
-.venv/bin/python -c \
-  "import pyarrow.parquet as p; t=p.read_table('$LSST_SMOKE/catalog/objects.parquet', columns=['tract','patch']); print(sorted(set(zip(t['tract'].to_pylist(), t['patch'].to_pylist()))))"
+read -rsp "RSP token: " RSP_TOKEN
+echo
+export RSP_TOKEN
 ```
 
-Mirror the complete six-band patch products. Four sources produce four MMU
-cutouts, while each unique patch requires six network products (`ugrizy`):
+### 2. Query the catalog
+
+This validation sample selects extended sources but does not impose S/N or
+isolation cuts. `--limit` queries are ordered by `objectId`, so rebuilding the
+same cone is deterministic. The saved `.adql` file records the exact query.
 
 ```bash
-.venv/bin/python -m scripts.lsst_dp2.download_coadds \
-  --catalog "$LSST_SMOKE/catalog/objects.parquet" \
-  --mirror-root "$LSST_SMOKE/coadds" \
-  --manifest "$LSST_SMOKE/download_manifest.sqlite" \
-  --workers 2
-```
-
-Check that all `6 * number_of_unique_patches` tasks completed:
-
-```bash
-.venv/bin/python -m scripts.lsst_dp2.download_coadds \
-  --catalog "$LSST_SMOKE/catalog/objects.parquet" \
-  --mirror-root "$LSST_SMOKE/coadds" \
-  --manifest "$LSST_SMOKE/download_manifest.sqlite" \
-  --status-only
-```
-
-Build and ingest the four rows:
-
-```bash
-.venv/bin/python -m scripts.lsst_dp2.build_parent_sample_hats \
-  --catalog "$LSST_SMOKE/catalog/objects.parquet" \
-  --manifest "$LSST_SMOKE/download_manifest.sqlite" \
-  --scratch-dir "$LSST_SMOKE/parquet" \
-  --output-root "$LSST_SMOKE/hats/lsst_dp2" \
-  --objects-per-shard 2 \
-  --pixel-threshold 32 \
-  --ingest-workers 1 \
-  --verify-checksums \
-  --require-all-bands
-```
-
-The build must report four rows. Confirm the restart shards and HATS metadata:
-
-```bash
-.venv/bin/python -c \
-  "from pathlib import Path; import pyarrow.parquet as p; q=Path('$LSST_SMOKE/parquet'); print(sum(p.read_metadata(x).num_rows for x in q.glob('part-*.parquet')))"
-find "$LSST_SMOKE/hats" -name hats.properties -print
-```
-
-Run the fail-closed scientific validation gate:
-
-```bash
-.venv/bin/python -m scripts.lsst_dp2.validate_parent_sample \
-  --catalog "$LSST_SMOKE/catalog/objects.parquet" \
-  --manifest "$LSST_SMOKE/download_manifest.sqlite" \
-  --scratch-dir "$LSST_SMOKE/parquet" \
-  --hats-root "$LSST_SMOKE/hats/lsst_dp2" \
-  --verify-checksums
-```
-
-This checks exact object identity, WCS centering within half a pixel on each
-axis, native FITS units, six-band shapes, finite flux/ivar, mask consistency,
-PSF and dataset provenance, and equal catalog/Parquet/HATS row counts. The
-machine-readable receipt is `parquet/validation_report.json`.
-
-## 2. Mirror complete useful patches
-
-Run this from Jean-Zay or another host allowed to access the RSP API. Start at
-low concurrency and set `--workers` from the live RSP quota page. Re-running
-the same command retries failed manifest rows and skips completed checksummed
-files.
-
-```bash
-uv run --no-sync python -m scripts.lsst_dp2.download_coadds \
-  --catalog "$WORK/lsst_dp2/catalog/objects.parquet" \
-  --mirror-root "$WORK/lsst_dp2/coadds" \
-  --manifest "$WORK/lsst_dp2/download_manifest.sqlite" \
-  --workers 4
-```
-
-Use `--limit 6` for the first one-patch smoke. The downloader follows the SIA
-DataLink `#this` record (not a geometrically approximated SODA cutout). A product
-is written as `tract=<id>/patch=<id>/band=<band>/deep_coadd.fits` only after FITS
-validation, `fsync`, checksum, and atomic rename.
-
-Inspect progress and the latest failures without requiring a Rubin token:
-
-```bash
-uv run --no-sync python -m scripts.lsst_dp2.download_coadds \
-  --catalog "$WORK/lsst_dp2/catalog/objects.parquet" \
-  --mirror-root "$WORK/lsst_dp2/coadds" \
-  --manifest "$WORK/lsst_dp2/download_manifest.sqlite" \
-  --status-only
-```
-
-## 3. Build restartable Parquet shards
-
-For a smoke build:
-
-```bash
-uv run python -m scripts.lsst_dp2.build_parent_sample_hats \
-  --catalog "$WORK/lsst_dp2/catalog/objects.parquet" \
-  --manifest "$WORK/lsst_dp2/download_manifest.sqlite" \
-  --scratch-dir "$WORK/lsst_dp2/parquet" \
-  --output-root "$WORK/mmu_hats/lsst_dp2" \
-  --verify-checksums
-```
-
-For a scatter/gather production build, submit independent shard jobs:
-
-```bash
-for i in $(seq 0 63); do
-  sbatch --export=ALL,SHARD_IDX="$i" scripts/lsst_dp2/build_shard.slurm
-done
-```
-
-Each shard command must include:
-
-```bash
---num-shards 64 --shard-idx "$SHARD_IDX" --skip-ingest
-```
-
-After all 64 jobs succeed, run one gather job with the same catalog, manifest,
-scratch and output paths plus `--only-ingest`. Never run gather while scatter
-jobs are still writing Parquet files.
-
-## Scaling
-
-A six-band 3400x3400 patch requires about 0.83 GB just for float32 image and
-variance plus int32 mask planes, before the additional ExposureF extensions and
-compression. The MMU row payload is about 2.03 MB/source uncompressed when
-including flux, ivar, boolean clean mask, raw int32 mask bits, and six 35x35
-PSF kernels; 5,000 sources are therefore about 10.2 GB before
-Parquet/Zstandard compression. Network volume
-scales with unique patches, while final HATS volume scales with source count.
-
-### 5,000-galaxy Jean-Zay pilot
-
-Jean-Zay compute nodes do not have Internet access. Run the TAP query and SIA
-mirror from a login or pre/post-processing node with outbound access, then run
-the restartable cutout build on CPU compute nodes. Keep data and caches under
-`$WORK` or `$SCRATCH`, not `$HOME`.
-
-Start with a compact region so the objects reuse a small number of patches:
-
-```bash
-export LSST_DP2_ROOT="$WORK/lsst_dp2_pilot5000"
-mkdir -p "$LSST_DP2_ROOT/catalog"
-
-uv run --no-sync python -m scripts.lsst_dp2.query_catalog \
-  --ra 53.1246023 --dec -27.7404715 --radius-deg 0.20 \
-  --where "refExtendedness = 1 AND detect_isIsolated = 1 AND i_cModelFlux / i_cModelFluxErr >= 10" \
+"$MMU_PYTHON" -u -m scripts.lsst_dp2.query_catalog \
+  --ra 53.1246023 \
+  --dec -27.7404715 \
+  --radius-deg 0.20 \
+  --where "refExtendedness = 1" \
   --limit 5000 \
   --output "$LSST_DP2_ROOT/catalog/objects.parquet"
 ```
 
-Require exactly 5,000 unique IDs and inspect the number of unique patches,
-which controls mirror volume:
+This selection is only a validation pilot. Production must enumerate the
+desired DP2 footprint without S/N, isolation, or morphology cuts and preserve
+the corresponding catalog metadata for downstream selections.
+
+### 3. Check the query result
+
+Do not continue if the cone contains fewer than 5,000 extended objects.
 
 ```bash
-uv run --no-sync python - <<'PY'
+"$MMU_PYTHON" - <<'PY'
 import os
 from pathlib import Path
 import pyarrow.parquet as pq
 
-p = Path(os.environ["LSST_DP2_ROOT"]) / "catalog/objects.parquet"
-t = pq.read_table(p, columns=["objectId", "tract", "patch"])
-ids = t["objectId"].to_pylist()
-patches = set(zip(t["tract"].to_pylist(), t["patch"].to_pylist()))
-assert len(ids) == 5000 and len(set(ids)) == 5000
-print(f"objects={len(ids)} unique_patches={len(patches)} download_tasks={6 * len(patches)}")
+path = Path(os.environ["LSST_DP2_ROOT"]) / "catalog/objects.parquet"
+table = pq.read_table(path, columns=["objectId", "tract", "patch"])
+ids = table["objectId"].to_pylist()
+patches = set(zip(table["tract"].to_pylist(), table["patch"].to_pylist()))
+assert len(ids) == 5000, f"expected 5000 rows, found {len(ids)}"
+assert len(ids) == len(set(ids)), "duplicate objectId"
+print(f"objects={len(ids)} patches={len(patches)} download_tasks={6 * len(patches)}")
 PY
 ```
 
-Mirror from the connected node; rerunning this command resumes the manifest:
+If it returns fewer rows, increase `--radius-deg` and use a new
+`LSST_DP2_RUN_NAME`. A manifest is deliberately bound to one exact catalog and
+mirror root.
+
+### 4. Run the complete workflow
+
+Inside the interactive allocation:
 
 ```bash
-uv run --no-sync python -u -m scripts.lsst_dp2.download_coadds \
+bash scripts/lsst_dp2/run_prepost.sh
+```
+
+The DAG performs, in order:
+
+1. resumable SIA downloads with four workers;
+2. patch-local cutout extraction into restartable Parquet shards;
+3. HATS ingestion with four Dask workers;
+4. checksum, WCS, centering, unit, shape, mask, ivar, PSF, provenance, row-count,
+   and HATS metadata validation.
+
+Transient Rubin/proxy failures are retried by Snakemake. Running the same
+command again resumes complete downloads and Parquet files.
+
+For a launch that survives terminal disconnection, leave the interactive
+allocation after installation and catalog creation. Exports made inside
+`srun` do not propagate back to the login shell, so restore them there before
+submitting:
+
+```bash
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export LSST_DP2_RUN_NAME="pilot5000_clean"
+cd "$MMU_JZ_ROOT/MultimodalUniverse"
+source scripts/lsst_dp2/jeanzay_env.sh
+read -rsp "RSP token: " RSP_TOKEN
+echo
+export RSP_TOKEN
+
+mkdir -p "$LSST_DP2_ROOT/logs"
+JOB_ID=$(sbatch --parsable \
+  --account=jrx@cpu \
+  --partition=prepost \
+  --export=ALL \
+  --output="$LSST_DP2_ROOT/logs/workflow-%j.out" \
+  --error="$LSST_DP2_ROOT/logs/workflow-%j.err" \
+  scripts/lsst_dp2/pilot_prepost.slurm)
+echo "$JOB_ID"
+```
+
+### 5. Monitor
+
+```bash
+squeue -j "$JOB_ID"
+tail -F "$LSST_DP2_ROOT/logs/workflow-$JOB_ID.out"
+tail -F "$LSST_DP2_ROOT/logs/download.log"
+tail -F "$LSST_DP2_ROOT/logs/build_parquet.log"
+tail -F "$LSST_DP2_ROOT/logs/ingest_hats.log"
+tail -F "$LSST_DP2_ROOT/logs/validate.log"
+```
+
+After the job leaves `squeue`, check terminal state rather than assuming that
+disappearance means success:
+
+```bash
+sacct -j "$JOB_ID" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS
+```
+
+### 6. Acceptance gate
+
+```bash
+"$MMU_PYTHON" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["LSST_DP2_ROOT"])
+report = json.loads((root / "validation_report.json").read_text())
+assert report["status"] == "PASS"
+assert report["catalog_rows"] == report["parquet_rows"] == report["hats_rows"] == 5000
+assert report["center_checks"] == 6 * 5000
+print(json.dumps({
+    "status": report["status"],
+    "rows": report["hats_rows"],
+    "coadds": report["coadd_products"],
+    "max_center_offset_pix": report["max_center_radial_offset_pix"],
+    "psf_valid_fractions": report["psf_valid_fractions"],
+    "elapsed_seconds": report["elapsed_seconds"],
+}, indent=2))
+PY
+```
+
+The final catalog is below:
+
+```text
+$MMU_HATS_ROOT/lsst_dp2/lsst_dp2/lsst_dp2/
+```
+
+## Recovery
+
+Inspect the download manifest without a token:
+
+```bash
+"$MMU_PYTHON" -m scripts.lsst_dp2.download_coadds \
   --catalog "$LSST_DP2_ROOT/catalog/objects.parquet" \
   --mirror-root "$LSST_DP2_ROOT/coadds" \
   --manifest "$LSST_DP2_ROOT/download_manifest.sqlite" \
-  --workers 4
+  --status-only
 ```
 
-For this pilot, use 16 scatter jobs. Run the gather only after every scatter
-job has completed successfully:
+If tasks reached the attempt limit after a resolved external outage:
 
 ```bash
-mkdir -p logs
-for i in $(seq 0 15); do
-  sbatch --export=ALL,LSST_DP2_ROOT="$LSST_DP2_ROOT",NUM_SHARDS=16,SHARD_IDX="$i" \
-    scripts/lsst_dp2/build_shard.slurm
-done
+"$MMU_PYTHON" -m scripts.lsst_dp2.download_coadds \
+  --catalog "$LSST_DP2_ROOT/catalog/objects.parquet" \
+  --mirror-root "$LSST_DP2_ROOT/coadds" \
+  --manifest "$LSST_DP2_ROOT/download_manifest.sqlite" \
+  --reset-failed --workers 2
 ```
 
-After `sacct` shows that all 16 jobs completed with exit code `0:0`, submit the
-single HATS gather and fail-closed validation job:
+Do not delete individual Parquet files or edit the SQLite database manually.
+If the catalog, mask policy, schema, or processing code changes, start a new
+`LSST_DP2_RUN_NAME`. The build contract intentionally refuses to mix products
+from different inputs or code versions.
 
-```bash
-sbatch --export=ALL,LSST_DP2_ROOT="$LSST_DP2_ROOT" \
-  scripts/lsst_dp2/gather_validate.slurm
-```
+## Scientific release gate
 
-The pilot is complete only when this job exits `0:0` and
-`$LSST_DP2_ROOT/parquet/validation_report.json` contains `"status": "PASS"`.
+A technical `PASS` proves internal consistency, not absence of scientific
+bias. Before a release or full DP2 production run, compare a fixed independent
+sample against Butler-generated cutouts for:
 
-## Required validation
+- flux, variance, integer mask, WCS, dimensions, and units;
+- catalog aperture/PSF photometry reconstructed from the cutouts;
+- normalized background residuals and resampling-induced covariance;
+- local PSF kernel selection and invalid-cell frequency;
+- truncation and edge effects as a function of size, brightness, and position.
 
-1. Compare one patch-band against Butler for flux, variance, integer mask, WCS,
-   dimensions and pixel scale.
-2. Assert six channels, finite flux/ivar, non-negative ivar, and
-   `ivar[~mask] == 0` after HATS read-back.
-3. Confirm catalog row count equals HATS row count and object IDs are unique.
-4. Inspect the SQLite manifest for failed or incomplete tasks before claiming
-   production completion.
+Record that comparison, the git commit, saved ADQL, manifest identity, build
+contract, validation report, Slurm receipt, and final HATS row count as the
+dataset provenance bundle.

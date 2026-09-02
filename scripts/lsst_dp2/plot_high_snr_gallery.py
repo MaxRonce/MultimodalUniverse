@@ -44,7 +44,9 @@ def _rgb(
         plane = flux[index].copy()
         valid = common_mask & np.isfinite(plane)
         sky_valid = valid & sky
-        background = np.median(plane[sky_valid]) if sky_valid.any() else np.median(plane[valid])
+        background = (
+            np.median(plane[sky_valid]) if sky_valid.any() else np.median(plane[valid])
+        )
         plane[~valid] = background
         plane = gaussian_filter(plane, smooth_sigma) if smooth_sigma > 0 else plane
         residual = plane[sky_valid] - np.median(plane[sky_valid])
@@ -70,8 +72,11 @@ def main() -> None:
     args = parser.parse_args()
 
     columns = [
-        "object_id", "ref_extendedness", "detect_is_isolated",
-        "i_cModelFlux", "i_cModelFluxErr",
+        "object_id",
+        "ref_extendedness",
+        "detect_is_isolated",
+        "i_cModelFlux",
+        "i_cModelFluxErr",
     ]
     metadata = HATSDataset(args.hats_path, columns=columns)
     ranked = []
@@ -79,7 +84,11 @@ def main() -> None:
         row = metadata[index]
         flux = _scalar(row["i_cModelFlux"])
         error = _scalar(row["i_cModelFluxErr"])
-        snr = flux / error if np.isfinite(flux) and np.isfinite(error) and error > 0 else np.nan
+        snr = (
+            flux / error
+            if np.isfinite(flux) and np.isfinite(error) and error > 0
+            else np.nan
+        )
         if (
             bool(row["detect_is_isolated"])
             and _scalar(row["ref_extendedness"]) >= 0.5
@@ -95,7 +104,9 @@ def main() -> None:
     dataset = HATSDataset(args.hats_path)
     columns_count = min(4, len(selected))
     rows_count = math.ceil(len(selected) / columns_count)
-    fig, axes = plt.subplots(rows_count, columns_count, figsize=(4 * columns_count, 4 * rows_count))
+    fig, axes = plt.subplots(
+        rows_count, columns_count, figsize=(4 * columns_count, 4 * rows_count)
+    )
     axes = np.atleast_1d(axes).reshape(-1)
     for axis, (snr, index) in zip(axes, selected):
         sample = dataset[index]
@@ -110,7 +121,7 @@ def main() -> None:
         )
         axis.set_title(f"{sample['object_id']}  S/N$_i$={snr:.0f}", fontsize=10)
         axis.set_axis_off()
-    for axis in axes[len(selected):]:
+    for axis in axes[len(selected) :]:
         axis.set_visible(False)
     fig.suptitle("LSST DP2 galaxies - asinh RGB (i/r/g)", fontsize=14)
     fig.tight_layout()
