@@ -409,6 +409,51 @@ The validated MMU catalog is:
 $LSST_DP2_ROOT/hats/lsst_dp2/lsst_dp2/lsst_dp2/
 ```
 
+For a zero-to-result batch launch, `qualification_50k_prepost.slurm` performs
+the environment installation, catalog query, preflight, workflow, and final
+validation within one `prepost` allocation. The front node is used only to
+clone/update the repository, read the token, and submit the job; see the launch
+recipe below.
+
+```bash
+set -euo pipefail
+
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export MMU_REPO="$MMU_JZ_ROOT/MultimodalUniverse"
+export LSST_DP2_RUN_NAME="multiregion_i22_50k_v1"
+mkdir -p "$MMU_JZ_ROOT"
+
+if [[ ! -d "$MMU_REPO/.git" ]]; then
+  git clone --branch feat/lsst-dp2 \
+    https://github.com/MaxRonce/MultimodalUniverse.git \
+    "$MMU_REPO"
+else
+  git -C "$MMU_REPO" fetch origin feat/lsst-dp2
+  git -C "$MMU_REPO" switch feat/lsst-dp2
+  git -C "$MMU_REPO" pull --ff-only origin feat/lsst-dp2
+fi
+
+unset LSST_DP2_ROOT LSST_DP2_HATS_OUTER
+source "$MMU_REPO/scripts/lsst_dp2/jeanzay_env.sh"
+read -rsp "RSP token: " RSP_TOKEN
+echo
+export RSP_TOKEN
+
+JOB_ID=$(sbatch --parsable \
+  --account=jrx@cpu \
+  --partition=prepost \
+  --export=ALL \
+  --output="$LSST_DP2_ROOT/logs/qualification-%j.out" \
+  --error="$LSST_DP2_ROOT/logs/qualification-%j.err" \
+  "$MMU_REPO/scripts/lsst_dp2/qualification_50k_prepost.slurm")
+unset RSP_TOKEN
+echo "JOB_ID=$JOB_ID"
+```
+
+The job can be resubmitted with the same run name after a timeout or transient
+service failure. It reuses the exact catalog, completed downloads, and valid
+intermediate shards.
+
 ## Magnitude-size validation sample
 
 The 5,000-row smoke test above checks the pipeline, but it is not a controlled
