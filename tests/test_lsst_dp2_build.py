@@ -312,6 +312,35 @@ def test_manifest_status_does_not_require_token(tmp_path, monkeypatch, capsys):
     assert "pending=6" in capsys.readouterr().out
 
 
+def test_manifest_status_does_not_mutate_running_tasks(tmp_path, monkeypatch):
+    catalog_path = tmp_path / "objects.parquet"
+    _catalog(catalog_path)
+    manifest_path = tmp_path / "manifest.sqlite"
+    con = download.connect_manifest(str(manifest_path))
+    download.initialize_tasks(con, str(catalog_path), str(tmp_path / "mirror"))
+    con.execute("UPDATE coadds SET status='running', attempts=1 WHERE band='u'")
+    con.commit()
+    con.close()
+    monkeypatch.delenv("RSP_TOKEN", raising=False)
+
+    assert download.main(
+        [
+            "--catalog",
+            str(catalog_path),
+            "--mirror-root",
+            str(tmp_path / "mirror"),
+            "--manifest",
+            str(manifest_path),
+            "--status-only",
+        ]
+    ) == 0
+    con = sqlite3.connect(manifest_path)
+    assert con.execute(
+        "SELECT status, attempts FROM coadds WHERE band='u'"
+    ).fetchone() == ("running", 1)
+    con.close()
+
+
 def test_select_sia_record_requires_exact_identity():
     table = Table(
         {

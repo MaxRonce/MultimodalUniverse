@@ -550,6 +550,11 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+    if args.status_only:
+        print(f"Manifest has {initialized} tasks")
+        print_status(con)
+        con.close()
+        return 0
     recovered = recover_interrupted_tasks(con)
     migrated = migrate_known_unavailable_tasks(con)
     if recovered:
@@ -558,11 +563,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Marked {migrated} known missing products unavailable", flush=True)
     if args.reset_failed:
         print(f"Reset {reset_failed_tasks(con)} incomplete tasks", flush=True)
-    if args.status_only:
-        print(f"Manifest has {initialized} tasks")
-        print_status(con)
-        con.close()
-        return 0
 
     token = os.environ.get(args.token_env)
     if not token:
