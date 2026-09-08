@@ -14,6 +14,7 @@ The implementation is split by responsibility:
 - `build_parent_sample_hats.py`: restartable patch processing and HATS ingest;
 - `validate_parent_sample.py`: fail-closed catalog-to-HATS validation;
 - `plot_mag_size_gallery.py`: auditable per-cell RGB galleries;
+- `plot_mag_size_band_gallery.py`: full `160 x 160` grayscale `ugrizy` panels;
 - `Snakefile`: single-node Jean-Zay workflow with durable stage markers.
 
 ## Data contract
@@ -378,6 +379,22 @@ Each directory contains one PNG per populated cell, a CSV listing every shown
 parameters. This E-CDFS run is a controlled deep-field diagnostic, not a
 sky-representative DP2 sample; repeat the same grid in other DP2 regions before
 using the result to characterize survey-wide population diversity.
+
+For a view closest to the stored MMU product, render all six bands separately
+at the full cutout size. This command applies no crop, smoothing, or background
+subtraction. The asinh operation is display normalization only and its settings
+are recorded in `rendering.json`:
+
+```bash
+"$MMU_PYTHON" -u -m scripts.lsst_dp2.plot_mag_size_band_gallery \
+  --hats-path "$HATS_PATH" \
+  --output-dir "$LSST_DP2_ROOT/figures/full_bands" \
+  --mag-edges "18,20,21,22,23,24" \
+  --size-edges "0.4,0.6,1.0,1.5,inf" \
+  --per-cell 8 \
+  --stretch asinh \
+  --shared-object-scale
+```
 
 ### Photometric redshifts
 
