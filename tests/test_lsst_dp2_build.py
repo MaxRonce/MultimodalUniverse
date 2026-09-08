@@ -323,6 +323,42 @@ def test_select_sia_record_requires_exact_identity():
     assert download.select_sia_record(table, 1234, 56, "i") == 1
 
 
+def test_select_sia_record_marks_missing_product_unavailable():
+    table = Table(
+        {
+            "lsst_tract": [1234],
+            "lsst_patch": [56],
+            "lsst_band": ["i"],
+        }
+    )
+    with pytest.raises(download.ProductUnavailableError, match="no SIA product"):
+        download.select_sia_record(table, 1234, 56, "u")
+
+
+def test_manifest_recovers_interrupted_and_preserves_unavailable(tmp_path):
+    catalog_path = tmp_path / "objects.parquet"
+    _catalog(catalog_path)
+    con = download.connect_manifest(str(tmp_path / "manifest.sqlite"))
+    download.initialize_tasks(con, str(catalog_path), str(tmp_path / "mirror"))
+    con.execute("UPDATE coadds SET status='running', attempts=1 WHERE band='g'")
+    con.execute(
+        "UPDATE coadds SET status='failed', attempts=1, error=? WHERE band='u'",
+        ("RuntimeError: expected one SIA result for (1234, 56, 'u'), found 0",),
+    )
+    con.commit()
+
+    assert download.recover_interrupted_tasks(con) == 1
+    assert download.migrate_known_unavailable_tasks(con) == 1
+    assert con.execute(
+        "SELECT status, attempts FROM coadds WHERE band='g'"
+    ).fetchone() == ("pending", 0)
+    assert con.execute(
+        "SELECT status FROM coadds WHERE band='u'"
+    ).fetchone()[0] == "unavailable"
+    assert {task.band for task in download.pending_tasks(con, 5)} == set("grizy")
+    con.close()
+
+
 def test_select_full_product_url_requires_this_semantics():
     datalink = Table(
         {
@@ -472,6 +508,12 @@ def test_missing_band_is_explicitly_padded(tmp_path):
     assert not np.asarray(image["ivar"])[0].any()
     assert not np.asarray(image["psf_image"])[0].any()
     assert image["psf_image_valid"][0] is False
+    assert image["dataset_id"][0] == ""
+    assert image["sha256"][0] == ""
+    clean_fraction, psf_valid, band_present = validate._validate_image("101", image)
+    assert 0 < clean_fraction <= 1
+    assert psf_valid.tolist() == [False, True, True, True, True, True]
+    assert band_present.tolist() == [False, True, True, True, True, True]
 
 
 def test_build_contract_rejects_changed_manifest(tmp_path):

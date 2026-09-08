@@ -43,6 +43,13 @@ as zero only where the mask rejects that pixel. A missing or non-finite Rubin
 PSF cell is stored as a zero kernel with `psf_image_valid=False`; it is never
 replaced with a neighboring PSF.
 
+DP2 does not provide every band for every patch. A SIA query with no matching
+product is a terminal `unavailable` manifest state, not a download failure. The
+corresponding MMU band keeps its fixed `ugrizy` slot with `flux=0`, `ivar=0`,
+`mask=False`, `mask_bits=0`, a zero PSF, and `band_present=False`. This is
+explicit missingness; downstream code must use `band_present` and must not
+interpret the zero-filled plane as an observed image.
+
 The default rejected mask planes are `BAD,SAT,NO_DATA,SUSPECT,UNMASKEDNAN`.
 The raw mask bits and their plane mapping remain in the output, so downstream
 users can define a different policy.
@@ -245,7 +252,7 @@ root = Path(os.environ["LSST_DP2_ROOT"])
 report = json.loads((root / "validation_report.json").read_text())
 assert report["status"] == "PASS"
 assert report["catalog_rows"] == report["parquet_rows"] == report["hats_rows"] == 5000
-assert report["center_checks"] == 6 * 5000
+assert report["center_checks"] == sum(report["band_present_counts"].values())
 print(json.dumps({
     "status": report["status"],
     "rows": report["hats_rows"],
@@ -396,9 +403,10 @@ assert report["catalog_rows"] == 50000
 assert report["parquet_rows"] == 50000
 assert report["hats_rows"] == 50000
 assert report["unique_object_ids"] == 50000
-assert report["center_checks"] == 6 * 50000
+assert report["center_checks"] == sum(report["band_present_counts"].values())
 assert report["max_center_axis_offset_pix"] <= 0.500001
 assert set(report["psf_valid_fractions"]) == set("ugrizy")
+assert set(report["band_present_fractions"]) == set("ugrizy")
 print(json.dumps(report, indent=2))
 PY
 ```
@@ -452,7 +460,38 @@ echo "JOB_ID=$JOB_ID"
 
 The job can be resubmitted with the same run name after a timeout or transient
 service failure. It reuses the exact catalog, completed downloads, and valid
-intermediate shards.
+intermediate shards. On startup, interrupted `running` tasks return to `pending`;
+legacy zero-result SIA failures become terminal `unavailable` tasks. No completed
+FITS product is downloaded again.
+
+After pulling a pipeline update, resume the same run from a Jean-Zay front node:
+
+```bash
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export MMU_REPO="$MMU_JZ_ROOT/MultimodalUniverse"
+export LSST_DP2_RUN_NAME="multiregion_i22_50k_v1"
+
+git -C "$MMU_REPO" fetch origin feat/lsst-dp2
+git -C "$MMU_REPO" switch feat/lsst-dp2
+git -C "$MMU_REPO" pull --ff-only origin feat/lsst-dp2
+
+unset LSST_DP2_ROOT LSST_DP2_HATS_OUTER
+source "$MMU_REPO/scripts/lsst_dp2/jeanzay_env.sh"
+read -rsp "RSP token: " RSP_TOKEN
+echo
+export RSP_TOKEN
+
+mkdir -p "$LSST_DP2_ROOT/logs"
+JOB_ID=$(sbatch --parsable \
+  --account=jrx@cpu \
+  --partition=prepost \
+  --export=ALL \
+  --output="$LSST_DP2_ROOT/logs/qualification-%j.out" \
+  --error="$LSST_DP2_ROOT/logs/qualification-%j.err" \
+  "$MMU_REPO/scripts/lsst_dp2/qualification_50k_prepost.slurm")
+unset RSP_TOKEN
+echo "JOB_ID=$JOB_ID"
+```
 
 ## Magnitude-size validation sample
 

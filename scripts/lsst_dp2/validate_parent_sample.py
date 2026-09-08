@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -60,7 +61,7 @@ def _validate_coadds(
         for band in BANDS:
             info = manifest.get((tract, patch, band))
             if info is None:
-                raise ValueError(f"missing complete coadd for {(tract, patch, band)}")
+                continue
             path = info["output_path"]
             if path not in wcs_cache:
                 with fits.open(path, memmap=True) as hdul:
@@ -100,7 +101,9 @@ def _validate_coadds(
     }
 
 
-def _validate_image(object_id: str, image: dict) -> tuple[float, np.ndarray]:
+def _validate_image(
+    object_id: str, image: dict
+) -> tuple[float, np.ndarray, np.ndarray]:
     """Validate one nested MMU image struct and return aggregate statistics."""
     if image["band"] != list(BANDS):
         raise ValueError(f"unexpected bands for {object_id}: {image['band']}")
@@ -111,14 +114,17 @@ def _validate_image(object_id: str, image: dict) -> tuple[float, np.ndarray]:
     mask_bits = np.asarray(image["mask_bits"], dtype=np.int32)
     psf_image = np.asarray(image["psf_image"], dtype=np.float32)
     psf_image_valid = np.asarray(image["psf_image_valid"], dtype=bool)
+    band_present = np.asarray(image["band_present"], dtype=bool)
     expected_shape = (len(BANDS), IMAGE_SIZE, IMAGE_SIZE)
 
     if any(array.shape != expected_shape for array in (flux, ivar, mask, mask_bits)):
         raise ValueError(f"invalid image shape for {object_id}")
     if psf_image.shape != (len(BANDS), PSF_SIZE, PSF_SIZE):
         raise ValueError(f"invalid PSF image shape for {object_id}")
-    if psf_image_valid.shape != (len(BANDS),):
-        raise ValueError(f"invalid PSF validity shape for {object_id}")
+    if psf_image_valid.shape != (len(BANDS),) or band_present.shape != (len(BANDS),):
+        raise ValueError(f"invalid band/PSF validity shape for {object_id}")
+    if not band_present.any():
+        raise ValueError(f"all bands are missing for {object_id}")
     if not np.isfinite(psf_image).all():
         raise ValueError(f"non-finite PSF image for {object_id}")
 
@@ -135,33 +141,53 @@ def _validate_image(object_id: str, image: dict) -> tuple[float, np.ndarray]:
     if len(plane_maps) != len(BANDS):
         raise ValueError(f"invalid mask-plane provenance for {object_id}")
     for band_index, encoded_mapping in enumerate(plane_maps):
+        if not band_present[band_index]:
+            continue
         mapping = json.loads(encoded_mapping)
         clean_from_bits = clean_mask_from_bits(mask_bits[band_index], mapping)
         if np.any(mask[band_index] & ~clean_from_bits):
             raise ValueError(
                 f"valid mask includes rejected bits for {object_id}/{BANDS[band_index]}"
             )
-    if not all(image["band_present"]):
-        raise ValueError(f"missing band for {object_id}")
-
     psf = np.asarray(image["psf_fwhm"], dtype=np.float32)
     scale = np.asarray(image["scale"], dtype=np.float32)
-    if not np.isfinite(psf).all() or (psf <= 0).any():
+    if not np.isfinite(psf).all() or (psf[band_present] <= 0).any():
         raise ValueError(f"missing or invalid PSF FWHM for {object_id}")
     if not np.allclose(scale, PIXEL_SCALE_ARCSEC):
         raise ValueError(f"invalid pixel scale for {object_id}: {scale}")
-    if not all(image["dataset_id"]) or not all(image["sha256"]):
+    dataset_ids = image["dataset_id"]
+    checksums = image["sha256"]
+    if any(not dataset_ids[index] or not checksums[index] for index in np.flatnonzero(band_present)):
         raise ValueError(f"missing provenance for {object_id}")
+    absent = np.flatnonzero(~band_present)
+    for band_index in absent:
+        if (
+            flux[band_index].any()
+            or ivar[band_index].any()
+            or mask[band_index].any()
+            or mask_bits[band_index].any()
+            or psf_image[band_index].any()
+            or psf_image_valid[band_index]
+            or psf[band_index] != 0
+            or dataset_ids[band_index]
+            or checksums[band_index]
+            or plane_maps[band_index] != "{}"
+            or image["psf_source"][band_index] != "missing"
+        ):
+            raise ValueError(
+                f"absent band is not zero-padded for {object_id}/{BANDS[band_index]}"
+            )
     if image["flux_unit"] != ["nJy"] * len(BANDS):
         raise ValueError(f"invalid flux units for {object_id}")
     if image["ivar_unit"] != ["nJy^-2"] * len(BANDS):
         raise ValueError(f"invalid ivar units for {object_id}")
-    return float(mask.mean()), psf_image_valid
+    return float(mask[band_present].mean()), psf_image_valid, band_present
 
 
 def _validate_parquet(
     scratch_dir: str,
     expected_ids: set[str],
+    expected_band_presence: dict[str, np.ndarray],
     progress_every: int = 500,
 ) -> dict:
     paths = sorted(Path(scratch_dir).glob("part-*.parquet"))
@@ -172,6 +198,7 @@ def _validate_parquet(
     min_clean_fraction = 1.0
     max_clean_fraction = 0.0
     psf_valid_counts = np.zeros(len(BANDS), dtype=np.int64)
+    band_present_counts = np.zeros(len(BANDS), dtype=np.int64)
     for path in paths:
         parquet = pq.ParquetFile(path)
         for batch in parquet.iter_batches(
@@ -182,10 +209,17 @@ def _validate_parquet(
                 if object_id in found_ids:
                     raise ValueError(f"duplicate object_id in shards: {object_id}")
                 found_ids.add(object_id)
-                clean_fraction, psf_valid = _validate_image(
+                clean_fraction, psf_valid, band_present = _validate_image(
                     object_id, image_scalar.as_py()
                 )
+                if not np.array_equal(
+                    band_present, expected_band_presence[object_id]
+                ):
+                    raise ValueError(
+                        f"band availability differs from manifest for {object_id}"
+                    )
                 psf_valid_counts += psf_valid
+                band_present_counts += band_present
                 min_clean_fraction = min(min_clean_fraction, clean_fraction)
                 max_clean_fraction = max(max_clean_fraction, clean_fraction)
                 checked_rows += 1
@@ -213,7 +247,31 @@ def _validate_parquet(
         "psf_valid_fractions": dict(
             zip(BANDS, (psf_valid_counts / checked_rows).tolist())
         ),
+        "band_present_counts": dict(zip(BANDS, band_present_counts.tolist())),
+        "band_present_fractions": dict(
+            zip(BANDS, (band_present_counts / checked_rows).tolist())
+        ),
     }
+
+
+def _manifest_status_counts(path: str) -> dict[str, int]:
+    con = sqlite3.connect(path)
+    try:
+        counts = dict(
+            con.execute(
+                "SELECT status, COUNT(*) FROM coadds GROUP BY status ORDER BY status"
+            ).fetchall()
+        )
+    finally:
+        con.close()
+    incomplete = {
+        status: count
+        for status, count in counts.items()
+        if status not in {"complete", "unavailable"}
+    }
+    if incomplete:
+        raise ValueError(f"download manifest has incomplete tasks: {incomplete}")
+    return counts
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -250,7 +308,15 @@ def main(argv: list[str] | None = None) -> int:
         object_ids = [str(value) for value in catalog[columns["object_id"]]]
         if len(set(object_ids)) != len(object_ids):
             raise ValueError("parent catalog contains duplicate object IDs")
+        manifest_status_counts = _manifest_status_counts(args.manifest)
         manifest = load_manifest(args.manifest, args.verify_checksums)
+        expected_band_presence = {}
+        for object_id, row in zip(object_ids, catalog):
+            tract = int(row[columns["tract"]])
+            patch = int(row[columns["patch"]])
+            expected_band_presence[object_id] = np.asarray(
+                [(tract, patch, band) in manifest for band in BANDS], dtype=bool
+            )
         catalog_elapsed = time.monotonic() - started
 
         print("[2/4] validating coadds, units, WCS, and centering", flush=True)
@@ -261,7 +327,10 @@ def main(argv: list[str] | None = None) -> int:
         print("[3/4] validating Parquet image records", flush=True)
         stage_started = time.monotonic()
         parquet_report = _validate_parquet(
-            args.scratch_dir, set(object_ids), args.progress_every
+            args.scratch_dir,
+            set(object_ids),
+            expected_band_presence,
+            args.progress_every,
         )
         parquet_elapsed = time.monotonic() - stage_started
 
@@ -276,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
         report = {
             "status": "PASS",
             "catalog_rows": len(catalog),
+            "manifest_status_counts": manifest_status_counts,
             **coadd_report,
             **parquet_report,
             "hats_rows": hats_rows,

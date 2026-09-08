@@ -60,7 +60,7 @@ rule build_parquet:
         "{PYTHON} -u -m scripts.lsst_dp2.build_parent_sample_hats "
         "--catalog {input.catalog} --manifest {MANIFEST} --scratch-dir {PARQUET} "
         "--output-root {HATS_OUTER} --objects-per-shard 64 "
-        "--patch-workers {PATCH_WORKERS} --require-all-bands --skip-ingest "
+        "--patch-workers {PATCH_WORKERS} --skip-ingest "
         ">> {log} 2>&1"
 
 

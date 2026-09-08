@@ -129,8 +129,10 @@ def load_manifest(
     result = {}
     for row in rows:
         item = dict(row)
-        if item["status"] != "complete" or not os.path.isfile(item["output_path"]):
+        if item["status"] != "complete":
             continue
+        if not os.path.isfile(item["output_path"]):
+            raise ValueError(f"complete coadd is missing: {item['output_path']}")
         if verify_checksums and sha256_file(item["output_path"]) != item["sha256"]:
             raise ValueError(f"checksum mismatch: {item['output_path']}")
         result[(int(item["tract"]), int(item["patch"]), str(item["band"]))] = item

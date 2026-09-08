@@ -15,7 +15,7 @@ import sqlite3
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +36,10 @@ from scripts.lsst_dp2.common import (
 DEFAULT_SIA_URL = "https://data.lsst.cloud/api/sia/dp2/query"
 MANIFEST_SCHEMA_VERSION = 2
 _THREAD_LOCAL = threading.local()
+
+
+class ProductUnavailableError(RuntimeError):
+    """The requested patch-band has no DP2 SIA product."""
 
 
 class RequestRateLimiter:
@@ -205,7 +209,37 @@ def reset_failed_tasks(con: sqlite3.Connection) -> int:
         """
         UPDATE coadds
         SET status='pending', attempts=0, error=NULL, updated_at=?
-        WHERE status != 'complete'
+        WHERE status NOT IN ('complete', 'unavailable')
+        """,
+        (utcnow(),),
+    )
+    con.commit()
+    return cursor.rowcount
+
+
+def recover_interrupted_tasks(con: sqlite3.Connection) -> int:
+    """Return tasks left running by an interrupted process to the pending queue."""
+    cursor = con.execute(
+        """
+        UPDATE coadds
+        SET status='pending', attempts=MAX(attempts - 1, 0),
+            error='recovered after interrupted downloader', updated_at=?
+        WHERE status='running'
+        """,
+        (utcnow(),),
+    )
+    con.commit()
+    return cursor.rowcount
+
+
+def migrate_known_unavailable_tasks(con: sqlite3.Connection) -> int:
+    """Promote legacy zero-result failures to explicit product unavailability."""
+    cursor = con.execute(
+        """
+        UPDATE coadds
+        SET status='unavailable', updated_at=?
+        WHERE status='failed'
+          AND error LIKE '%expected one SIA result for % found 0'
         """,
         (utcnow(),),
     )
@@ -239,7 +273,7 @@ def pending_tasks(con: sqlite3.Connection, max_attempts: int) -> list[Task]:
         """
         SELECT tract, patch, band, ra, dec, output_path, attempts
         FROM coadds
-        WHERE status != 'complete' AND attempts < ?
+        WHERE status NOT IN ('complete', 'unavailable') AND attempts < ?
         ORDER BY tract, patch, band
         """,
         (max_attempts,),
@@ -256,6 +290,8 @@ def select_sia_record(table, tract: int, patch: int, band: str):
         row_band = str(row["lsst_band"]).strip()
         if (row_tract, row_patch, row_band) == (tract, patch, band):
             matches.append(index)
+    if not matches:
+        raise ProductUnavailableError(f"no SIA product for {(tract, patch, band)}")
     if len(matches) != 1:
         raise RuntimeError(
             f"expected one SIA result for {(tract, patch, band)}, found {len(matches)}"
@@ -514,6 +550,12 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+    recovered = recover_interrupted_tasks(con)
+    migrated = migrate_known_unavailable_tasks(con)
+    if recovered:
+        print(f"Recovered {recovered} interrupted tasks", flush=True)
+    if migrated:
+        print(f"Marked {migrated} known missing products unavailable", flush=True)
     if args.reset_failed:
         print(f"Reset {reset_failed_tasks(con)} incomplete tasks", flush=True)
     if args.status_only:
@@ -539,81 +581,102 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     failed = 0
+    unavailable = 0
+    processed = 0
     rate_limiter = RequestRateLimiter(args.requests_per_minute)
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {}
-        for task in tasks:
-            con.execute(
-                "UPDATE coadds SET status='running', attempts=attempts+1, updated_at=? "
-                "WHERE tract=? AND patch=? AND band=?",
-                (utcnow(), task.tract, task.patch, task.band),
-            )
-            con.commit()
-            futures[
-                pool.submit(
-                    download_after_delay,
-                    task,
-                    token,
-                    args.sia_url,
-                    args.retry_base_seconds,
-                    rate_limiter,
-                )
-            ] = task
 
-        for done, future in enumerate(as_completed(futures), 1):
-            task = futures[future]
-            try:
-                result = future.result()
-                con.execute(
-                    """
-                    UPDATE coadds SET status='complete', bytes=?, sha256=?, dataset_id=?,
-                        datalink_url=?, access_url=?, s_resolution=?, mask_planes=?,
-                        error=NULL, updated_at=?
-                    WHERE tract=? AND patch=? AND band=?
-                    """,
-                    (
-                        result["bytes"],
-                        result["sha256"],
-                        result["dataset_id"],
-                        result["datalink_url"],
-                        result["access_url"],
-                        result["s_resolution"],
-                        result["mask_planes"],
-                        utcnow(),
-                        task.tract,
-                        task.patch,
-                        task.band,
-                    ),
-                )
-                size_mib = result["bytes"] / (1024 * 1024)
-                print(
-                    f"DONE [{done}/{len(futures)}] tract={task.tract} "
-                    f"patch={task.patch} band={task.band} size={size_mib:.1f} MiB",
-                    flush=True,
-                )
-            except Exception as exc:  # noqa: BLE001
-                failed += 1
-                con.execute(
-                    "UPDATE coadds SET status='failed', error=?, updated_at=? "
-                    "WHERE tract=? AND patch=? AND band=?",
-                    (
+    def submit(pool: ThreadPoolExecutor, task: Task) -> Future:
+        con.execute(
+            "UPDATE coadds SET status='running', attempts=attempts+1, updated_at=? "
+            "WHERE tract=? AND patch=? AND band=?",
+            (utcnow(), task.tract, task.patch, task.band),
+        )
+        con.commit()
+        return pool.submit(
+            download_after_delay,
+            task,
+            token,
+            args.sia_url,
+            args.retry_base_seconds,
+            rate_limiter,
+        )
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        task_iterator = iter(tasks)
+        futures: dict[Future, Task] = {}
+        for task in task_iterator:
+            futures[submit(pool, task)] = task
+            if len(futures) == args.workers:
+                break
+
+        while futures:
+            completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in completed:
+                task = futures.pop(future)
+                processed += 1
+                try:
+                    result = future.result()
+                    con.execute(
+                        """
+                        UPDATE coadds SET status='complete', bytes=?, sha256=?, dataset_id=?,
+                            datalink_url=?, access_url=?, s_resolution=?, mask_planes=?,
+                            error=NULL, updated_at=?
+                        WHERE tract=? AND patch=? AND band=?
+                        """,
+                        (
+                            result["bytes"], result["sha256"], result["dataset_id"],
+                            result["datalink_url"], result["access_url"],
+                            result["s_resolution"], result["mask_planes"], utcnow(),
+                            task.tract, task.patch, task.band,
+                        ),
+                    )
+                    size_mib = result["bytes"] / (1024 * 1024)
+                    print(
+                        f"DONE [{processed}/{len(tasks)}] tract={task.tract} "
+                        f"patch={task.patch} band={task.band} size={size_mib:.1f} MiB",
+                        flush=True,
+                    )
+                except ProductUnavailableError as exc:
+                    unavailable += 1
+                    con.execute(
+                        "UPDATE coadds SET status='unavailable', error=?, updated_at=? "
+                        "WHERE tract=? AND patch=? AND band=?",
+                        (str(exc), utcnow(), task.tract, task.patch, task.band),
+                    )
+                    print(
+                        f"UNAVAILABLE [{processed}/{len(tasks)}] tract={task.tract} "
+                        f"patch={task.patch} band={task.band}: {exc}",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    failed += 1
+                    con.execute(
+                        "UPDATE coadds SET status='failed', error=?, updated_at=? "
+                        "WHERE tract=? AND patch=? AND band=?",
+                        (
+                            f"{type(exc).__name__}: {exc}", utcnow(),
+                            task.tract, task.patch, task.band,
+                        ),
+                    )
+                    print(
+                        f"FAILED [{processed}/{len(tasks)}] tract={task.tract} "
+                        f"patch={task.patch} band={task.band}: "
                         f"{type(exc).__name__}: {exc}",
-                        utcnow(),
-                        task.tract,
-                        task.patch,
-                        task.band,
-                    ),
-                )
-                print(
-                    f"FAILED [{done}/{len(futures)}] tract={task.tract} "
-                    f"patch={task.patch} band={task.band}: {type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-            con.commit()
+                        flush=True,
+                    )
+                con.commit()
+                try:
+                    next_task = next(task_iterator)
+                except StopIteration:
+                    continue
+                futures[submit(pool, next_task)] = next_task
     counts = status_counts(con)
-    incomplete = sum(value for key, value in counts.items() if key != "complete")
+    incomplete = sum(
+        value for key, value in counts.items() if key not in {"complete", "unavailable"}
+    )
     print(
-        f"Finished {len(futures)} tasks; failed={failed}; incomplete={incomplete}",
+        f"Finished {processed} tasks; failed={failed}; unavailable={unavailable}; "
+        f"incomplete={incomplete}",
         flush=True,
     )
     con.close()
