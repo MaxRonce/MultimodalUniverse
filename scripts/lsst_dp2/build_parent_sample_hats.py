@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -241,6 +242,9 @@ def _make_records(
                 "object_id": str(_row_value(row, columns["object_id"], "")),
                 "tract": int(row[columns["tract"]]),
                 "patch": int(row[columns["patch"]]),
+                "dp2_region": str(
+                    _row_value(row, catalog_columns.get("dp2_region"), "")
+                ),
                 "ref_band": str(_row_value(row, columns["ref_band"], "")),
                 "ref_extendedness": _finite_float(
                     _row_value(row, columns["ref_extendedness"], float("nan"))
@@ -426,6 +430,12 @@ def main(argv: list[str] | None = None) -> int:
         "--ingest-workers", type=int, default=8, help="Dask workers for HATS ingestion"
     )
     parser.add_argument(
+        "--patch-workers",
+        type=int,
+        default=1,
+        help="patches processed concurrently while writing intermediate Parquet",
+    )
+    parser.add_argument(
         "--num-shards", type=int, default=1, help="number of scatter jobs"
     )
     parser.add_argument(
@@ -456,9 +466,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.num_shards <= 0 or args.objects_per_shard <= 0 or args.ingest_workers <= 0:
+    if (
+        args.num_shards <= 0
+        or args.objects_per_shard <= 0
+        or args.ingest_workers <= 0
+        or args.patch_workers <= 0
+    ):
         parser.error(
-            "--num-shards, --objects-per-shard, and --ingest-workers must be positive"
+            "--num-shards, --objects-per-shard, --ingest-workers, and "
+            "--patch-workers must be positive"
         )
     if args.pixel_threshold <= 0:
         parser.error("--pixel-threshold must be positive")
@@ -497,8 +513,9 @@ def main(argv: list[str] | None = None) -> int:
             manifest = load_manifest(args.manifest, args.verify_checksums)
             groups = grouped_rows(catalog, columns)[args.shard_idx :: args.num_shards]
             total = 0
-            for index, rows in enumerate(groups, 1):
-                expected, written = process_patch(
+
+            def submit_patch(rows):
+                return process_patch(
                     catalog,
                     rows,
                     columns,
@@ -508,13 +525,28 @@ def main(argv: list[str] | None = None) -> int:
                     reject_planes,
                     args.require_all_bands,
                 )
-                if expected != written:
-                    raise RuntimeError(f"wrote {written}/{expected} rows for one patch")
-                total += written
-                print(
-                    f"[shard {args.shard_idx}] [{index}/{len(groups)}] rows={written} total={total}",
-                    flush=True,
-                )
+
+            if args.patch_workers == 1:
+                results = (submit_patch(rows) for rows in groups)
+            else:
+                executor = ThreadPoolExecutor(max_workers=args.patch_workers)
+                futures = [executor.submit(submit_patch, rows) for rows in groups]
+                results = (future.result() for future in as_completed(futures))
+            try:
+                for index, (expected, written) in enumerate(results, 1):
+                    if expected != written:
+                        raise RuntimeError(
+                            f"wrote {written}/{expected} rows for one patch"
+                        )
+                    total += written
+                    print(
+                        f"[shard {args.shard_idx}] [{index}/{len(groups)}] "
+                        f"rows={written} total={total}",
+                        flush=True,
+                    )
+            finally:
+                if args.patch_workers != 1:
+                    executor.shutdown(wait=True, cancel_futures=True)
         except Exception as exc:  # noqa: BLE001
             print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1

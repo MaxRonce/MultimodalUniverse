@@ -15,7 +15,11 @@ import pyarrow.parquet as pq
 from astropy.io import fits
 from astropy.wcs import WCS
 
-from scripts.lsst_dp2.build_parent_sample_hats import PSF_SIZE, load_manifest
+from scripts.lsst_dp2.build_parent_sample_hats import (
+    PSF_SIZE,
+    clean_mask_from_bits,
+    load_manifest,
+)
 from scripts.lsst_dp2.common import (
     BANDS,
     IMAGE_SIZE,
@@ -127,6 +131,16 @@ def _validate_image(object_id: str, image: dict) -> tuple[float, np.ndarray]:
         raise ValueError(f"non-finite flux/ivar for {object_id}")
     if (ivar < 0).any() or (ivar[~mask] != 0).any():
         raise ValueError(f"invalid ivar/mask relation for {object_id}")
+    plane_maps = image["mask_plane_map"]
+    if len(plane_maps) != len(BANDS):
+        raise ValueError(f"invalid mask-plane provenance for {object_id}")
+    for band_index, encoded_mapping in enumerate(plane_maps):
+        mapping = json.loads(encoded_mapping)
+        clean_from_bits = clean_mask_from_bits(mask_bits[band_index], mapping)
+        if np.any(mask[band_index] & ~clean_from_bits):
+            raise ValueError(
+                f"valid mask includes rejected bits for {object_id}/{BANDS[band_index]}"
+            )
     if not all(image["band_present"]):
         raise ValueError(f"missing band for {object_id}")
 

@@ -38,6 +38,26 @@ MANIFEST_SCHEMA_VERSION = 2
 _THREAD_LOCAL = threading.local()
 
 
+class RequestRateLimiter:
+    """Serialize request starts to a process-wide maximum rate."""
+
+    def __init__(self, requests_per_minute: float):
+        if requests_per_minute <= 0:
+            raise ValueError("requests_per_minute must be positive")
+        self.interval = 60.0 / requests_per_minute
+        self._lock = threading.Lock()
+        self._next_request = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            delay = self._next_request - now
+            if delay > 0:
+                time.sleep(delay)
+                now = time.monotonic()
+            self._next_request = max(now, self._next_request) + self.interval
+
+
 @dataclass(frozen=True)
 class Task:
     tract: int
@@ -320,10 +340,16 @@ def _optional_float(row, name: str) -> float | None:
     return value if np.isfinite(value) else None
 
 
-def download_one(task: Task, token: str, sia_url: str) -> dict:
+def download_one(
+    task: Task,
+    token: str,
+    sia_url: str,
+    rate_limiter: RequestRateLimiter,
+) -> dict:
     from pyvo.dal.adhoc import DatalinkResults
 
     sia, session = _clients(token, sia_url)
+    rate_limiter.wait()
     results = sia.search(
         pos=(task.ra, task.dec, 0.3),
         calib_level=3,
@@ -335,6 +361,7 @@ def download_one(task: Task, token: str, sia_url: str) -> dict:
     row = table[index]
     datalink_url = str(row["access_url"])
     dataset_id = str(row["obs_publisher_did"])
+    rate_limiter.wait()
     dl_result = DatalinkResults.from_result_url(datalink_url, session=session)
     access_url = select_full_product_url(dl_result)
 
@@ -342,6 +369,7 @@ def download_one(task: Task, token: str, sia_url: str) -> dict:
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_suffix(output.suffix + ".part")
     try:
+        rate_limiter.wait()
         with session.get(access_url, stream=True, timeout=(30, 600)) as response:
             response.raise_for_status()
             response.raw.decode_content = True
@@ -371,6 +399,7 @@ def download_after_delay(
     token: str,
     sia_url: str,
     retry_base_seconds: float,
+    rate_limiter: RequestRateLimiter,
 ) -> dict:
     if task.attempts:
         time.sleep(min(retry_base_seconds * (2**task.attempts), 60.0))
@@ -379,7 +408,7 @@ def download_after_delay(
         f"attempt={task.attempts + 1}",
         flush=True,
     )
-    return download_one(task, token, sia_url)
+    return download_one(task, token, sia_url, rate_limiter)
 
 
 def status_counts(con: sqlite3.Connection) -> dict[str, int]:
@@ -423,6 +452,12 @@ def main(argv: list[str] | None = None) -> int:
         "--workers", type=int, default=4, help="concurrent SIA downloads"
     )
     parser.add_argument(
+        "--requests-per-minute",
+        type=float,
+        default=50.0,
+        help="global request-start limit across all workers (default: 50)",
+    )
+    parser.add_argument(
         "--max-attempts",
         type=int,
         default=5,
@@ -462,8 +497,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.workers <= 0 or args.max_attempts <= 0:
-        parser.error("--workers and --max-attempts must be positive")
+    if (
+        args.workers <= 0
+        or args.max_attempts <= 0
+        or args.requests_per_minute <= 0
+    ):
+        parser.error(
+            "--workers, --max-attempts, and --requests-per-minute must be positive"
+        )
     if args.task_limit is not None and args.task_limit <= 0:
         parser.error("--task-limit must be positive")
 
@@ -491,9 +532,14 @@ def main(argv: list[str] | None = None) -> int:
     tasks = pending_tasks(con, args.max_attempts)
     if args.task_limit is not None:
         tasks = tasks[: args.task_limit]
-    print(f"Manifest has {initialized} tasks; {len(tasks)} scheduled", flush=True)
+    print(
+        f"Manifest has {initialized} tasks; {len(tasks)} scheduled; "
+        f"request_limit={args.requests_per_minute:g}/min",
+        flush=True,
+    )
 
     failed = 0
+    rate_limiter = RequestRateLimiter(args.requests_per_minute)
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {}
         for task in tasks:
@@ -510,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
                     token,
                     args.sia_url,
                     args.retry_base_seconds,
+                    rate_limiter,
                 )
             ] = task
 

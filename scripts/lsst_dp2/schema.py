@@ -15,7 +15,7 @@ from scripts.lsst_dp2.common import (
 )
 
 PHOTOMETRY_SUFFIXES = ("psfFlux", "psfFluxErr", "cModelFlux", "cModelFluxErr")
-OUTPUT_SCHEMA_VERSION = 5
+OUTPUT_SCHEMA_VERSION = 6
 
 
 def _nested_column(
@@ -99,6 +99,7 @@ def build_table(records: list[dict]) -> pa.Table:
         "object_id": pa.array([r["object_id"] for r in records], type=pa.string()),
         "tract": pa.array([r["tract"] for r in records], type=pa.int32()),
         "patch": pa.array([r["patch"] for r in records], type=pa.int32()),
+        "dp2_region": pa.array([r["dp2_region"] for r in records], type=pa.string()),
         "ref_band": pa.array([r["ref_band"] for r in records], type=pa.string()),
         "ref_extendedness": pa.array(
             [r["ref_extendedness"] for r in records], type=pa.float32()

@@ -16,6 +16,7 @@ from astropy.table import Table
 from scripts.lsst_dp2 import build_parent_sample_hats as build
 from scripts.lsst_dp2 import download_coadds as download
 from scripts.lsst_dp2 import query_catalog as query
+from scripts.lsst_dp2 import query_multiregion_catalog as multiregion
 from scripts.lsst_dp2 import stratify_catalog as stratify
 from scripts.lsst_dp2 import validate_parent_sample as validate
 from scripts.lsst_dp2.common import BANDS, IMAGE_SIZE, coadd_path
@@ -96,6 +97,7 @@ def _catalog(path: Path) -> Table:
         "coord_dec": np.array([2.0, 2.0001], dtype=np.float64),
         "tract": np.array([1234, 1234], dtype=np.int64),
         "patch": np.array([56, 56], dtype=np.int64),
+        "dp2_region": np.array(["TEST", "TEST"]),
         "refBand": np.array(["i", "r"]),
         "refExtendedness": np.array([1.0, 0.0], dtype=np.float32),
         "detect_isIsolated": np.array([True, False]),
@@ -214,6 +216,45 @@ def test_stratified_selection_is_deterministic_and_reports_cells():
     assert len(selected) == 6
     assert report["eligible_rows"] == 9
     assert [cell["selected"] for cell in report["cells"]] == [2, 2, 2, 0]
+
+
+def test_multiregion_selection_is_deterministic_and_unique():
+    region = multiregion.Region("TEST", 150.0, 2.0, 1.0)
+    table = Table(
+        {
+            "objectId": np.arange(10, 20),
+            "tract": np.ones(10, dtype=int),
+            "patch": np.full(10, 2, dtype=int),
+        }
+    )
+    first, skipped = multiregion.select_region_rows(table, region, 4, 7, set())
+    repeated, _ = multiregion.select_region_rows(table, region, 4, 7, set())
+    assert first["objectId"].tolist() == repeated["objectId"].tolist()
+    assert first["dp2_region"].tolist() == ["TEST"] * 4
+    assert skipped == 0
+
+    used = {str(value) for value in first["objectId"]}
+    second, skipped = multiregion.select_region_rows(table, region, 4, 7, used)
+    assert not set(first["objectId"]).intersection(second["objectId"])
+    assert skipped == 4
+
+
+def test_request_rate_limiter_spaces_request_starts(monkeypatch):
+    clock = {"now": 100.0}
+    sleeps = []
+
+    monkeypatch.setattr(download.time, "monotonic", lambda: clock["now"])
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(download.time, "sleep", fake_sleep)
+    limiter = download.RequestRateLimiter(50.0)
+    limiter.wait()
+    limiter.wait()
+    limiter.wait()
+    assert sleeps == pytest.approx([1.2, 1.2])
 
 
 def test_patch_psf_fallback_ignores_invalid_object_moments(tmp_path):
@@ -354,6 +395,8 @@ def test_end_to_end_parquet_and_hats(tmp_path):
             "32",
             "--ingest-workers",
             "1",
+            "--patch-workers",
+            "2",
             "--verify-checksums",
         ]
     )
@@ -380,6 +423,7 @@ def test_end_to_end_parquet_and_hats(tmp_path):
     assert table.column("i_cModelMag")[0].as_py() == pytest.approx(21.5)
     assert table.column("griz_model_extendedness")[0].as_py() == pytest.approx(0.95)
     assert table.column("sersic_reff_major")[0].as_py() == pytest.approx(0.8)
+    assert table.column("dp2_region")[0].as_py() == "TEST"
     assert list(output.rglob("hats.properties"))
     assert (
         validate.main(

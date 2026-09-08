@@ -7,6 +7,7 @@ FITS once, then extracts all source cutouts locally.
 The implementation is split by responsibility:
 
 - `query_catalog.py`: authenticated DP2 Object TAP query;
+- `query_multiregion_catalog.py`: balanced deterministic multi-region query;
 - `stratify_catalog.py`: deterministic magnitude-size sampling;
 - `download_coadds.py`: resumable SIA/DataLink mirror with a SQLite manifest;
 - `coadd.py`: calibrated FITS, mask, WCS, and local cell-PSF extraction;
@@ -180,9 +181,9 @@ bash scripts/lsst_dp2/run_prepost.sh
 
 The DAG performs, in order:
 
-1. resumable SIA downloads with four workers;
-2. patch-local cutout extraction into restartable Parquet shards;
-3. HATS ingestion with four Dask workers;
+1. resumable, rate-limited SIA downloads with four workers;
+2. four-way patch-local cutout extraction into restartable Parquet shards;
+3. memory-bounded HATS ingestion with two Dask workers;
 4. checksum, WCS, centering, unit, shape, mask, ivar, PSF, provenance, row-count,
    and HATS metadata validation.
 
@@ -259,7 +260,153 @@ PY
 The final catalog is below:
 
 ```text
-$MMU_HATS_ROOT/lsst_dp2/lsst_dp2/lsst_dp2/
+$LSST_DP2_ROOT/hats/lsst_dp2/lsst_dp2/lsst_dp2/
+```
+
+## Build a 50,000-object multi-region qualification sample
+
+This is the next scale gate after the 628-object visual validation. It selects
+10,000 candidate galaxies in each of five separated DP2 regions. Selection is
+deterministic within each region and imposes no effective-radius cut:
+
+```sql
+i_cModelMag < 22
+AND i_extendedness = 1
+AND griz_model_extendedness >= 0.8
+AND sersic_no_data_flag = 0
+AND sersic_unknown_flag = 0
+```
+
+The five default regions are DDF ELAIS-S1, DDF ECDFS, DDF EDFS-a, DDF COSMOS,
+and Rubin SV 225 -40. Their coordinates follow the
+[official DP2 region list](https://dp2.lsst.io/tutorials/notebook/301/notebook-301-1.html).
+
+### 1. Prepare the run on a prepost node
+
+```bash
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export LSST_DP2_RUN_NAME="multiregion_i22_50k_v1"
+cd "$MMU_JZ_ROOT/MultimodalUniverse"
+source scripts/lsst_dp2/jeanzay_env.sh
+
+read -rsp "RSP token: " RSP_TOKEN
+echo
+export RSP_TOKEN
+```
+
+All run products, including HATS, now live below `$LSST_DP2_ROOT`; a new run
+cannot overwrite another run's catalog.
+
+### 2. Query exactly 50,000 objects
+
+```bash
+"$MMU_PYTHON" -u -m scripts.lsst_dp2.query_multiregion_catalog \
+  --per-region 10000 \
+  --seed 20260908 \
+  --output "$LSST_DP2_ROOT/catalog/objects.parquet"
+```
+
+This performs five asynchronous TAP queries, retains the full eligible pool in
+memory one region at a time, and selects by a stable hash of `objectId`. The
+companion `objects.parquet.selection.json` records every query, region count,
+and coordinate. No image request is made at this stage.
+
+### 3. Preflight rows, patches, and storage
+
+```bash
+"$MMU_PYTHON" - <<'PY'
+import os
+import shutil
+from collections import Counter
+from pathlib import Path
+import pyarrow.parquet as pq
+
+root = Path(os.environ["LSST_DP2_ROOT"])
+table = pq.read_table(
+    root / "catalog/objects.parquet",
+    columns=["objectId", "tract", "patch", "dp2_region"],
+)
+ids = table["objectId"].to_pylist()
+patches = set(zip(table["tract"].to_pylist(), table["patch"].to_pylist()))
+regions = Counter(table["dp2_region"].to_pylist())
+free_gib = shutil.disk_usage(root).free / 1024**3
+
+assert len(ids) == len(set(ids)) == 50000
+assert set(regions.values()) == {10000}
+print("regions:", dict(sorted(regions.items())))
+print("unique patches:", len(patches))
+print("download tasks:", 6 * len(patches))
+print("estimated coadds GiB:", round(6 * len(patches) * 31 / 1024, 1))
+print("filesystem free GiB:", round(free_gib, 1))
+print("Require at least 350 GiB of usable project allocation for this pilot.")
+PY
+```
+
+`df` reports filesystem capacity, not necessarily the user's project quota.
+Confirm the applicable IDRIS quota before submission. The 350 GiB allowance
+covers mirrored coadds, intermediate Parquet, final HATS, and restart margin.
+
+### 4. Submit one prepost node
+
+The defaults are four download workers, a global limit of 50 request starts per
+minute, four concurrent patch builders, two HATS workers, and a 256-row HATS
+partition threshold. The request limiter covers SIA, DataLink, and FITS GET
+starts together.
+
+```bash
+mkdir -p "$LSST_DP2_ROOT/logs"
+JOB_ID=$(sbatch --parsable \
+  --account=jrx@cpu \
+  --partition=prepost \
+  --export=ALL \
+  --output="$LSST_DP2_ROOT/logs/workflow-%j.out" \
+  --error="$LSST_DP2_ROOT/logs/workflow-%j.err" \
+  scripts/lsst_dp2/pilot_prepost.slurm)
+echo "JOB_ID=$JOB_ID"
+```
+
+Do not start a second workflow against the same run directory. Monitor with:
+
+```bash
+squeue -j "$JOB_ID"
+tail -F "$LSST_DP2_ROOT/logs/download.log"
+tail -F "$LSST_DP2_ROOT/logs/build_parquet.log"
+tail -F "$LSST_DP2_ROOT/logs/ingest_hats.log"
+tail -F "$LSST_DP2_ROOT/logs/validate.log"
+```
+
+When the job ends:
+
+```bash
+sacct -j "$JOB_ID" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS
+```
+
+### 5. Acceptance gate
+
+```bash
+"$MMU_PYTHON" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["LSST_DP2_ROOT"])
+report = json.loads((root / "validation_report.json").read_text())
+assert report["status"] == "PASS"
+assert report["catalog_rows"] == 50000
+assert report["parquet_rows"] == 50000
+assert report["hats_rows"] == 50000
+assert report["unique_object_ids"] == 50000
+assert report["center_checks"] == 6 * 50000
+assert report["max_center_axis_offset_pix"] <= 0.500001
+assert set(report["psf_valid_fractions"]) == set("ugrizy")
+print(json.dumps(report, indent=2))
+PY
+```
+
+The validated MMU catalog is:
+
+```text
+$LSST_DP2_ROOT/hats/lsst_dp2/lsst_dp2/lsst_dp2/
 ```
 
 ## Magnitude-size validation sample
@@ -354,7 +501,7 @@ stretch independently to reveal faint morphology. Neither changes the stored
 MMU flux, ivar, mask, or PSF arrays.
 
 ```bash
-export HATS_PATH="$MMU_HATS_ROOT/lsst_dp2/lsst_dp2/lsst_dp2"
+export HATS_PATH="$LSST_DP2_ROOT/hats/lsst_dp2/lsst_dp2/lsst_dp2"
 
 "$MMU_PYTHON" -u -m scripts.lsst_dp2.plot_mag_size_gallery \
   --hats-path "$HATS_PATH" \
