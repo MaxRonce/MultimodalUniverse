@@ -7,11 +7,13 @@ FITS once, then extracts all source cutouts locally.
 The implementation is split by responsibility:
 
 - `query_catalog.py`: authenticated DP2 Object TAP query;
+- `stratify_catalog.py`: deterministic magnitude-size sampling;
 - `download_coadds.py`: resumable SIA/DataLink mirror with a SQLite manifest;
 - `coadd.py`: calibrated FITS, mask, WCS, and local cell-PSF extraction;
 - `schema.py`: nested Arrow representation of the MMU image contract;
 - `build_parent_sample_hats.py`: restartable patch processing and HATS ingest;
 - `validate_parent_sample.py`: fail-closed catalog-to-HATS validation;
+- `plot_mag_size_gallery.py`: auditable per-cell RGB galleries;
 - `Snakefile`: single-node Jean-Zay workflow with durable stage markers.
 
 ## Data contract
@@ -49,7 +51,7 @@ From the repository root:
 
 ```bash
 uv sync --frozen --extra dev --extra viz
-uv run pytest -q tests/test_lsst_dp2_build.py tests/test_hats_configs.py
+uv run python -m pytest -q tests/test_lsst_dp2_build.py tests/test_hats_configs.py
 uvx ruff check scripts/lsst_dp2 tests/test_lsst_dp2_build.py
 ```
 
@@ -258,6 +260,138 @@ The final catalog is below:
 ```text
 $MMU_HATS_ROOT/lsst_dp2/lsst_dp2/lsst_dp2/
 ```
+
+## Magnitude-size validation sample
+
+The 5,000-row smoke test above checks the pipeline, but it is not a controlled
+visual sample. Use the following workflow to compare morphology across
+brightness and apparent size without selecting the most attractive or
+highest-S/N objects.
+
+The default grid has five magnitude bins and four major-axis effective-radius
+bins. With 32 objects per cell it contains at most 640 galaxy candidates:
+
+- `18 <= i < 20`, then one-magnitude bins through `i < 24`;
+- `0.4 <= Re < 0.6`, `0.6 <= Re < 1.0`, `1.0 <= Re < 1.5`, and
+  `Re >= 1.5` arcsec.
+
+Start a fresh run so its manifest and products cannot be mixed with the
+5,000-row smoke test:
+
+```bash
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export LSST_DP2_RUN_NAME="ecdfs_mag_size_v1"
+cd "$MMU_JZ_ROOT/MultimodalUniverse"
+source scripts/lsst_dp2/jeanzay_env.sh
+
+read -rsp "RSP token: " RSP_TOKEN
+echo
+export RSP_TOKEN
+```
+
+Query a parent candidate pool in the DP2 E-CDFS region. This query deliberately
+keeps all candidates in the spatial region before the deterministic sampling
+step:
+
+```bash
+"$MMU_PYTHON" -u -m scripts.lsst_dp2.query_catalog \
+  --ra 53.0 \
+  --dec -28.1 \
+  --radius-deg 0.50 \
+  --where "i_cModelMag >= 18 AND i_cModelMag < 24 AND i_extendedness = 1 AND griz_model_extendedness >= 0.8 AND sersic_no_data_flag = 0 AND sersic_unknown_flag = 0 AND sersic_reff_major >= 0.4" \
+  --output "$LSST_DP2_ROOT/catalog/candidates.parquet"
+```
+
+Create the balanced sample. Selection inside each cell is based on a stable
+hash of `objectId`, not on S/N, color, appearance, or catalog order:
+
+```bash
+"$MMU_PYTHON" -u -m scripts.lsst_dp2.stratify_catalog \
+  --catalog "$LSST_DP2_ROOT/catalog/candidates.parquet" \
+  --output "$LSST_DP2_ROOT/catalog/objects.parquet" \
+  --mag-edges "18,20,21,22,23,24" \
+  --size-edges "0.4,0.6,1.0,1.5,inf" \
+  --per-cell 32 \
+  --seed 20260908 \
+  --require-full-cells
+```
+
+The companion file `objects.parquet.selection.json` records availability and
+selected counts for every cell. If a cell is underfilled, the command fails
+before writing the sample; enlarge the cone or reduce `--per-cell` explicitly.
+
+Build and validate the cutouts with the same restartable workflow:
+
+```bash
+bash scripts/lsst_dp2/run_prepost.sh
+```
+
+Check the actual expected row count rather than assuming 640 rows:
+
+```bash
+"$MMU_PYTHON" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["LSST_DP2_ROOT"])
+selection = json.loads(
+    (root / "catalog/objects.parquet.selection.json").read_text()
+)
+validation = json.loads((root / "validation_report.json").read_text())
+assert validation["status"] == "PASS"
+assert validation["catalog_rows"] == selection["selected_rows"]
+assert validation["parquet_rows"] == selection["selected_rows"]
+assert validation["hats_rows"] == selection["selected_rows"]
+print(f"PASS: {selection['selected_rows']} cutouts")
+PY
+```
+
+Generate two gallery sets. The first uses one fixed display stretch across all
+cells and is the appropriate comparison plot. The second adapts the display
+stretch independently to reveal faint morphology. Neither changes the stored
+MMU flux, ivar, mask, or PSF arrays.
+
+```bash
+export HATS_PATH="$MMU_HATS_ROOT/lsst_dp2/lsst_dp2/lsst_dp2"
+
+"$MMU_PYTHON" -u -m scripts.lsst_dp2.plot_mag_size_gallery \
+  --hats-path "$HATS_PATH" \
+  --output-dir "$LSST_DP2_ROOT/figures/fixed" \
+  --mag-edges "18,20,21,22,23,24" \
+  --size-edges "0.4,0.6,1.0,1.5,inf" \
+  --per-cell 16 \
+  --stretch-njy 10 \
+  --smooth-sigma 0 \
+  --display-sigma 0
+
+"$MMU_PYTHON" -u -m scripts.lsst_dp2.plot_mag_size_gallery \
+  --hats-path "$HATS_PATH" \
+  --output-dir "$LSST_DP2_ROOT/figures/adaptive" \
+  --mag-edges "18,20,21,22,23,24" \
+  --size-edges "0.4,0.6,1.0,1.5,inf" \
+  --per-cell 16
+```
+
+Each directory contains one PNG per populated cell, a CSV listing every shown
+`objectId`, magnitude, and size, and a JSON file recording the rendering
+parameters. This E-CDFS run is a controlled deep-field diagnostic, not a
+sky-representative DP2 sample; repeat the same grid in other DP2 regions before
+using the result to characterize survey-wide population diversity.
+
+### Photometric redshifts
+
+Redshifts are not columns of the TAP `dp2.Object` table. DP2 also provides a
+separate provisional HATS catalog at `/rubin/lsdb_data/dp2/object_photoz` in
+the Rubin Science Platform environment. It contains estimates from multiple
+photo-z algorithms and uncertainty intervals and can be joined to the selected
+sample by `objectId`. Preserve the algorithm name, point estimate, and interval
+bounds; do not reduce the photo-z information to one undocumented scalar.
+
+The `/rubin/lsdb_data` filesystem is an RSP path, not a Jean-Zay path. Generate
+the selected `objectId` list and images on Jean-Zay, perform the small regional
+photo-z join on the RSP, then transfer the resulting Parquet table back into
+the run's provenance directory.
 
 ## Recovery
 

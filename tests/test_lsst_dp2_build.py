@@ -16,6 +16,7 @@ from astropy.table import Table
 from scripts.lsst_dp2 import build_parent_sample_hats as build
 from scripts.lsst_dp2 import download_coadds as download
 from scripts.lsst_dp2 import query_catalog as query
+from scripts.lsst_dp2 import stratify_catalog as stratify
 from scripts.lsst_dp2 import validate_parent_sample as validate
 from scripts.lsst_dp2.common import BANDS, IMAGE_SIZE, coadd_path
 
@@ -98,6 +99,21 @@ def _catalog(path: Path) -> Table:
         "refBand": np.array(["i", "r"]),
         "refExtendedness": np.array([1.0, 0.0], dtype=np.float32),
         "detect_isIsolated": np.array([True, False]),
+        "i_cModelMag": np.array([21.5, 23.5], dtype=np.float32),
+        "i_cModelMagErr": np.array([0.02, 0.08], dtype=np.float32),
+        "i_extendedness": np.array([1.0, 0.0], dtype=np.float32),
+        "i_sizeExtendedness": np.array([0.9, 0.1], dtype=np.float32),
+        "griz_model_extendedness": np.array([0.95, 0.05], dtype=np.float32),
+        "sersic_reff_major": np.array([0.8, 0.2], dtype=np.float32),
+        "sersic_reff_minor": np.array([0.5, 0.1], dtype=np.float32),
+        "sersic_index": np.array([2.0, 1.0], dtype=np.float32),
+        "sersic_chi2_reduced": np.array([1.1, 1.2], dtype=np.float32),
+        "i_deblend_fluxOverlapFraction": np.array([0.1, 0.0], dtype=np.float32),
+        "i_extendedness_flag": np.array([False, False]),
+        "i_sizeExtendedness_flag": np.array([False, False]),
+        "i_cModel_flag": np.array([False, False]),
+        "sersic_no_data_flag": np.array([False, False]),
+        "sersic_unknown_flag": np.array([False, False]),
     }
     for i, band in enumerate(BANDS):
         data[f"{band}_ixxPSF"] = np.full(2, 4.0 + i, dtype=np.float32)
@@ -150,10 +166,16 @@ def test_query_column_discovery_and_polygon():
         "i_ixxPSF",
         "i_iyyPSF",
         "i_ixyPSF",
+        "i_cModelMag",
+        "griz_model_extendedness",
+        "sersic_reff_major",
     }
     columns = query.select_columns(available)
     assert columns[:5] == ["objectId", "coord_ra", "coord_dec", "tract", "patch"]
     assert "i_ixxPSF" in columns
+    assert "i_cModelMag" in columns
+    assert "griz_model_extendedness" in columns
+    assert "sersic_reff_major" in columns
     args = query.argparse.Namespace(
         polygon="0,0 1,0 1,1", ra=None, dec=None, radius_deg=None
     )
@@ -163,6 +185,35 @@ def test_query_column_discovery_and_polygon():
     limited_query = query.build_query(columns, "1=1", None, 4)
     assert limited_query.startswith("SELECT TOP 4 ")
     assert limited_query.endswith("ORDER BY objectId")
+
+
+def test_stratified_selection_is_deterministic_and_reports_cells():
+    table = Table(
+        {
+            "objectId": np.arange(1, 10),
+            "tract": np.ones(9, dtype=int),
+            "patch": np.ones(9, dtype=int),
+            "i_cModelMag": [20.2, 20.3, 20.4, 20.2, 20.3, 20.4, 21.2, 21.3, 21.4],
+            "i_extendedness": np.ones(9),
+            "griz_model_extendedness": np.full(9, 0.9),
+            "sersic_reff_major": [0.5, 0.5, 0.5, 0.8, 0.8, 0.8, 0.5, 0.5, 0.5],
+            "sersic_no_data_flag": np.zeros(9, dtype=bool),
+            "sersic_unknown_flag": np.zeros(9, dtype=bool),
+        }
+    )
+    kwargs = {
+        "mag_edges": np.array([20.0, 21.0, 22.0]),
+        "size_edges": np.array([0.4, 0.6, 1.0]),
+        "per_cell": 2,
+        "seed": 7,
+        "min_model_extendedness": 0.8,
+    }
+    selected, report = stratify.select_stratified(table, **kwargs)
+    repeated, _ = stratify.select_stratified(table, **kwargs)
+    assert selected["objectId"].tolist() == repeated["objectId"].tolist()
+    assert len(selected) == 6
+    assert report["eligible_rows"] == 9
+    assert [cell["selected"] for cell in report["cells"]] == [2, 2, 2, 0]
 
 
 def test_patch_psf_fallback_ignores_invalid_object_moments(tmp_path):
@@ -326,6 +377,9 @@ def test_end_to_end_parquet_and_hats(tmp_path):
     )
     assert all(image["band_present"])
     assert image["dataset_id"][3] == "ivo://dp2/i"
+    assert table.column("i_cModelMag")[0].as_py() == pytest.approx(21.5)
+    assert table.column("griz_model_extendedness")[0].as_py() == pytest.approx(0.95)
+    assert table.column("sersic_reff_major")[0].as_py() == pytest.approx(0.8)
     assert list(output.rglob("hats.properties"))
     assert (
         validate.main(

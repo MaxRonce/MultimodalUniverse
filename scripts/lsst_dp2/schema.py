@@ -6,10 +6,16 @@ import numpy as np
 import pyarrow as pa
 
 from scripts.lsst_dp2.coadd import PSF_SIZE
-from scripts.lsst_dp2.common import BANDS, IMAGE_SIZE, SKYMAP
+from scripts.lsst_dp2.common import (
+    BANDS,
+    IMAGE_SIZE,
+    SELECTION_FLAG_COLUMNS,
+    SELECTION_FLOAT_COLUMNS,
+    SKYMAP,
+)
 
 PHOTOMETRY_SUFFIXES = ("psfFlux", "psfFluxErr", "cModelFlux", "cModelFluxErr")
-OUTPUT_SCHEMA_VERSION = 4
+OUTPUT_SCHEMA_VERSION = 5
 
 
 def _nested_column(
@@ -110,4 +116,12 @@ def build_table(records: list[dict]) -> pa.Table:
             columns[name] = pa.array(
                 [r["photometry"][name] for r in records], type=pa.float32()
             )
+    for name in SELECTION_FLOAT_COLUMNS:
+        columns[name] = pa.array(
+            [r["selection_metadata"].get(name) for r in records], type=pa.float32()
+        )
+    for name in SELECTION_FLAG_COLUMNS:
+        columns[name] = pa.array(
+            [r["selection_metadata"].get(name) for r in records], type=pa.bool_()
+        )
     return pa.table(columns)

@@ -23,6 +23,7 @@ def _rgb(
     crop_size: int = 80,
     smooth_sigma: float = 1.2,
     display_sigma: float = 1.5,
+    stretch_njy: float | None = None,
 ) -> np.ndarray:
     flux = image["flux"].numpy().astype(np.float32)
     mask = image["mask"].numpy().astype(bool)
@@ -56,7 +57,10 @@ def _rgb(
     intensity = sum(planes) / len(planes)
     positive = intensity[intensity > 0]
     scale = np.percentile(positive, 99) if positive.size else 1.0
-    return make_lupton_rgb(*planes, stretch=max(0.2 * scale, 1e-6), Q=5)
+    stretch = max(0.2 * scale, 1e-6) if stretch_njy is None else stretch_njy
+    if stretch <= 0:
+        raise ValueError("stretch_njy must be positive")
+    return make_lupton_rgb(*planes, stretch=stretch, Q=5)
 
 
 def main() -> None:

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from astropy.table import Table
 
-from scripts.lsst_dp2.common import BANDS
+from scripts.lsst_dp2.common import BANDS, SELECTION_COLUMNS
 
 DEFAULT_TAP_URL = "https://data.lsst.cloud/api/tap"
 
@@ -46,7 +46,12 @@ def select_columns(available: set[str]) -> list[str]:
     if missing:
         raise ValueError(f"DP2 Object schema is missing required columns: {missing}")
 
-    wanted = required + ["refBand", "refExtendedness", "detect_isIsolated"]
+    wanted = required + [
+        "refBand",
+        "refExtendedness",
+        "detect_isIsolated",
+        *SELECTION_COLUMNS,
+    ]
     for band in BANDS:
         wanted.extend(
             [

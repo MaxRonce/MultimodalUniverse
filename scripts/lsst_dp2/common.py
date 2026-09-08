@@ -31,6 +31,28 @@ DEFAULT_REJECT_MASK_PLANES = (
     "UNMASKEDNAN",
 )
 
+# DP2 measurements needed to reproduce galaxy selections after image ingestion.
+SELECTION_FLOAT_COLUMNS = (
+    "i_cModelMag",
+    "i_cModelMagErr",
+    "i_extendedness",
+    "i_sizeExtendedness",
+    "griz_model_extendedness",
+    "sersic_reff_major",
+    "sersic_reff_minor",
+    "sersic_index",
+    "sersic_chi2_reduced",
+    "i_deblend_fluxOverlapFraction",
+)
+SELECTION_FLAG_COLUMNS = (
+    "i_extendedness_flag",
+    "i_sizeExtendedness_flag",
+    "i_cModel_flag",
+    "sersic_no_data_flag",
+    "sersic_unknown_flag",
+)
+SELECTION_COLUMNS = SELECTION_FLOAT_COLUMNS + SELECTION_FLAG_COLUMNS
+
 _COLUMN_ALIASES = {
     "object_id": ("object_id", "objectId"),
     "ra": ("ra", "coord_ra"),

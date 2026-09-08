@@ -38,6 +38,8 @@ from scripts.lsst_dp2.common import (
     DEFAULT_REJECT_MASK_PLANES,
     IMAGE_SIZE,
     PIXEL_SCALE_ARCSEC,
+    SELECTION_FLAG_COLUMNS,
+    SELECTION_FLOAT_COLUMNS,
     mask_plane_mapping,
     read_catalog,
     sha256_file,
@@ -213,6 +215,25 @@ def _make_records(
                 photometry[name] = (
                     _finite_float(row[column]) if column else float("nan")
                 )
+        selection_metadata = {
+            name: (
+                _finite_float(row[column])
+                if (column := catalog_columns.get(name.casefold()))
+                else None
+            )
+            for name in SELECTION_FLOAT_COLUMNS
+        }
+        selection_metadata.update(
+            {
+                name: (
+                    bool(row[column])
+                    if (column := catalog_columns.get(name.casefold()))
+                    and not np.ma.is_masked(row[column])
+                    else None
+                )
+                for name in SELECTION_FLAG_COLUMNS
+            }
+        )
         records.append(
             {
                 "ra": ra,
@@ -241,6 +262,7 @@ def _make_records(
                 "sha256": checksums,
                 "mask_plane_map": plane_maps,
                 "photometry": photometry,
+                "selection_metadata": selection_metadata,
             }
         )
     assert len(records) == n
