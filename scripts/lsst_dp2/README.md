@@ -396,6 +396,15 @@ are recorded in `rendering.json`:
   --shared-object-scale
 ```
 
+Build a self-contained HTML viewer with one slider for magnitude and one for
+effective radius from the 20 full-band panels:
+
+```bash
+"$MMU_PYTHON" -m scripts.lsst_dp2.build_interactive_gallery \
+  --input-dir "$LSST_DP2_ROOT/figures/full_bands" \
+  --output "$LSST_DP2_ROOT/figures/interactive_mag_re.html"
+```
+
 ### Photometric redshifts
 
 Redshifts are not columns of the TAP `dp2.Object` table. DP2 also provides a
