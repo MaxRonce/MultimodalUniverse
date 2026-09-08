@@ -119,7 +119,7 @@ def psf_kernel_at(coadd: dict, ra: float, dec: float) -> tuple[np.ndarray, bool]
     psf_array = coadd["psf_array"]
 
     if not (0 <= iy < psf_array.shape[0] and 0 <= ix < psf_array.shape[1]):
-        raise ValueError(f"source is outside PSF grid: cell={(iy, ix)}")
+        return np.zeros((PSF_SIZE, PSF_SIZE), dtype=np.float32), False
 
     kernel = np.asarray(psf_array[iy, ix], dtype=np.float32).copy()
     if not np.isfinite(kernel).all():

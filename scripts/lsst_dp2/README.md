@@ -41,7 +41,9 @@ The `image` struct contains:
 Invalid pixels have `ivar=0` and `mask=False`. Non-finite input flux is stored
 as zero only where the mask rejects that pixel. A missing or non-finite Rubin
 PSF cell is stored as a zero kernel with `psf_image_valid=False`; it is never
-replaced with a neighboring PSF.
+replaced with a neighboring PSF. Sources outside a product's tabulated PSF grid
+use the same explicit missing-PSF representation; their calibrated image,
+inverse variance, masks, and scalar catalog PSF summary remain available.
 
 DP2 does not provide every band for every patch. A SIA query with no matching
 product is a terminal `unavailable` manifest state, not a download failure. The

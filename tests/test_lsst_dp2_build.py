@@ -423,6 +423,17 @@ def test_missing_psf_cell_is_explicit(tmp_path):
     assert not kernel.any()
 
 
+def test_source_outside_psf_grid_is_explicit(tmp_path):
+    path = tmp_path / "masked.fits"
+    _write_maskedimage(path, 3.0)
+    with build.open_maskedimage(str(path)) as coadd:
+        coadd["psf_grid_start_yx"] = (10_000, 10_000)
+        kernel, valid = build.psf_kernel_at(coadd, 150.0, 2.0)
+    assert valid is False
+    assert kernel.shape == (build.PSF_SIZE, build.PSF_SIZE)
+    assert not kernel.any()
+
+
 def test_dp2_mask_header_decode_and_sat_alias():
     header = fits.Header()
     header["MSKN0000"] = "NO_DATA"
