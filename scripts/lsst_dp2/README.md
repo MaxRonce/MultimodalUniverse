@@ -297,7 +297,7 @@ step:
 "$MMU_PYTHON" -u -m scripts.lsst_dp2.query_catalog \
   --ra 53.0 \
   --dec -28.1 \
-  --radius-deg 0.50 \
+  --radius-deg 0.30 \
   --where "i_cModelMag >= 18 AND i_cModelMag < 24 AND i_extendedness = 1 AND griz_model_extendedness >= 0.8 AND sersic_no_data_flag = 0 AND sersic_unknown_flag = 0 AND sersic_reff_major >= 0.4" \
   --output "$LSST_DP2_ROOT/catalog/candidates.parquet"
 ```
