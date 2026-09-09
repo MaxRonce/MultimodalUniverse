@@ -33,7 +33,7 @@ The `image` struct contains:
 | `mask_bits` | `(6,160,160)` int32 | original Rubin integer bit mask |
 | `psf_image` | `(6,35,35)` float32 | normalized local DP2 cell PSF |
 | `psf_image_valid` | `(6,)` bool | whether the local PSF cell is usable |
-| `psf_fwhm` | `(6,)` float32 | catalog/SIA scalar PSF summary in arcsec |
+| `psf_fwhm` | `(6,)` float32 | catalog/SIA scalar PSF summary in arcsec; zero when unavailable |
 | `scale` | `(6,)` float32 | pixel scale, currently `0.2` arcsec/pixel |
 | `band_present` | `(6,)` bool | availability of each deep coadd |
 | provenance | `(6,)` | dataset ID, SHA-256, mask-plane map, PSF source |
@@ -44,6 +44,9 @@ PSF cell is stored as a zero kernel with `psf_image_valid=False`; it is never
 replaced with a neighboring PSF. Sources outside a product's tabulated PSF grid
 use the same explicit missing-PSF representation; their calibrated image,
 inverse variance, masks, and scalar catalog PSF summary remain available.
+An unavailable scalar FWHM is independently represented by `psf_fwhm=0` and
+`psf_source="missing"`; validation reports its availability per band without
+rejecting an otherwise valid cutout.
 
 DP2 does not provide every band for every patch. A SIA query with no matching
 product is a terminal `unavailable` manifest state, not a download failure. The

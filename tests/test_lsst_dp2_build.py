@@ -550,9 +550,14 @@ def test_missing_band_is_explicitly_padded(tmp_path):
     assert image["psf_image_valid"][0] is False
     assert image["dataset_id"][0] == ""
     assert image["sha256"][0] == ""
-    clean_fraction, psf_valid, band_present = validate._validate_image("101", image)
+    image["psf_fwhm"][1] = 0.0
+    image["psf_source"][1] = "missing"
+    clean_fraction, psf_valid, psf_fwhm_valid, band_present = (
+        validate._validate_image("101", image)
+    )
     assert 0 < clean_fraction <= 1
     assert psf_valid.tolist() == [False, True, True, True, True, True]
+    assert psf_fwhm_valid.tolist() == [False, False, True, True, True, True]
     assert band_present.tolist() == [False, True, True, True, True, True]
 
 

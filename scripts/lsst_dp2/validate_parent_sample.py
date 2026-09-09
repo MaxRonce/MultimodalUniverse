@@ -103,7 +103,7 @@ def _validate_coadds(
 
 def _validate_image(
     object_id: str, image: dict
-) -> tuple[float, np.ndarray, np.ndarray]:
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
     """Validate one nested MMU image struct and return aggregate statistics."""
     if image["band"] != list(BANDS):
         raise ValueError(f"unexpected bands for {object_id}: {image['band']}")
@@ -150,9 +150,15 @@ def _validate_image(
                 f"valid mask includes rejected bits for {object_id}/{BANDS[band_index]}"
             )
     psf = np.asarray(image["psf_fwhm"], dtype=np.float32)
+    psf_sources = image["psf_source"]
     scale = np.asarray(image["scale"], dtype=np.float32)
-    if not np.isfinite(psf).all() or (psf[band_present] <= 0).any():
-        raise ValueError(f"missing or invalid PSF FWHM for {object_id}")
+    if len(psf_sources) != len(BANDS) or not np.isfinite(psf).all():
+        raise ValueError(f"invalid PSF FWHM provenance for {object_id}")
+    psf_fwhm_valid = band_present & np.asarray(
+        [source != "missing" for source in psf_sources], dtype=bool
+    )
+    if (psf[psf_fwhm_valid] <= 0).any() or (psf[~psf_fwhm_valid] != 0).any():
+        raise ValueError(f"inconsistent PSF FWHM availability for {object_id}")
     if not np.allclose(scale, PIXEL_SCALE_ARCSEC):
         raise ValueError(f"invalid pixel scale for {object_id}: {scale}")
     dataset_ids = image["dataset_id"]
@@ -172,7 +178,7 @@ def _validate_image(
             or dataset_ids[band_index]
             or checksums[band_index]
             or plane_maps[band_index] != "{}"
-            or image["psf_source"][band_index] != "missing"
+            or psf_sources[band_index] != "missing"
         ):
             raise ValueError(
                 f"absent band is not zero-padded for {object_id}/{BANDS[band_index]}"
@@ -181,7 +187,12 @@ def _validate_image(
         raise ValueError(f"invalid flux units for {object_id}")
     if image["ivar_unit"] != ["nJy^-2"] * len(BANDS):
         raise ValueError(f"invalid ivar units for {object_id}")
-    return float(mask[band_present].mean()), psf_image_valid, band_present
+    return (
+        float(mask[band_present].mean()),
+        psf_image_valid,
+        psf_fwhm_valid,
+        band_present,
+    )
 
 
 def _validate_parquet(
@@ -198,6 +209,7 @@ def _validate_parquet(
     min_clean_fraction = 1.0
     max_clean_fraction = 0.0
     psf_valid_counts = np.zeros(len(BANDS), dtype=np.int64)
+    psf_fwhm_valid_counts = np.zeros(len(BANDS), dtype=np.int64)
     band_present_counts = np.zeros(len(BANDS), dtype=np.int64)
     for path in paths:
         parquet = pq.ParquetFile(path)
@@ -209,9 +221,12 @@ def _validate_parquet(
                 if object_id in found_ids:
                     raise ValueError(f"duplicate object_id in shards: {object_id}")
                 found_ids.add(object_id)
-                clean_fraction, psf_valid, band_present = _validate_image(
-                    object_id, image_scalar.as_py()
-                )
+                (
+                    clean_fraction,
+                    psf_valid,
+                    psf_fwhm_valid,
+                    band_present,
+                ) = _validate_image(object_id, image_scalar.as_py())
                 if not np.array_equal(
                     band_present, expected_band_presence[object_id]
                 ):
@@ -219,6 +234,7 @@ def _validate_parquet(
                         f"band availability differs from manifest for {object_id}"
                     )
                 psf_valid_counts += psf_valid
+                psf_fwhm_valid_counts += psf_fwhm_valid
                 band_present_counts += band_present
                 min_clean_fraction = min(min_clean_fraction, clean_fraction)
                 max_clean_fraction = max(max_clean_fraction, clean_fraction)
@@ -246,6 +262,12 @@ def _validate_parquet(
         "psf_valid_counts": dict(zip(BANDS, psf_valid_counts.tolist())),
         "psf_valid_fractions": dict(
             zip(BANDS, (psf_valid_counts / checked_rows).tolist())
+        ),
+        "psf_fwhm_valid_counts": dict(
+            zip(BANDS, psf_fwhm_valid_counts.tolist())
+        ),
+        "psf_fwhm_valid_fractions": dict(
+            zip(BANDS, (psf_fwhm_valid_counts / checked_rows).tolist())
         ),
         "band_present_counts": dict(zip(BANDS, band_present_counts.tolist())),
         "band_present_fractions": dict(
