@@ -655,6 +655,115 @@ the selected `objectId` list and images on Jean-Zay, perform the small regional
 photo-z join on the RSP, then transfer the resulting Parquet table back into
 the run's provenance directory.
 
+## Dense-patch network campaign (`i < 21`, `Re > 0.6 arcsec`)
+
+Use this download-only campaign when network access is the scarce resource and
+cutout extraction will run later. It first counts the selected objects in every
+DP2 patch, keeps the 6,000 densest patches, queries every selected object in
+those patches, and mirrors each available complete `ugrizy` coadd once. It does
+not extract cutouts or run HATS.
+
+The exact default selection is:
+
+```sql
+i_cModelMag < 21
+AND i_extendedness = 1
+AND griz_model_extendedness >= 0.8
+AND sersic_no_data_flag = 0
+AND sersic_unknown_flag = 0
+AND sersic_reff_major > 0.6
+```
+
+At the DP2 pixel scale, `Re > 0.6 arcsec` means a major-axis effective radius
+larger than about 3 pixels. The fixed MMU stamp remains `160 x 160` pixels, or
+about `32 x 32 arcsec`; this query does not resize or preprocess images.
+
+The manifest contains 36,000 patch-band tasks for 6,000 patches. Each job
+processes at most 18,000 tasks with eight I/O workers and one process-wide cap
+of 59 request starts per minute. The downloader currently uses up to three
+HTTP requests per product (SIA discovery, DataLink resolution, file transfer),
+so the theoretical request floor is about 30.5 hours for the full campaign.
+The observed pilot throughput implies about 36 hours, before query time,
+retries, queueing, and service variation. Expected coadd storage is about
+1.1 TiB. The generated selection report records the actual object count and
+density before downloads start.
+
+From a Jean-Zay login node, update the fork and restore an isolated run under
+`$SCRATCH`:
+
+```bash
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export MMU_REPO="$MMU_JZ_ROOT/MultimodalUniverse"
+export LSST_DP2_RUN_NAME="dense_i21_reff0p6_weekend_v1"
+
+git -C "$MMU_REPO" fetch fork feat/lsst-dp2
+git -C "$MMU_REPO" switch feat/lsst-dp2
+git -C "$MMU_REPO" pull --ff-only fork feat/lsst-dp2
+
+unset LSST_DP2_ROOT LSST_DP2_HATS_OUTER
+source "$MMU_REPO/scripts/lsst_dp2/jeanzay_env.sh"
+read -rsp "RSP token: " RSP_TOKEN
+echo
+export RSP_TOKEN
+mkdir -p "$LSST_DP2_ROOT/logs"
+```
+
+Submit two full task batches and a short third recovery job. Jobs are strictly
+sequential, so they share neither the request budget nor the SQLite manifest
+concurrently. `afterany` allows the next job to recover tasks left `running` by
+a timeout; completed FITS are not downloaded again.
+
+```bash
+JOB1=$(sbatch --parsable \
+  --account=jrx@cpu --partition=prepost --export=ALL \
+  --output="$LSST_DP2_ROOT/logs/dense-%j.out" \
+  --error="$LSST_DP2_ROOT/logs/dense-%j.err" \
+  "$MMU_REPO/scripts/lsst_dp2/dense_download_prepost.slurm")
+
+JOB2=$(sbatch --parsable --dependency="afterany:$JOB1" \
+  --account=jrx@cpu --partition=prepost --export=ALL \
+  --output="$LSST_DP2_ROOT/logs/dense-%j.out" \
+  --error="$LSST_DP2_ROOT/logs/dense-%j.err" \
+  "$MMU_REPO/scripts/lsst_dp2/dense_download_prepost.slurm")
+
+JOB3=$(sbatch --parsable --dependency="afterany:$JOB2" \
+  --account=jrx@cpu --partition=prepost --export=ALL \
+  --output="$LSST_DP2_ROOT/logs/dense-%j.out" \
+  --error="$LSST_DP2_ROOT/logs/dense-%j.err" \
+  "$MMU_REPO/scripts/lsst_dp2/dense_download_prepost.slurm")
+
+unset RSP_TOKEN
+echo "JOB1=$JOB1 JOB2=$JOB2 JOB3=$JOB3"
+```
+
+Queue and live progress:
+
+```bash
+watch -n 30 "date; squeue -j $JOB1,$JOB2,$JOB3 \
+  -o '%.18i %.2t %.12M %.30R'; du -sh '$LSST_DP2_ROOT/coadds' 2>/dev/null"
+```
+
+After a reconnect, restore the variables shown above and recover the job IDs
+with `squeue -u "$USER" -n mmu-lsst-net`. Inspect one active log with
+`tail -F "$LSST_DP2_ROOT/logs/dense-JOBID.out"`. The catalog selection report
+is `$LSST_DP2_ROOT/catalog/objects.parquet.selection.json`.
+
+Check manifest progress without authentication:
+
+```bash
+cd "$MMU_REPO"
+"$MMU_PYTHON" -m scripts.lsst_dp2.download_coadds \
+  --catalog "$LSST_DP2_ROOT/catalog/objects.parquet" \
+  --mirror-root "$LSST_DP2_ROOT/coadds" \
+  --manifest "$LSST_DP2_ROOT/download_manifest.sqlite" \
+  --status-only
+```
+
+Patch density is a prioritization strategy for this time-bounded cache, not a
+scientifically representative sampling scheme. Preserve the inventory and
+selection report. A downstream training sample should explicitly assess sky,
+magnitude, size, color, seeing, depth, and missing-band coverage before use.
+
 ## Recovery
 
 Inspect the download manifest without a token:

@@ -680,7 +680,12 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
     con.close()
-    return 1 if failed or incomplete else 0
+    if args.task_limit is not None and incomplete:
+        print(
+            f"Task-limited run left {incomplete} manifest tasks for the next job",
+            flush=True,
+        )
+    return 1 if failed or (incomplete and args.task_limit is None) else 0
 
 
 if __name__ == "__main__":

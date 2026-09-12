@@ -16,6 +16,7 @@ from astropy.table import Table
 from scripts.lsst_dp2 import build_parent_sample_hats as build
 from scripts.lsst_dp2 import download_coadds as download
 from scripts.lsst_dp2 import query_catalog as query
+from scripts.lsst_dp2 import query_dense_patch_catalog as dense_query
 from scripts.lsst_dp2 import query_multiregion_catalog as multiregion
 from scripts.lsst_dp2 import stratify_catalog as stratify
 from scripts.lsst_dp2 import validate_parent_sample as validate
@@ -187,6 +188,24 @@ def test_query_column_discovery_and_polygon():
     limited_query = query.build_query(columns, "1=1", None, 4)
     assert limited_query.startswith("SELECT TOP 4 ")
     assert limited_query.endswith("ORDER BY objectId")
+
+
+def test_dense_patch_query_ranks_by_population_and_builds_predicate():
+    inventory = Table(
+        {
+            "tract": [2, 1, 1, 2],
+            "patch": [8, 4, 3, 7],
+            "n_objects": [20, 30, 30, 10],
+        }
+    )
+    selected = dense_query.rank_inventory(inventory, patch_limit=3)
+    assert selected["tract"].tolist() == [1, 1, 2]
+    assert selected["patch"].tolist() == [3, 4, 8]
+    assert selected["density_rank"].tolist() == [1, 2, 3]
+    assert dense_query.patch_predicate([(2, 8), (1, 4), (1, 3)]) == (
+        "((tract = 1 AND patch IN (3, 4)) OR "
+        "(tract = 2 AND patch IN (8)))"
+    )
 
 
 def test_stratified_selection_is_deterministic_and_reports_cells():
