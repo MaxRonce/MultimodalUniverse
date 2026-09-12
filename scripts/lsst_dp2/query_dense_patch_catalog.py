@@ -175,8 +175,6 @@ def main(argv: list[str] | None = None) -> int:
         "patch_limit": args.patch_limit,
         "batch_patches": args.batch_patches,
         "tap_url": args.tap_url,
-        "tap_attempts": args.tap_attempts,
-        "retry_base_seconds": args.retry_base_seconds,
     }
     _write_plan(work / "plan.json", plan)
 
