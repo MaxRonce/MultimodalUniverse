@@ -208,6 +208,21 @@ def test_dense_patch_query_ranks_by_population_and_builds_predicate():
     )
 
 
+def test_dense_patch_query_retries_transient_dal_failures(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def operation():
+        calls.append(None)
+        if len(calls) < 3:
+            raise OSError("temporary proxy failure")
+        return "ok"
+
+    monkeypatch.setattr(dense_query.time, "sleep", sleeps.append)
+    assert dense_query.retry_dal_call(operation, "test", 4, 2.0) == "ok"
+    assert sleeps == [2.0, 4.0]
+
+
 def test_stratified_selection_is_deterministic_and_reports_cells():
     table = Table(
         {

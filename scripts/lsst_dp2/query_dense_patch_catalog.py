@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import warnings
 from collections import defaultdict
 from pathlib import Path
@@ -21,6 +22,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+import pyvo
+import requests
 from astropy.table import Column, Table
 
 from scripts.lsst_dp2.query_catalog import (
@@ -73,26 +76,59 @@ def rank_inventory(table: Table, patch_limit: int) -> Table:
     return selected
 
 
-def run_async_query(service, query: str, maxrec: int) -> Table:
-    """Run one TAP job and reject truncated results."""
-    import pyvo
-
-    job = service.submit_job(query, maxrec=maxrec)
-    print(f"TAP job: {job.url}", flush=True)
-    try:
-        job.run()
-        job.wait(phases=["COMPLETED", "ERROR", "ABORTED"])
-        job.raise_if_error()
-        if job.phase != "COMPLETED":
-            raise RuntimeError(f"TAP job ended in phase {job.phase}")
-        with warnings.catch_warnings():
-            warnings.filterwarnings("error", category=pyvo.dal.DALOverflowWarning)
-            return job.fetch_result().to_table()
-    finally:
+def retry_dal_call(operation, label: str, attempts: int, base_seconds: float):
+    """Retry transient TAP/proxy failures with capped exponential backoff."""
+    for attempt in range(1, attempts + 1):
         try:
-            job.delete()
-        except Exception as exc:  # noqa: BLE001
-            print(f"WARNING: could not delete TAP job: {exc}", file=sys.stderr)
+            return operation()
+        except pyvo.dal.DALQueryError:
+            raise
+        except (pyvo.dal.DALAccessError, requests.RequestException, OSError) as exc:
+            if attempt == attempts:
+                raise
+            delay = min(300.0, base_seconds * 2 ** (attempt - 1))
+            print(
+                f"RETRY {label} after {type(exc).__name__}: {exc}; "
+                f"attempt={attempt + 1}/{attempts} delay={delay:g}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+
+
+def run_async_query(
+    service,
+    query: str,
+    maxrec: int,
+    attempts: int,
+    base_seconds: float,
+) -> Table:
+    """Run one TAP job and reject truncated results."""
+
+    def run_once():
+        job = service.submit_job(query, maxrec=maxrec)
+        print(f"TAP job: {job.url}", flush=True)
+        try:
+            job.run()
+            job.wait(phases=["COMPLETED", "ERROR", "ABORTED"])
+            job.raise_if_error()
+            if job.phase != "COMPLETED":
+                raise RuntimeError(f"TAP job ended in phase {job.phase}")
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", category=pyvo.dal.DALOverflowWarning)
+                return job.fetch_result().to_table()
+        finally:
+            try:
+                job.delete()
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARNING: could not delete TAP job: {exc}", file=sys.stderr)
+
+    return retry_dal_call(
+        run_once,
+        "TAP query",
+        attempts=attempts,
+        base_seconds=base_seconds,
+    )
 
 
 def _write_plan(path: Path, plan: dict) -> None:
@@ -115,9 +151,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--where", default=DEFAULT_WHERE)
     parser.add_argument("--tap-url", default=DEFAULT_TAP_URL)
     parser.add_argument("--token-env", default="RSP_TOKEN")
+    parser.add_argument("--tap-attempts", type=int, default=8)
+    parser.add_argument("--retry-base-seconds", type=float, default=10.0)
     args = parser.parse_args(argv)
-    if args.patch_limit <= 0 or args.batch_patches <= 0:
-        parser.error("--patch-limit and --batch-patches must be positive")
+    if (
+        args.patch_limit <= 0
+        or args.batch_patches <= 0
+        or args.tap_attempts <= 0
+        or args.retry_base_seconds <= 0
+    ):
+        parser.error("limits, attempts, and retry delay must be positive")
     token = os.environ.get(args.token_env)
     if not token:
         parser.error(f"environment variable {args.token_env} is not set")
@@ -132,12 +175,19 @@ def main(argv: list[str] | None = None) -> int:
         "patch_limit": args.patch_limit,
         "batch_patches": args.batch_patches,
         "tap_url": args.tap_url,
+        "tap_attempts": args.tap_attempts,
+        "retry_base_seconds": args.retry_base_seconds,
     }
     _write_plan(work / "plan.json", plan)
 
     service = _authenticated_tap(args.tap_url, token)
     try:
-        available = discover_columns(service)
+        available = retry_dal_call(
+            lambda: discover_columns(service),
+            "schema discovery",
+            attempts=args.tap_attempts,
+            base_seconds=args.retry_base_seconds,
+        )
         columns = select_columns(available)
         inventory_path = work / "patch_inventory.parquet"
         if inventory_path.exists():
@@ -151,7 +201,13 @@ def main(argv: list[str] | None = None) -> int:
                 "GROUP BY tract, patch"
             )
             (work / "inventory.adql").write_text(query + "\n", encoding="ascii")
-            inventory = run_async_query(service, query, maxrec=2_000_000)
+            inventory = run_async_query(
+                service,
+                query,
+                maxrec=2_000_000,
+                attempts=args.tap_attempts,
+                base_seconds=args.retry_base_seconds,
+            )
             write_catalog(inventory, str(inventory_path))
             print(f"Wrote {len(inventory)} patch inventory rows", flush=True)
 
@@ -196,7 +252,13 @@ def main(argv: list[str] | None = None) -> int:
             query_path = path.with_suffix(".adql")
             query_path.write_text(query + "\n", encoding="ascii")
             batch_expected = sum(population[pair] for pair in subset)
-            table = run_async_query(service, query, maxrec=batch_expected + 1)
+            table = run_async_query(
+                service,
+                query,
+                maxrec=batch_expected + 1,
+                attempts=args.tap_attempts,
+                base_seconds=args.retry_base_seconds,
+            )
             if len(table) != batch_expected:
                 raise RuntimeError(
                     f"batch {batch_index} returned {len(table)}/{batch_expected} rows"
