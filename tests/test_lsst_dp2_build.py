@@ -298,6 +298,27 @@ def test_manifest_is_restartable(tmp_path):
     con.close()
 
 
+def test_manifest_downloads_dense_patches_first(tmp_path):
+    catalog_path = tmp_path / "dense.parquet"
+    catalog = Table(
+        {
+            "objectId": [1, 2],
+            "coord_ra": [150.0, 151.0],
+            "coord_dec": [2.0, 2.0],
+            "tract": [100, 200],
+            "patch": [1, 2],
+            "dense_patch_rank": [2, 1],
+        }
+    )
+    catalog.write(catalog_path, format="parquet")
+    con = download.connect_manifest(str(tmp_path / "manifest.sqlite"))
+    download.initialize_tasks(con, str(catalog_path), str(tmp_path / "mirror"))
+    tasks = download.pending_tasks(con, max_attempts=5)
+    assert [(task.tract, task.patch) for task in tasks[:6]] == [(200, 2)] * 6
+    assert [(task.tract, task.patch) for task in tasks[6:]] == [(100, 1)] * 6
+    con.close()
+
+
 def test_manifest_rejects_a_changed_catalog(tmp_path):
     catalog_path = tmp_path / "objects.parquet"
     catalog = _catalog(catalog_path)

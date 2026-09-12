@@ -100,6 +100,7 @@ def connect_manifest(path: str) -> sqlite3.Connection:
             s_resolution REAL,
             mask_planes TEXT,
             error TEXT,
+            priority INTEGER NOT NULL DEFAULT 2147483647,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (tract, patch, band)
         )
@@ -116,6 +117,11 @@ def connect_manifest(path: str) -> sqlite3.Connection:
     columns = {row[1] for row in con.execute("PRAGMA table_info(coadds)")}
     if "datalink_url" not in columns:
         con.execute("ALTER TABLE coadds ADD COLUMN datalink_url TEXT")
+    if "priority" not in columns:
+        con.execute(
+            "ALTER TABLE coadds ADD COLUMN priority INTEGER NOT NULL "
+            "DEFAULT 2147483647"
+        )
     con.commit()
     return con
 
@@ -130,6 +136,7 @@ def initialize_tasks(
     patch_col = columns["patch"]
     ra_col = columns["ra"]
     dec_col = columns["dec"]
+    priority_col = "dense_patch_rank" if "dense_patch_rank" in catalog.colnames else None
     seen: set[tuple[int, int]] = set()
     rows = []
     for row in catalog:
@@ -137,6 +144,7 @@ def initialize_tasks(
         if key in seen:
             continue
         seen.add(key)
+        priority = int(row[priority_col]) if priority_col else len(seen)
         for band in BANDS:
             rows.append(
                 (
@@ -146,6 +154,7 @@ def initialize_tasks(
                     float(row[ra_col]),
                     float(row[dec_col]),
                     str(coadd_path(mirror_root, key[0], key[1], band)),
+                    priority,
                     utcnow(),
                 )
             )
@@ -192,10 +201,13 @@ def initialize_tasks(
     )
     con.executemany(
         """
-        INSERT INTO coadds (tract, patch, band, ra, dec, output_path, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO coadds (
+            tract, patch, band, ra, dec, output_path, priority, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(tract, patch, band) DO UPDATE SET
-            ra=excluded.ra, dec=excluded.dec, output_path=excluded.output_path
+            ra=excluded.ra, dec=excluded.dec, output_path=excluded.output_path,
+            priority=excluded.priority
         """,
         rows,
     )
@@ -274,7 +286,7 @@ def pending_tasks(con: sqlite3.Connection, max_attempts: int) -> list[Task]:
         SELECT tract, patch, band, ra, dec, output_path, attempts
         FROM coadds
         WHERE status NOT IN ('complete', 'unavailable') AND attempts < ?
-        ORDER BY tract, patch, band
+        ORDER BY priority, tract, patch, band
         """,
         (max_attempts,),
     ).fetchall()
