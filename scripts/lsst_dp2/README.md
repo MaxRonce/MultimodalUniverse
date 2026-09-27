@@ -18,6 +18,8 @@ The implementation is split by responsibility:
 - `validate_parent_sample.py`: fail-closed catalog-to-HATS validation;
 - `plot_mag_size_gallery.py`: auditable per-cell RGB galleries;
 - `plot_mag_size_band_gallery.py`: full `160 x 160` grayscale `ugrizy` panels;
+- `review_dataset.py`: final HATS count checks, random QA panels, and raw NPZs;
+- `publish_review.py`: explicit W&B upload of review panels and metadata;
 - `Snakefile`: single-node Jean-Zay workflow with durable stage markers.
 
 ## Data contract
@@ -996,6 +998,93 @@ and undergo full record validation. A failed HATS gather is rebuilt from the
 validated intermediates. Do not delete or modify source coadds or successful
 receipts. A different snapshot, schema, code version, or package environment
 requires a new output run name.
+
+### Review the finished dataset locally or on W&B
+
+First check the **gather job**, not just the extraction array: `sacct -j GATHER_ID
+--format=JobID,State,ExitCode,Elapsed,MaxRSS` must show `COMPLETED` and `0:0`.
+The final `validation_report.json` must exist with `status=PASS`.
+
+`review_dataset.py` checks that this report matches the frozen plan, compares
+its counts with **all actual main-catalog Parquet footers**, and validates a
+reproducible uniform random sample of image records from the final HATS. It
+does not rerun the full pixel/checksum audit or modify any source files. The
+original pipeline validated every intermediate record and all final object IDs;
+the small review is an additional readback, not a scientific certification.
+The sample has no extra S/N or quality cut. It represents this density-selected
+dataset, not the whole DP2 sky. Unavailable bands and invalid PSFs are retained
+with their flags, never replaced by simulated measurements.
+
+Run the export on a CPU node; no network access or RSP token is needed. Updating
+only the review utilities does not change the frozen processing contract. Do
+not update dependencies or processing code while production jobs are active.
+
+```bash
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export MMU_REPO="$MMU_JZ_ROOT/MultimodalUniverse"
+export LSST_DP2_RUN_NAME=dense_i21_reff0p6_mmu_v1
+unset LSST_DP2_ROOT LSST_DP2_HATS_OUTER
+source "$MMU_REPO/scripts/lsst_dp2/jeanzay_env.sh"
+cd "$MMU_REPO"
+git pull --ff-only https://github.com/MaxRonce/MultimodalUniverse.git feat/lsst-dp2
+
+srun --account=jrx@cpu --partition=cpu_p1 \
+  --nodes=1 --ntasks=1 --cpus-per-task=8 --hint=nomultithread --time=01:00:00 \
+  "$MMU_PYTHON" -u -m scripts.lsst_dp2.review_dataset export \
+  --run-root "$LSST_DP2_ROOT" --output-dir "$LSST_DP2_ROOT/review24" \
+  --count 24 --stretch linear
+```
+
+An existing output directory is refused to avoid mixing reviews. Use another
+name, for example `review24_asinh`, for `--stretch asinh`. The export includes:
+
+- `review.json`: counts, validation scope, seed, object metadata, band/PSF
+  availability, original pipeline report, and rendering parameters;
+- one PNG per object: six columns `ugrizy`, three rows **flux / ivar / bad
+  pixels**, always the full `160x160` stamp, no crop or smoothing;
+- one NPZ per object: unchanged arrays, units, mask bits, PSF kernels, and
+  provenance, readable with `np.load(path, allow_pickle=False)`;
+- `index.html`: a local gallery with links to the raw NPZs.
+
+Only the display is scaled: flux uses the 0.5th/99.5th percentiles across valid
+pixels in all bands of one object; ivar uses zero to the 99.5th percentile.
+Both ranges are shared across that object's bands, **not across objects**.
+White mask pixels are bad (`image.mask=False`); a black mask panel means valid
+pixels, not missing mask information. An unavailable band has a white bad-pixel
+panel and zero flux/ivar. Display percentiles can hide faint structures or clip
+bright cores; the NPZ values are unaffected.
+
+From your **local machine**, retrieve only the small review, not the full HATS:
+
+```bash
+export REVIEW_LOCAL=/home/maxime/src/LSST_cutouts/reviews/dense_i21_mmu
+mkdir -p "$REVIEW_LOCAL"
+rsync -avh --progress -e "ssh -J mr287471@hubble.extra.cea.fr" \
+  urx63nr@jean-zay.idris.fr:/lustre/fsn1/projects/rech/jrx/urx63nr/mmu_lsst_dp2/runs/dense_i21_reff0p6_mmu_v1/review24/ \
+  "$REVIEW_LOCAL/"
+xdg-open "$REVIEW_LOCAL/index.html"
+```
+
+Optional W&B publication uses an isolated `uv run` environment, **not** an
+installation into the frozen MMU environment. Run locally after updating the
+local checkout too. Authenticate through `wandb login` if needed; do not put
+API keys in shell history. Use a private project restricted to collaborators
+authorized to access DP2 pixel data; the PNGs are still pixel-level products.
+Nothing is uploaded by the export command. The explicit publisher uploads only
+PNGs and summary metadata, not the raw NPZ files.
+
+```bash
+cd /home/maxime/src/MMU/MultimodalUniverse
+git pull --ff-only https://github.com/MaxRonce/MultimodalUniverse.git feat/lsst-dp2
+uv run --no-project --with wandb --with pillow --with numpy \
+  python scripts/lsst_dp2/publish_review.py \
+  --review-dir "$REVIEW_LOCAL" \
+  --entity maxronce-universit-de-tours --project lsst-dp2-mmu
+```
+
+The command prints the run URL. Open the `cutouts` Table and its `panels`
+column to inspect each object. `--mode offline` writes a local W&B run without
+uploading. See the [W&B Tables documentation](https://docs.wandb.ai/guides/track/log/log-tables).
 
 ## Scientific release gate
 
