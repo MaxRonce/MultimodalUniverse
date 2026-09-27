@@ -15,6 +15,7 @@ from astropy.table import Table
 
 from scripts.lsst_dp2 import build_parent_sample_hats as build
 from scripts.lsst_dp2 import download_coadds as download
+from scripts.lsst_dp2 import offline_cutouts as offline
 from scripts.lsst_dp2 import query_catalog as query
 from scripts.lsst_dp2 import query_dense_patch_catalog as dense_query
 from scripts.lsst_dp2 import query_multiregion_catalog as multiregion
@@ -203,8 +204,7 @@ def test_dense_patch_query_ranks_by_population_and_builds_predicate():
     assert selected["patch"].tolist() == [3, 4, 8]
     assert selected["density_rank"].tolist() == [1, 2, 3]
     assert dense_query.patch_predicate([(2, 8), (1, 4), (1, 3)]) == (
-        "((tract = 1 AND patch IN (3, 4)) OR "
-        "(tract = 2 AND patch IN (8)))"
+        "((tract = 1 AND patch IN (3, 4)) OR (tract = 2 AND patch IN (8)))"
     )
 
 
@@ -378,17 +378,20 @@ def test_manifest_status_does_not_mutate_running_tasks(tmp_path, monkeypatch):
     con.close()
     monkeypatch.delenv("RSP_TOKEN", raising=False)
 
-    assert download.main(
-        [
-            "--catalog",
-            str(catalog_path),
-            "--mirror-root",
-            str(tmp_path / "mirror"),
-            "--manifest",
-            str(manifest_path),
-            "--status-only",
-        ]
-    ) == 0
+    assert (
+        download.main(
+            [
+                "--catalog",
+                str(catalog_path),
+                "--mirror-root",
+                str(tmp_path / "mirror"),
+                "--manifest",
+                str(manifest_path),
+                "--status-only",
+            ]
+        )
+        == 0
+    )
     con = sqlite3.connect(manifest_path)
     assert con.execute(
         "SELECT status, attempts FROM coadds WHERE band='u'"
@@ -436,9 +439,10 @@ def test_manifest_recovers_interrupted_and_preserves_unavailable(tmp_path):
     assert con.execute(
         "SELECT status, attempts FROM coadds WHERE band='g'"
     ).fetchone() == ("pending", 0)
-    assert con.execute(
-        "SELECT status FROM coadds WHERE band='u'"
-    ).fetchone()[0] == "unavailable"
+    assert (
+        con.execute("SELECT status FROM coadds WHERE band='u'").fetchone()[0]
+        == "unavailable"
+    )
     assert {task.band for task in download.pending_tasks(con, 5)} == set("grizy")
     con.close()
 
@@ -607,8 +611,8 @@ def test_missing_band_is_explicitly_padded(tmp_path):
     assert image["sha256"][0] == ""
     image["psf_fwhm"][1] = 0.0
     image["psf_source"][1] = "missing"
-    clean_fraction, psf_valid, psf_fwhm_valid, band_present = (
-        validate._validate_image("101", image)
+    clean_fraction, psf_valid, psf_fwhm_valid, band_present = validate._validate_image(
+        "101", image
     )
     assert 0 < clean_fraction <= 1
     assert psf_valid.tolist() == [False, True, True, True, True, True]
@@ -642,3 +646,144 @@ def test_build_contract_rejects_changed_manifest(tmp_path):
             64,
             build.DEFAULT_REJECT_MASK_PLANES,
         )
+
+
+@pytest.mark.parametrize("xy", [(128, 128), (2.3, 100.8), (250.1, 252.8)])
+def test_stamp_optimized_slices_match_astropy_reference(tmp_path, xy):
+    from astropy.coordinates import SkyCoord
+    from astropy.nddata import Cutout2D
+
+    path = tmp_path / "masked.fits"
+    _write_maskedimage(path, 2.0)
+    with build.open_maskedimage(path) as coadd:
+        coadd["image"] = np.arange(256 * 256, dtype=">f4").reshape(256, 256)
+        coadd["image"][125, 125] = np.nan
+        coadd["variance"][126, 126] = 0
+        ra, dec = coadd["wcs"].pixel_to_world_values(*xy)
+        args = {
+            "position": SkyCoord(ra=ra, dec=dec, unit="deg"),
+            "size": (160, 160),
+            "wcs": coadd["wcs"],
+            "mode": "partial",
+        }
+        image = Cutout2D(coadd["image"], fill_value=np.nan, **args).data
+        variance = Cutout2D(coadd["variance"], fill_value=np.nan, **args).data
+        bits = Cutout2D(coadd["mask_bits"], fill_value=0, **args).data
+        coverage = Cutout2D(
+            np.ones(coadd["image"].shape), fill_value=0, **args
+        ).data.astype(bool)
+        mask = coverage & build.clean_mask_from_bits(bits, coadd["mask_mapping"])
+        mask &= np.isfinite(image) & np.isfinite(variance) & (variance > 0)
+        expected_ivar = np.zeros((160, 160), np.float32)
+        np.divide(1, variance, out=expected_ivar, where=mask)
+        actual = build.make_stamp(coadd, ra, dec)
+        for got, expected in zip(
+            actual, (np.nan_to_num(image), expected_ivar, mask, bits)
+        ):
+            np.testing.assert_array_equal(got, expected)
+
+
+def test_offline_ready_patches_and_balancing():
+    rows = []
+    for patch in range(5):
+        for band in BANDS:
+            status = "complete"
+            if patch == 1 and band == "u":
+                status = "unavailable"
+            if patch == 2 and band == "u":
+                status = "failed"
+            if patch == 3:
+                status = "unavailable"
+            if patch == 4 and band == "u":
+                continue
+            rows.append({"tract": 1, "patch": patch, "band": band, "status": status})
+    assert offline.ready_patches(rows) == {(1, 0), (1, 1)}
+    counts = {(1, 0): 100, (1, 1): 60, (2, 0): 40, (2, 1): 10}
+    groups = offline.balance_patches(counts, 2)
+    assert groups == offline.balance_patches(dict(reversed(list(counts.items()))), 2)
+    assert sorted(sum(counts[key] for key in group) for group in groups) == [100, 110]
+    assert {key for group in groups for key in group} == set(counts)
+    with pytest.raises(ValueError, match="duplicate"):
+        offline.ready_patches(rows + [rows[0]])
+
+
+def test_offline_snapshot_extract_gather_restart_and_arrow_parity(tmp_path):
+    from astropy.table import vstack
+
+    source, root = tmp_path / "source", tmp_path / "offline"
+    (source / "catalog").mkdir(parents=True)
+    path = source / "catalog/objects.parquet"
+    catalog = Table(_catalog(path), masked=True)
+    extra = catalog.copy()
+    extra["objectId"] += 10
+    extra["patch"] = 57
+    vstack([catalog, extra]).write(path, format="parquet", overwrite=True)
+    manifest = source / "download_manifest.sqlite"
+    _manifest(manifest, source / "coadds")
+    with sqlite3.connect(manifest) as con:
+        con.row_factory = sqlite3.Row
+        for row in con.execute("SELECT * FROM coadds").fetchall():
+            values = dict(row)
+            values["patch"] = 57
+            values["status"] = "failed" if values["band"] == "u" else "complete"
+            con.execute(
+                f"INSERT INTO coadds ({','.join(values)}) VALUES ({','.join('?' for _ in values)})",
+                list(values.values()),
+            )
+        con.execute(
+            "UPDATE coadds SET status='unavailable' WHERE patch=56 AND band='u'"
+        )
+    original_sha = build.sha256_file(manifest)
+    plan = offline.prepare(source, root, 2)
+    assert (plan["objects"], plan["patches"], plan["excluded_objects"]) == (2, 1, 2)
+    assert build.sha256_file(manifest) == original_sha
+    # A subsequent completed download must not mutate an existing dataset snapshot.
+    with sqlite3.connect(manifest) as con:
+        con.execute("UPDATE coadds SET status='complete' WHERE status='failed'")
+    assert offline.prepare(source, root, 2) == plan
+    with pytest.raises(ValueError, match="different source or shard"):
+        offline.prepare(source, root, 3)
+    assert offline.extract(root, 1, 1) is None
+    report = offline.extract(root, 0, 2)
+    assert report["parquet_rows"] == 2
+    assert report["band_present_counts"]["u"] == 0
+    assert report["center_checks"] == 10
+    assert report["full_band_rows"] == 0
+    assert offline.extract(root, 0, 1) == report
+    table = pq.read_table(next((root / "shards/00000/parquet").glob("part-*.parquet")))
+    for scalar in table["image"]:
+        old, fast = scalar.as_py(), validate.image_from_arrow(scalar)
+        for name in old:
+            np.testing.assert_array_equal(fast[name], old[name])
+        old_stats, fast_stats = (
+            validate._validate_image("test", old),
+            validate._validate_image("test", fast),
+        )
+        for left, right in zip(old_stats, fast_stats):
+            np.testing.assert_array_equal(left, right)
+    # Offsets from slicing must be honored; null and ragged pixels must fail.
+    scalar = table["image"].slice(1, 1)[0]
+    np.testing.assert_array_equal(
+        validate.image_from_arrow(scalar)["flux"], scalar.as_py()["flux"]
+    )
+    bad = scalar.as_py()
+    bad["flux"][0][0][0] = None
+    with pytest.raises(ValueError, match="null pixels"):
+        validate.image_from_arrow(pa.array([bad], type=scalar.type)[0])
+    bad = scalar.as_py()
+    bad["flux"][0][0].pop()
+    with pytest.raises(ValueError, match="ragged"):
+        validate.image_from_arrow(pa.array([bad], type=scalar.type)[0])
+    final = offline.gather(root, workers=1, pixel_threshold=32)
+    assert final["status"] == "PASS"
+    assert final["hats_rows"] == final["unique_object_ids"] == 2
+    assert final["hats_image_records_checked"] > 0
+    assert final["band_present_fractions"]["u"] == 0
+    assert offline.gather(root, workers=1, pixel_threshold=32) == final
+    # A completed shard's input contract and data are immutable on restart.
+    parquet_path = next((root / "shards/00000/parquet").glob("part-*.parquet"))
+    contents = bytearray(parquet_path.read_bytes())
+    contents[10] ^= 1
+    parquet_path.write_bytes(contents)
+    with pytest.raises(ValueError, match="modified"):
+        offline.extract(root, 0, 1)

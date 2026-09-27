@@ -874,6 +874,129 @@ If the catalog, mask policy, schema, or processing code changes, start a new
 `LSST_DP2_RUN_NAME`. The build contract intentionally refuses to mix products
 from different inputs or code versions.
 
+## Offline distributed cutouts from the existing mirror
+
+The download-only campaign and this CPU workflow are independent. An extension
+download can keep running while the first campaign is processed. No RSP token,
+new network query, GPU, or copy of the FITS mirror is needed.
+
+`submit_offline_cutouts.sh` submits three stages with `afterok` dependencies:
+
+1. **Prepare:** read a consistent SQLite snapshot, retain patches with exactly
+   six terminal statuses (`complete` or `unavailable`) and at least one image,
+   freeze per-shard catalogs/manifests in a NEW output run. Failed/pending or
+   entirely unavailable patches are excluded and counted, not relabeled.
+2. **Extract + validate:** a CPU job array balanced by object counts, keeping
+   each patch in exactly one shard. Each task verifies its FITS checksums,
+   opens each patch once per band, writes MMU Parquet, validates every record,
+   and writes a checksummed completion receipt. Ready shards are independently
+   restartable. No worker loads or hashes all other workers' FITS files.
+3. **Gather:** check all receipts and Parquet checksums, ingest with the shared
+   MMU HATS writer and 16 local Dask workers, create the standard 10 arcsec
+   margin, then check ALL final object IDs and an image record from EACH final
+   partition. This stage uses one 40-core CPU allocation for memory; it is not
+   a multi-node HATS import. A technical `PASS` does not certify morphology or
+   photometric calibration against an independent reference.
+
+The image contract remains `flux`, `ivar`, `mask`, `mask_bits` with shape
+`(6, 160, 160)`, band order `ugrizy`, and pixel scale 0.2 arcsec (32 arcsec field).
+`mask=True` means a valid pixel; rejected/non-finite/uncovered pixels have zero
+inverse variance. Missing bands have `band_present=False` and zero-filled
+arrays, not synthetic observations. Local PSF images remain `(6, 35, 35)` with
+their validity flags. No display stretch, smoothing, resizing, or background
+manipulation is applied. The source galaxy selection is preserved unchanged.
+
+The new extractor reuses Astropy cutout slices across the image/variance/mask
+planes instead of allocating a full-patch coverage map per source. Validation
+decodes dense arrays directly from Arrow buffers, avoiding the former conversion
+of every pixel into a Python object. Both paths have numerical parity tests.
+
+### Submit from the Jean-Zay frontend
+
+Use the environment already installed for downloads. Do not run `uv sync`
+concurrently against that environment. All run products, caches, and job-local
+temporary directories remain under `$SCRATCH`. Update the checkout before
+starting this campaign; do not change the processing code or installed packages
+while it is active. Code/package hashes are part of the frozen contract.
+
+```bash
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export MMU_REPO="$MMU_JZ_ROOT/MultimodalUniverse"
+cd "$MMU_REPO"
+git pull --ff-only https://github.com/MaxRonce/MultimodalUniverse.git feat/lsst-dp2
+
+export LSST_DP2_ACCOUNT=jrx@cpu
+export LSST_DP2_CPU_PARTITION=cpu_p1
+
+bash scripts/lsst_dp2/submit_offline_cutouts.sh \
+  --source-run "$MMU_JZ_ROOT/runs/dense_i21_reff0p6_weekend_v1" \
+  --run-name dense_i21_reff0p6_mmu_v1 \
+  --shards 128 \
+  --concurrent 16
+```
+
+128 is the number of work units, not the number of simultaneously allocated
+nodes. `--concurrent 16` caps the array at 16 jobs x 8 allocated CPU cores = 128
+cores; `--concurrent 32` requests a ceiling of 256 cores. Each job runs four
+patch-processing threads, then single-process vectorized validation. CPU
+allocation is not a measurement of utilization. Measure `TotalCPU`, `AllocCPUS`,
+`Elapsed`, and `MaxRSS` with `sacct` after completion. Availability and account
+quotas still control scheduling. Increase concurrency only after checking
+filesystem throughput; more readers do not guarantee a proportional speedup.
+
+The gather uses 16 processes on one CPU node, not all 40 cores for computation.
+It reserves the whole node to leave memory for decoded arrays and HATS shuffle.
+The default partition can be overridden with `LSST_DP2_CPU_PARTITION`; check that
+your account has CPU access before submission. Each array/gather job requests
+20 hours; prepare requests two hours.
+
+**Size planning:** the earlier 50k pilot occupied approximately 53 GiB of
+intermediate Parquet and 55 GiB of final HATS. Linear *storage-only* extrapolation
+to 1,484,453 sources is about 1.54 TiB + 1.59 TiB, besides the existing ~1 TiB
+FITS mirror. Allow several additional TiB for HATS shuffle and temporary data;
+check your project quota, not just `df`. Compression and missing-band fractions
+can change these estimates. Nothing is automatically deleted after success.
+There is no measured wall-time guarantee for the distributed million-row run.
+
+The snapshot count is computed when prepare runs. It will be 1,484,453 only if
+the input manifest still has the same 5,999 ready patches; if the last failed
+product was recovered, more rows can legitimately be included. These are
+selected candidates with available images, not an automatically pure or
+pixel-quality-filtered galaxy sample. The report includes band/PSF availability,
+valid central 5x5 pixel counts, and present bands with no valid pixels. No
+additional quality selection is silently applied.
+
+### Monitor, reconnect, and resume
+
+```bash
+export OUT="$SCRATCH/mmu_lsst_dp2/runs/dense_i21_reff0p6_mmu_v1"
+cat "$OUT"/logs/offline-jobs.*.txt
+squeue -u "$USER" -n dp2-dense_i21_reff0p6_mmu_v1 \
+  -o '%.22i %.2t %.12M %.40R'
+ls "$OUT"/inputs/plan.json
+# Substitute the array job ID from the receipt; there is one log per task.
+tail -F "$OUT/logs/extract-ARRAY_ID_0.out"
+find "$OUT/shards" -name validation.json | wc -l
+# After gather:
+cat "$OUT/validation_report.json"
+```
+
+The final catalog is
+`$OUT/hats/lsst_dp2/lsst_dp2/lsst_dp2`; validated intermediate files remain in
+`$OUT/shards/NNNNN/parquet`. `ingest_input/` contains only symlinks, not another
+data copy. The source selection report and snapshot exclusions live under
+`$OUT/inputs/`. The job receipt contains IDs, never tokens.
+
+If a stage fails, inspect its `.err` AND `.out` logs and `sacct`. Downstream
+`afterok` jobs will not run. Cancel only this campaign's pending dependent jobs
+using their IDs from the receipt, wait for any running array tasks to finish,
+then repeat the same submission command. Finished shards are checksummed and
+reused; unfinished shards reuse their existing valid-row-count Parquet files
+and undergo full record validation. A failed HATS gather is rebuilt from the
+validated intermediates. Do not delete or modify source coadds or successful
+receipts. A different snapshot, schema, code version, or package environment
+requires a new output run name.
+
 ## Scientific release gate
 
 A technical `PASS` proves internal consistency, not absence of scientific

@@ -146,12 +146,20 @@ def make_stamp(
         "wcs": coadd["wcs"],
         "mode": "partial",
     }
-    image = Cutout2D(coadd["image"], fill_value=np.nan, **cutout_args).data
-    variance = Cutout2D(coadd["variance"], fill_value=np.nan, **cutout_args).data
-    bits = Cutout2D(coadd["mask_bits"], fill_value=0, **cutout_args).data
-    coverage = Cutout2D(
-        np.ones(coadd["image"].shape, dtype=np.uint8), fill_value=0, **cutout_args
-    ).data.astype(bool)
+    cutout = Cutout2D(coadd["image"], fill_value=np.nan, **cutout_args)
+    image = cutout.data
+    # The planes share a pixel grid. Reuse Astropy's slices instead of repeating
+    # WCS transforms and allocating a full-patch coverage array for each source.
+    if any(
+        coadd[name].shape != coadd["image"].shape for name in ("variance", "mask_bits")
+    ):
+        raise ValueError("coadd image, variance, and mask grids have different shapes")
+    variance = np.full(shape, np.nan, dtype=coadd["variance"].dtype)
+    bits = np.zeros(shape, dtype=coadd["mask_bits"].dtype)
+    coverage = np.zeros(shape, dtype=bool)
+    variance[cutout.slices_cutout] = coadd["variance"][cutout.slices_original]
+    bits[cutout.slices_cutout] = coadd["mask_bits"][cutout.slices_original]
+    coverage[cutout.slices_cutout] = True
 
     bits = native_array(np.asarray(bits, dtype=np.int32))
     clean = coverage & clean_mask_from_bits(bits, coadd["mask_mapping"], reject_planes)

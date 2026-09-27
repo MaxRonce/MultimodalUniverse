@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 from astropy.io import fits
 from astropy.wcs import WCS
@@ -163,7 +164,10 @@ def _validate_image(
         raise ValueError(f"invalid pixel scale for {object_id}: {scale}")
     dataset_ids = image["dataset_id"]
     checksums = image["sha256"]
-    if any(not dataset_ids[index] or not checksums[index] for index in np.flatnonzero(band_present)):
+    if any(
+        not dataset_ids[index] or not checksums[index]
+        for index in np.flatnonzero(band_present)
+    ):
         raise ValueError(f"missing provenance for {object_id}")
     absent = np.flatnonzero(~band_present)
     for band_index in absent:
@@ -211,6 +215,10 @@ def _validate_parquet(
     psf_valid_counts = np.zeros(len(BANDS), dtype=np.int64)
     psf_fwhm_valid_counts = np.zeros(len(BANDS), dtype=np.int64)
     band_present_counts = np.zeros(len(BANDS), dtype=np.int64)
+    no_clean_pixel_counts = np.zeros(len(BANDS), dtype=np.int64)
+    central_5x5_valid_counts = np.zeros(len(BANDS), dtype=np.int64)
+    full_band_rows = 0
+    no_clean_pixel_rows = 0
     for path in paths:
         parquet = pq.ParquetFile(path)
         for batch in parquet.iter_batches(
@@ -221,21 +229,28 @@ def _validate_parquet(
                 if object_id in found_ids:
                     raise ValueError(f"duplicate object_id in shards: {object_id}")
                 found_ids.add(object_id)
+                image = image_from_arrow(image_scalar)
                 (
                     clean_fraction,
                     psf_valid,
                     psf_fwhm_valid,
                     band_present,
-                ) = _validate_image(object_id, image_scalar.as_py())
-                if not np.array_equal(
-                    band_present, expected_band_presence[object_id]
-                ):
+                ) = _validate_image(object_id, image)
+                if not np.array_equal(band_present, expected_band_presence[object_id]):
                     raise ValueError(
                         f"band availability differs from manifest for {object_id}"
                     )
                 psf_valid_counts += psf_valid
                 psf_fwhm_valid_counts += psf_fwhm_valid
                 band_present_counts += band_present
+                mask = image["mask"]
+                no_clean_pixel_counts += band_present & ~mask.any(axis=(1, 2))
+                center = IMAGE_SIZE // 2
+                central_5x5_valid_counts += mask[
+                    :, center - 2 : center + 3, center - 2 : center + 3
+                ].all(axis=(1, 2))
+                full_band_rows += int(band_present.all())
+                no_clean_pixel_rows += int(not mask.any())
                 min_clean_fraction = min(min_clean_fraction, clean_fraction)
                 max_clean_fraction = max(max_clean_fraction, clean_fraction)
                 checked_rows += 1
@@ -259,13 +274,17 @@ def _validate_parquet(
         "unique_object_ids": len(found_ids),
         "min_clean_fraction": min_clean_fraction,
         "max_clean_fraction": max_clean_fraction,
+        "full_band_rows": full_band_rows,
+        "no_clean_pixel_rows": no_clean_pixel_rows,
+        "present_band_no_clean_pixel_counts": dict(
+            zip(BANDS, no_clean_pixel_counts.tolist())
+        ),
+        "central_5x5_valid_counts": dict(zip(BANDS, central_5x5_valid_counts.tolist())),
         "psf_valid_counts": dict(zip(BANDS, psf_valid_counts.tolist())),
         "psf_valid_fractions": dict(
             zip(BANDS, (psf_valid_counts / checked_rows).tolist())
         ),
-        "psf_fwhm_valid_counts": dict(
-            zip(BANDS, psf_fwhm_valid_counts.tolist())
-        ),
+        "psf_fwhm_valid_counts": dict(zip(BANDS, psf_fwhm_valid_counts.tolist())),
         "psf_fwhm_valid_fractions": dict(
             zip(BANDS, (psf_fwhm_valid_counts / checked_rows).tolist())
         ),
@@ -274,6 +293,51 @@ def _validate_parquet(
             zip(BANDS, (band_present_counts / checked_rows).tolist())
         ),
     }
+
+
+def image_from_arrow(image: pa.StructScalar) -> dict:
+    """Decode dense pixels via Arrow buffers, retaining all shape/null checks.
+
+    Converting the whole struct with ``as_py`` creates hundreds of thousands
+    of Python objects per source. Only the small string metadata needs that.
+    """
+    shapes = {
+        **{
+            name: (len(BANDS), IMAGE_SIZE, IMAGE_SIZE)
+            for name in ("flux", "ivar", "mask", "mask_bits")
+        },
+        "psf_image": (len(BANDS), PSF_SIZE, PSF_SIZE),
+        **{
+            name: (len(BANDS),)
+            for name in ("psf_image_valid", "psf_fwhm", "scale", "band_present")
+        },
+    }
+    if not image.is_valid:
+        raise ValueError("null image struct")
+    result = {}
+    for field in image.type:
+        scalar = image[field.name]
+        if field.name not in shapes:
+            result[field.name] = scalar.as_py()
+            continue
+        shape = shapes[field.name]
+        if not scalar.is_valid:
+            raise ValueError(f"null image field: {field.name}")
+        values = scalar.values
+        if len(values) != shape[0]:
+            raise ValueError(f"invalid image shape: {field.name}")
+        for size in shape[1:]:
+            if values.null_count or not (
+                pa.types.is_list(values.type) or pa.types.is_large_list(values.type)
+            ):
+                raise ValueError(f"null or non-list image field: {field.name}")
+            if not np.all(np.diff(values.offsets.to_numpy()) == size):
+                raise ValueError(f"ragged image field: {field.name}")
+            values = values.flatten()
+        if values.null_count:
+            raise ValueError(f"null pixels: {field.name}")
+        result[field.name] = values.to_numpy(zero_copy_only=False).reshape(shape)
+    return result
 
 
 def _manifest_status_counts(path: str) -> dict[str, int]:
