@@ -26,6 +26,7 @@ import pyvo
 import requests
 from astropy.table import Column, Table
 
+from scripts.lsst_dp2.common import sha256_file
 from scripts.lsst_dp2.query_catalog import (
     DEFAULT_TAP_URL,
     _authenticated_tap,
@@ -70,10 +71,64 @@ def rank_inventory(table: Table, patch_limit: int) -> Table:
     patches = np.asarray(table[names["patch"]], dtype=np.int64)
     if len(table) == 0 or np.any(counts <= 0):
         raise ValueError("inventory must contain positive object counts")
+    if len(set(zip(tracts, patches, strict=True))) != len(table):
+        raise ValueError("inventory contains duplicate tract/patch pairs")
     order = np.lexsort((patches, tracts, -counts))
     selected = table[order[: min(patch_limit, len(order))]]
     selected.add_column(Column(np.arange(1, len(selected) + 1)), name="density_rank")
     return selected
+
+
+def load_extension_source(
+    run: Path, where: str, tap_url: str
+) -> tuple[Table, int, dict]:
+    """Reuse an immutable inventory and continue after an earlier rank interval.
+
+    Only the source run's catalog selection is needed. Its coadds and manifest
+    stay in place; pending products in that run remain its responsibility.
+    """
+    run = run.resolve()
+    work = run / "catalog/.objects.dense_query"
+    report_path = run / "catalog/objects.parquet.selection.json"
+    plan = json.loads((work / "plan.json").read_text())
+    report = json.loads(report_path.read_text())
+    for document in (plan, report):
+        if document["where"] != where or document["tap_url"] != tap_url:
+            raise ValueError("extension must use the source selection and TAP endpoint")
+    if report["status"] != "PASS":
+        raise ValueError("source catalog selection has not completed")
+    start = int(report.get("rank_start", 1))
+    stop = int(report.get("rank_stop", report["patches"]))
+    if start < 1 or stop < start or stop - start + 1 != report["patches"]:
+        raise ValueError("invalid source rank interval")
+
+    inventory_path = work / "patch_inventory.parquet"
+    inventory = Table.read(inventory_path, format="parquet")
+    expected = rank_inventory(inventory, stop)[start - 1 : stop]
+    selected = Table.read(work / "selected_patches.parquet", format="parquet")
+
+    def signatures(table):
+        names = {name.lower(): name for name in table.colnames}
+        return [
+            tuple(int(row[names[name]]) for name in ("tract", "patch", "n_objects"))
+            for row in table
+        ]
+
+    if len(expected) != report["patches"] or signatures(selected) != signatures(
+        expected
+    ):
+        raise ValueError("source selected patches do not match its ranked inventory")
+    if sum(row[2] for row in signatures(expected)) != report["objects"]:
+        raise ValueError("source object count does not match its ranked inventory")
+    return (
+        inventory,
+        stop,
+        {
+            "extends_run": str(run),
+            "source_inventory_sha256": sha256_file(inventory_path),
+            "patch_offset": stop,
+        },
+    )
 
 
 def retry_dal_call(operation, label: str, attempts: int, base_seconds: float):
@@ -140,13 +195,25 @@ def _write_plan(path: Path, plan: dict) -> None:
                 "use a new output path"
             )
         return
-    path.write_text(json.dumps(plan, indent=2) + "\n", encoding="ascii")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(plan, indent=2) + "\n", encoding="ascii")
+    os.replace(temporary, path)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--patch-limit", type=int, default=6000)
+    parser.add_argument(
+        "--patch-limit",
+        type=int,
+        default=6000,
+        help="last global density rank to include (not additional patch count)",
+    )
+    parser.add_argument(
+        "--extend-from",
+        type=Path,
+        help="source run root; continue after its last selected rank in a NEW run",
+    )
     parser.add_argument("--batch-patches", type=int, default=200)
     parser.add_argument("--where", default=DEFAULT_WHERE)
     parser.add_argument("--tap-url", default=DEFAULT_TAP_URL)
@@ -176,6 +243,25 @@ def main(argv: list[str] | None = None) -> int:
         "batch_patches": args.batch_patches,
         "tap_url": args.tap_url,
     }
+    source_inventory = None
+    offset = 0
+    if args.extend_from:
+        if (
+            args.output.resolve()
+            == args.extend_from.resolve() / "catalog/objects.parquet"
+        ):
+            parser.error("--extend-from requires a new output run")
+        try:
+            source_inventory, offset, source_plan = load_extension_source(
+                args.extend_from, args.where, args.tap_url
+            )
+        except (KeyError, OSError, ValueError) as exc:
+            parser.error(str(exc))
+        if min(args.patch_limit, len(source_inventory)) <= offset:
+            parser.error(
+                "no additional patches: increase --patch-limit within the inventory"
+            )
+        plan.update(source_plan)
     _write_plan(work / "plan.json", plan)
 
     service = _authenticated_tap(args.tap_url, token)
@@ -191,6 +277,13 @@ def main(argv: list[str] | None = None) -> int:
         if inventory_path.exists():
             inventory = Table.read(inventory_path, format="parquet")
             print(f"Reusing patch inventory: {inventory_path}", flush=True)
+        elif source_inventory is not None:
+            inventory = source_inventory
+            write_catalog(inventory, str(inventory_path))
+            print(
+                f"Reused source global inventory; skipping first {offset} patches",
+                flush=True,
+            )
         else:
             query = (
                 "SELECT tract, patch, COUNT(*) AS n_objects\n"
@@ -209,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
             write_catalog(inventory, str(inventory_path))
             print(f"Wrote {len(inventory)} patch inventory rows", flush=True)
 
-        selected = rank_inventory(inventory, args.patch_limit)
+        selected = rank_inventory(inventory, args.patch_limit)[offset:]
         write_catalog(selected, str(work / "selected_patches.parquet"))
         names = {name.lower(): name for name in selected.colnames}
         patch_pairs = list(
@@ -222,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
         expected_rows = int(
             np.asarray(selected[names["n_objects"]], dtype=np.int64).sum()
         )
-        rank = {pair: index + 1 for index, pair in enumerate(patch_pairs)}
+        rank = {pair: offset + index + 1 for index, pair in enumerate(patch_pairs)}
         population = {
             pair: int(value)
             for pair, value in zip(
@@ -295,7 +388,8 @@ def main(argv: list[str] | None = None) -> int:
         if len(set(ids.to_pylist())) != catalog.num_rows:
             raise RuntimeError("combined catalog contains duplicate objectId values")
         sort_indices = pc.sort_indices(
-            catalog, sort_keys=[("dense_patch_rank", "ascending"), ("objectId", "ascending")]
+            catalog,
+            sort_keys=[("dense_patch_rank", "ascending"), ("objectId", "ascending")],
         )
         catalog = pc.take(catalog, sort_indices)
         temporary = args.output.with_suffix(args.output.suffix + ".tmp")
@@ -308,6 +402,8 @@ def main(argv: list[str] | None = None) -> int:
             "status": "PASS",
             "objects": expected_rows,
             "patches": len(patch_pairs),
+            "rank_start": offset + 1,
+            "rank_stop": offset + len(patch_pairs),
             "objects_per_patch_mean": float(counts.mean()),
             "objects_per_patch_min": int(counts.min()),
             "objects_per_patch_max": int(counts.max()),
@@ -315,9 +411,7 @@ def main(argv: list[str] | None = None) -> int:
             "request_budget_hours_three_requests_at_59_per_minute": (
                 6 * len(patch_pairs) * 3 / 59 / 60
             ),
-            "estimated_coadds_gib_at_31_mib_each": (
-                6 * len(patch_pairs) * 31 / 1024
-            ),
+            "estimated_coadds_gib_at_31_mib_each": (6 * len(patch_pairs) * 31 / 1024),
         }
         report_path = Path(str(args.output) + ".selection.json")
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="ascii")

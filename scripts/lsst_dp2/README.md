@@ -8,6 +8,8 @@ The implementation is split by responsibility:
 
 - `query_catalog.py`: authenticated DP2 Object TAP query;
 - `query_multiregion_catalog.py`: balanced deterministic multi-region query;
+- `query_dense_patch_catalog.py`: ranked patch selection and disjoint extensions;
+- `submit_dense_extension.sh`: sequential download allocations for an extension;
 - `stratify_catalog.py`: deterministic magnitude-size sampling;
 - `download_coadds.py`: resumable SIA/DataLink mirror with a SQLite manifest;
 - `coadd.py`: calibrated FITS, mask, WCS, and local cell-PSF extraction;
@@ -763,6 +765,87 @@ Patch density is a prioritization strategy for this time-bounded cache, not a
 scientifically representative sampling scheme. Preserve the inventory and
 selection report. A downstream training sample should explicitly assess sky,
 magnitude, size, color, seeing, depth, and missing-band coverage before use.
+
+### Extend an existing dense campaign
+
+Increasing the number of jobs does not extend the selected footprint: jobs
+reuse the existing catalog and finish once its products are resolved. To
+acquire more objects, create a new run using `--extend-from`. The new run reuses
+the previous global patch inventory and selects only ranks after the previous
+run's last rank. `--patch-limit` is the final global rank, including previous
+runs, not the number of additional patches.
+
+For a source run covering ranks 1--6,000, a limit of 30,000 selects up to
+24,000 NEW patches (ranks 6,001--30,000). The existing 6,000 patches and their
+FITS stay in their original run. The extension neither redownloads them nor
+retries their failures. Query parameters, inventory fingerprint, and rank
+interval are recorded; incompatible selections and overlapping source output
+paths are rejected. A later extension can use this new run as its source.
+
+The following submits **10 sequential prepost jobs, each with a 20-hour
+wall-time limit, one node and 8 CPUs**. Peak allocation is one node / 8 CPUs /
+0 GPUs, not 80 CPUs concurrently. The allocation ceiling is 200 hours of
+wall time and 1,600 CPU-hours; jobs can exit sooner. Each job attempts at most
+18,000 patch-band tasks, and remaining jobs are for continuation or retries.
+The new 24,000 patches require up to 144,000 products. Allow roughly 4--4.5 TiB
+of additional FITS, with the actual sizes and band availability determining
+the result. No extraction, HATS import or pixel validation is submitted.
+
+On the Jean-Zay login node:
+
+```bash
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export MMU_REPO="$MMU_JZ_ROOT/MultimodalUniverse"
+cd "$MMU_REPO"
+git pull --ff-only https://github.com/MaxRonce/MultimodalUniverse.git feat/lsst-dp2
+
+export LSST_DP2_RUN_NAME="dense_i21_reff0p6_30k_v1"
+read -rsp "RSP token: " RSP_TOKEN
+echo
+export RSP_TOKEN
+
+bash scripts/lsst_dp2/submit_dense_extension.sh \
+  --source-run "$MMU_JZ_ROOT/runs/dense_i21_reff0p6_weekend_v1" \
+  --patch-limit 30000 \
+  --jobs 10
+
+unset RSP_TOKEN
+```
+
+The submitter sets a fresh output root, 8 download workers, and a limit of
+59 request starts/minute. It uses `singleton` with the existing `mmu-lsst-net`
+job name: previously submitted jobs of this user with that name must finish
+before the new passes start. Jobs proceed after failures/timeouts as well as
+success; a run-level file lock also rejects accidental simultaneous wrapper
+launches. All related download jobs must keep this job name, and independent
+manual downloaders must not run alongside them. Authentication failures cannot
+be resolved by retries; use a fresh token for new submissions when needed.
+
+A receipt with successfully submitted job IDs (no credentials) is saved to
+`$MMU_JZ_ROOT/runs/dense_i21_reff0p6_30k_v1/logs/submitted-jobs.*.txt`.
+If Slurm rejects a submission, the script stops and preserves earlier IDs.
+If repeating the submit command, it APPENDS jobs; it does not replace or cancel
+previous submissions. The on-disk inventory identifies a fixed catalogue
+snapshot. If Rubin's current catalog no longer matches its counts, the query
+fails rather than silently changing membership.
+
+After submission or reconnection:
+
+```bash
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export MMU_REPO="$MMU_JZ_ROOT/MultimodalUniverse"
+export LSST_DP2_RUN_NAME="dense_i21_reff0p6_30k_v1"
+unset LSST_DP2_ROOT LSST_DP2_HATS_OUTER MMU_PYTHON
+source "$MMU_REPO/scripts/lsst_dp2/jeanzay_env.sh"
+squeue -u "$USER" -n mmu-lsst-net -o "%.18i %.2t %.12M %.40R"
+ls -lt "$LSST_DP2_ROOT/logs"
+```
+
+`catalog/objects.parquet.selection.json` in the NEW run contains only the
+additional objects and patches. Combine totals from disjoint runs when
+reporting campaign coverage. Download completion remains distinct from pixel
+coverage and scientifically usable cutouts. Failed products in the original
+run must still be retried there; do not change its catalog or manifest.
 
 ## Recovery
 

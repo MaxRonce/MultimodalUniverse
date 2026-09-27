@@ -19,6 +19,14 @@ cd "$MMU_REPO"
 # shellcheck source=jeanzay_env.sh
 source scripts/lsst_dp2/jeanzay_env.sh
 
+# Singleton Slurm dependencies serialize campaigns; this also guards a run
+# against accidental direct launches of this wrapper.
+exec 9>"$LSST_DP2_ROOT/.dense_download.lock"
+if ! flock -n 9; then
+  echo "ERROR: another dense downloader holds this run's lock" >&2
+  exit 1
+fi
+
 if ! command -v uv >/dev/null 2>&1; then
   UV_BOOTSTRAP="$MMU_JZ_ROOT/venvs/uv"
   if [[ ! -x "$UV_BOOTSTRAP/bin/uv" ]]; then
@@ -35,11 +43,18 @@ CATALOG="$LSST_DP2_ROOT/catalog/objects.parquet"
 PATCH_LIMIT="${LSST_DP2_DENSE_PATCH_LIMIT:-6000}"
 TASK_LIMIT="${LSST_DP2_DOWNLOAD_TASK_LIMIT:-18000}"
 WHERE="${LSST_DP2_DENSE_WHERE:-i_cModelMag < 21 AND i_extendedness = 1 AND griz_model_extendedness >= 0.8 AND sersic_no_data_flag = 0 AND sersic_unknown_flag = 0 AND sersic_reff_major > 0.6}"
+export LSST_DP2_DENSE_PATCH_LIMIT="$PATCH_LIMIT"
+export LSST_DP2_DENSE_WHERE="$WHERE"
+QUERY_OPTIONS=()
+if [[ -n "${LSST_DP2_EXTEND_FROM:-}" ]]; then
+  QUERY_OPTIONS+=(--extend-from "$LSST_DP2_EXTEND_FROM")
+fi
 
 if [[ ! -f "$CATALOG" || ! -f "$CATALOG.selection.json" ]]; then
   "$MMU_PYTHON" -u -m scripts.lsst_dp2.query_dense_patch_catalog \
     --where "$WHERE" \
     --patch-limit "$PATCH_LIMIT" \
+    "${QUERY_OPTIONS[@]}" \
     --output "$CATALOG"
 else
   echo "Reusing existing dense catalog: $CATALOG"
@@ -53,6 +68,15 @@ from pathlib import Path
 
 root = Path(os.environ["LSST_DP2_ROOT"])
 report = json.loads(Path(str(root / "catalog/objects.parquet") + ".selection.json").read_text())
+if report["status"] != "PASS":
+    raise RuntimeError("catalog selection has not completed")
+if (report["patch_limit"] != int(os.environ["LSST_DP2_DENSE_PATCH_LIMIT"])
+        or report["where"] != os.environ["LSST_DP2_DENSE_WHERE"]):
+    raise RuntimeError("existing catalog uses different limits/selection; use a new run")
+source = os.environ.get("LSST_DP2_EXTEND_FROM")
+expected_source = str(Path(source).resolve()) if source else None
+if report.get("extends_run") != expected_source:
+    raise RuntimeError("existing catalog uses a different extension source; use a new run")
 print("Dense download plan:")
 print(json.dumps(report, indent=2))
 free_gib = shutil.disk_usage(root).free / 1024**3
