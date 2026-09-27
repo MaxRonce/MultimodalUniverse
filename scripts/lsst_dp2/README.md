@@ -894,7 +894,7 @@ new network query, GPU, or copy of the FITS mirror is needed.
    and writes a checksummed completion receipt. Ready shards are independently
    restartable. No worker loads or hashes all other workers' FITS files.
 3. **Gather:** check all receipts and Parquet checksums, ingest with the shared
-   MMU HATS writer and 16 local Dask workers, create the standard 10 arcsec
+   MMU HATS writer and 8 local Dask workers, create the standard 10 arcsec
    margin, then check ALL final object IDs and an image record from EACH final
    partition. This stage uses one 40-core CPU allocation for memory; it is not
    a multi-node HATS import. A technical `PASS` does not certify morphology or
@@ -946,8 +946,13 @@ allocation is not a measurement of utilization. Measure `TotalCPU`, `AllocCPUS`,
 quotas still control scheduling. Increase concurrency only after checking
 filesystem throughput; more readers do not guarantee a proportional speedup.
 
-The gather uses 16 processes on one CPU node, not all 40 cores for computation.
+The gather uses 8 processes on one CPU node, not all 40 cores for computation.
 It reserves the whole node to leave memory for decoded arrays and HATS shuffle.
+Its default HATS partition threshold is 512 rows. Override these settings with
+`LSST_DP2_GATHER_WORKERS` and `LSST_DP2_GATHER_PIXEL_THRESHOLD` before submission;
+they are independent of the generic pilot's `LSST_DP2_PIXEL_THRESHOLD` default.
+The worker logs the chosen settings. Fewer workers leave more memory per worker
+for larger decoded partitions; allocation is not measured CPU utilization.
 The default partition can be overridden with `LSST_DP2_CPU_PARTITION`; check that
 your account has CPU access before submission. Each array/gather job requests
 20 hours; prepare requests two hours.
@@ -998,6 +1003,58 @@ and undergo full record validation. A failed HATS gather is rebuilt from the
 validated intermediates. Do not delete or modify source coadds or successful
 receipts. A different snapshot, schema, code version, or package environment
 requires a new output run name.
+
+### Resume only a failed HATS gather
+
+`ValueError: single pixel row count 280 exceeds threshold 256` is a HATS
+partition-planning failure, not an invalid image pixel or a corrupt shard.
+Here "pixel" means a HEALPix sky cell. The maximum row count at the importer's
+finest configured order is 280, so it cannot meet a 256-row partition limit.
+A 512-row limit admits this cell without discarding objects or changing their
+`160x160` image, ivar, mask, or PSF arrays. Eight workers instead of sixteen
+leave more memory per worker for the larger partitions. This fixes the reported
+binning error; completing the remaining ingestion/readback still needs a run.
+
+After checking that all extraction tasks completed and the gather verified
+all 128 receipts, update the checkout and submit **gather only**. No token,
+package installation, new snapshot, or extraction array is needed. This fix
+changes only the Slurm wrapper, tests, and documentation, not the Python files
+or package versions covered by the frozen processing contract.
+
+```bash
+export MMU_JZ_ROOT="$SCRATCH/mmu_lsst_dp2"
+export MMU_REPO="$MMU_JZ_ROOT/MultimodalUniverse"
+cd "$MMU_REPO"
+git pull --ff-only https://github.com/MaxRonce/MultimodalUniverse.git feat/lsst-dp2
+
+export LSST_DP2_SOURCE_RUN="$MMU_JZ_ROOT/runs/dense_i21_reff0p6_weekend_v1"
+export LSST_DP2_OFFLINE_ROOT="$MMU_JZ_ROOT/runs/dense_i21_reff0p6_mmu_v1"
+export LSST_DP2_GATHER_WORKERS=8
+export LSST_DP2_GATHER_PIXEL_THRESHOLD=512
+export MMU_PYTHON="$MMU_REPO/.venv/bin/python"
+unset RSP_TOKEN
+mkdir -p "$LSST_DP2_OFFLINE_ROOT/logs"
+
+# Ensure no other gather for this run is running or queued before submitting.
+squeue -u "$USER" -n dp2-dense_i21_reff0p6_mmu_v1
+GATHER_JOB=$(sbatch --parsable \
+  --account=jrx@cpu --partition=cpu_p1 --nodes=1 --ntasks=1 \
+  --cpus-per-task=40 --hint=nomultithread --time=20:00:00 --export=ALL \
+  --job-name=dp2-dense_i21_reff0p6_mmu_v1 \
+  --output="$LSST_DP2_OFFLINE_ROOT/logs/gather-%j.out" \
+  --error="$LSST_DP2_OFFLINE_ROOT/logs/gather-%j.err" \
+  "$MMU_REPO/scripts/lsst_dp2/offline_cutouts.slurm" gather)
+echo "GATHER_JOB=$GATHER_JOB"
+tail -F "$LSST_DP2_OFFLINE_ROOT/logs/gather-$GATHER_JOB.out" \
+        "$LSST_DP2_OFFLINE_ROOT/logs/gather-$GATHER_JOB.err"
+```
+
+The gather rechecks checksums and restarts HATS import from the validated
+Parquet shards. It removes stale **inner HATS catalog output** automatically;
+do not manually delete the coadds, shards, or frozen plan. Mapping/binning will
+run again. Wait for `COMPLETED / 0:0` and `validation_report.json` with
+`status=PASS` before running the image-review export below. Merely finding 128
+shard receipts does not establish that the final HATS dataset is complete.
 
 ### Review the finished dataset locally or on W&B
 

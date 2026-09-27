@@ -26,7 +26,17 @@ case "${1:?expected prepare, extract, or gather}" in
       --output-run "$LSST_DP2_ROOT" --index "$SLURM_ARRAY_TASK_ID" \
       --workers 4 ;;
   gather)
+    GATHER_WORKERS="${LSST_DP2_GATHER_WORKERS:-8}"
+    GATHER_THRESHOLD="${LSST_DP2_GATHER_PIXEL_THRESHOLD:-512}"
+    if [[ ! "$GATHER_WORKERS" =~ ^[1-9][0-9]*$ || ! "$GATHER_THRESHOLD" =~ ^[1-9][0-9]*$ ]]; then
+      echo "ERROR: gather workers and pixel threshold must be positive integers" >&2
+      exit 2
+    fi
+    # HATS cannot split below its finest HEALPix cell. The dense run has 280
+    # rows in one such cell; 256 fails. Fewer workers leave RAM for larger bins.
+    printf 'Gather settings: workers=%s pixel_threshold=%s\n' "$GATHER_WORKERS" "$GATHER_THRESHOLD"
     exec "$MMU_PYTHON" -u -m scripts.lsst_dp2.offline_cutouts gather \
-      --output-run "$LSST_DP2_ROOT" --workers 16 --pixel-threshold 256 ;;
+      --output-run "$LSST_DP2_ROOT" --workers "$GATHER_WORKERS" \
+      --pixel-threshold "$GATHER_THRESHOLD" ;;
   *) echo "ERROR: unknown stage $1" >&2; exit 2 ;;
 esac
