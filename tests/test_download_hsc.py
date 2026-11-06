@@ -22,11 +22,14 @@ class DownloadTests(unittest.TestCase):
         self.api.whoami.return_value = {"name": "test-account"}
         self.api.dataset_info.return_value = SimpleNamespace(
             sha="a" * 40,
-            siblings=[
-                SimpleNamespace(rfilename="collection.properties", size=3),
-                SimpleNamespace(rfilename="catalog_10arcs/hats.properties", size=4),
-            ],
+            # Deliberately incomplete: the plan must use the paginated tree.
+            siblings=[],
         )
+        self.api.list_repo_tree.return_value = [
+            SimpleNamespace(path="catalog_10arcs"),  # Directory, not a file.
+            hsc.RepoFile(path="collection.properties", size=3, oid="f" * 40),
+            hsc.RepoFile(path="catalog_10arcs/hats.properties", size=4, oid="e" * 40),
+        ]
 
     def run_main(self, *options):
         with patch("sys.argv", ["download_hsc.py", "--root", str(self.root),
@@ -95,6 +98,49 @@ class DownloadTests(unittest.TestCase):
         with patch.object(hsc, "snapshot_download"):
             with self.assertRaisesRegex(RuntimeError, "fichiers absents"):
                 self.run_main()
+
+    def test_inventory_uses_complete_paginated_tree_at_pinned_revision(self):
+        self.api.list_repo_tree.return_value = iter(self.api.list_repo_tree.return_value)
+        plan = hsc.get_plan(self.api, "test/large", self.directory)
+        self.assertEqual(len(plan["files"]), 2)
+        self.assertEqual(sum(entry["size"] for entry in plan["files"]), 7)
+        self.api.list_repo_tree.assert_called_once_with(
+            "test/large", repo_type="dataset", revision="a" * 40, recursive=True
+        )
+
+    def test_inventory_keeps_files_beyond_the_repo_info_100k_limit(self):
+        self.api.list_repo_tree.return_value = (
+            hsc.RepoFile(path=f"part/{i}.parquet", size=1, oid="f" * 40)
+            for i in range(100001)
+        )
+        with redirect_stdout(io.StringIO()):
+            plan = hsc.get_plan(self.api, "test/large", self.directory)
+        self.assertEqual(len(plan["files"]), 100001)
+        self.assertEqual(plan["files"][-1]["path"], "part/100000.parquet")
+
+    def test_custom_repo_selects_only_legacy_and_uses_explicit_root(self):
+        with patch.object(hsc, "snapshot_download"):
+            self.run_main_custom("--repo-id", "hugging-science/mmu_legacysurvey_dr10_south_21",
+                                 "--root", str(self.root), "--dry-run")
+        self.api.dataset_info.assert_called_once_with(
+            "hugging-science/mmu_legacysurvey_dr10_south_21", expand=["sha"]
+        )
+
+    def run_main_custom(self, *options):
+        with patch("sys.argv", ["download_hsc.py", *options]), \
+                patch.object(hsc, "HfApi", return_value=self.api), \
+                redirect_stdout(io.StringIO()):
+            hsc.main()
+
+    def test_custom_repo_cannot_default_to_hsc_directory(self):
+        with patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as error:
+            self.run_main_custom("--repo-id", "test/large", "--dry-run")
+        self.assertEqual(error.exception.code, 2)
+        self.api.whoami.assert_not_called()
+
+    def test_custom_repo_rejects_path_traversal(self):
+        with self.assertRaises(hsc.argparse.ArgumentTypeError):
+            hsc.validated_repo_id("../outside")
 
 
 if __name__ == "__main__":

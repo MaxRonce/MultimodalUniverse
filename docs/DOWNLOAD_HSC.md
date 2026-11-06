@@ -82,7 +82,7 @@ export MMU_UV="$HOME/.local/share/mmu-uv/bin/uv"
 
 "$MMU_UV" venv --python "$MMU_PYTHON" "$HF_DOWNLOAD_ENV"
 "$MMU_UV" pip install --python "$HF_DOWNLOAD_PYTHON" \
-  'huggingface_hub>=1.0,<2' 'hf-xet>=1.2,<2'
+  'huggingface_hub>=1.33,<2' 'hf-xet>=1.8,<2'
 
 "$HF_DOWNLOAD_ENV/bin/hf" --version
 ```
@@ -245,8 +245,9 @@ détaille l'ouverture d'une collection locale.
 ## Validation des scripts
 
 Vérifiés avec Python 3.12, `huggingface_hub` 1.33.0 et `hf-xet` 1.8.0.
-Les cinq tests hors ligne couvrent le dry-run, la reprise sur le commit enregistré,
-les tentatives après erreur réseau, le contrôle local et les téléchargements incomplets :
+Les tests hors ligne couvrent le dry-run, la reprise sur le commit enregistré,
+les tentatives après erreur réseau, le contrôle local, les téléchargements incomplets,
+les dépôts personnalisés et l'inventaire au-delà de 100 000 fichiers :
 
 ```bash
 # Depuis la racine de ce projet, si le dossier tests/ a également été copié.

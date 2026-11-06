@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Download complete, authenticated HSC HATS repositories to Ceph.
+"""Download complete, authenticated HATS repositories to Ceph.
 
-Requires huggingface_hub>=1.0,<2 and hf-xet>=1.2,<2.
-See docs/DOWNLOAD_HSC.md for installation, login and background execution.
+Requires huggingface_hub>=1.33,<2 and hf-xet>=1.8,<2.
+See docs/DOWNLOAD_HSC.md and docs/DOWNLOAD_LEGACY.md for setup and usage.
 """
 
 import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
 import sys
 import time
 
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi, RepoFile, snapshot_download
 from huggingface_hub.errors import HfHubHTTPError
 
 
@@ -35,6 +37,14 @@ def volume(size):
     return f"{size / 1e9:,.2f} Go ({size / 2**30:,.2f} Gio)"
 
 
+def validated_repo_id(value):
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", value) or any(
+        part in (".", "..") for part in value.split("/")
+    ):
+        raise argparse.ArgumentTypeError("Utiliser un depot au format organisation/nom.")
+    return value
+
+
 def get_plan(api, repo_id, directory, verify_only=False):
     manifest = directory / MANIFEST
     if manifest.exists():
@@ -44,14 +54,25 @@ def get_plan(api, repo_id, directory, verify_only=False):
         return plan
     if verify_only:
         raise RuntimeError(f"Manifeste absent : {manifest}")
-    info = api.dataset_info(repo_id, files_metadata=True)
-    if not info.sha or not info.siblings:
-        raise RuntimeError(f"Inventaire vide pour {repo_id}")
+    # The siblings array in dataset_info is capped at 100,000 files on large repos.
+    # Resolve once, then page through the tree of this exact immutable revision.
+    info = api.dataset_info(repo_id, expand=["sha"])
+    if not info.sha:
+        raise RuntimeError(f"Commit inconnu pour {repo_id}")
+    print(f"Inventaire complet de {repo_id} (pagination)...", flush=True)
     files = []
-    for entry in info.siblings:
+    for entry in api.list_repo_tree(
+        repo_id, repo_type="dataset", revision=info.sha, recursive=True
+    ):
+        if not isinstance(entry, RepoFile):
+            continue
         if entry.size is None:
-            raise RuntimeError(f"Taille inconnue : {repo_id}/{entry.rfilename}")
-        files.append({"path": entry.rfilename, "size": entry.size})
+            raise RuntimeError(f"Taille inconnue : {repo_id}/{entry.path}")
+        files.append({"path": entry.path, "size": entry.size})
+        if len(files) % 20000 == 0:
+            print(f"  {len(files):,} fichiers inventories...", flush=True)
+    if not files:
+        raise RuntimeError(f"Inventaire vide pour {repo_id}")
     return {"repo_id": repo_id, "revision": info.sha, "files": files}
 
 
@@ -63,11 +84,18 @@ def save_plan(directory, plan):
 
 
 def incomplete_files(directory, plan):
-    return [
-        entry for entry in plan["files"]
-        if not (directory / entry["path"]).is_file()
-        or (directory / entry["path"]).stat().st_size != entry["size"]
-    ]
+    if not directory.exists():
+        return plan["files"]
+    missing = []
+    for entry in plan["files"]:
+        try:
+            local = (directory / entry["path"]).stat()
+        except (FileNotFoundError, NotADirectoryError):
+            missing.append(entry)
+            continue
+        if not stat.S_ISREG(local.st_mode) or local.st_size != entry["size"]:
+            missing.append(entry)
+    return missing
 
 
 def download(plan, directory, workers, attempts):
@@ -96,12 +124,13 @@ def download(plan, directory, workers, attempts):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", choices=["all", *DATASETS], default="all")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--dataset", choices=["all", *DATASETS], default="all")
+    selection.add_argument("--repo-id", type=validated_repo_id,
+                           help="Autre depot HATS ; necessite --root explicite.")
     parser.add_argument(
         "--root", type=Path,
-        default=Path(os.environ.get(
-            "HSC_DEST", "/mnt/ceph/users/polymathic/mronceray/hsc_pdr3"
-        )),
+        help="Dossier parent : organisation/nom sera ajoute automatiquement.",
     )
     parser.add_argument("--workers", type=positive_int, default=8)
     parser.add_argument("--attempts", type=positive_int, default=5)
@@ -111,15 +140,24 @@ def main():
     modes.add_argument("--verify-only", action="store_true",
                        help="Controle local des presences/tailles, sans reseau.")
     args = parser.parse_args()
+    if args.repo_id and args.root is None:
+        parser.error("--repo-id necessite --root pour choisir le dossier de destination.")
+    if args.root is None:
+        args.root = Path(os.environ.get(
+            "HSC_DEST", "/mnt/ceph/users/polymathic/mronceray/hsc_pdr3"
+        ))
 
     api = HfApi(token=True)
     if not args.verify_only:
         account = api.whoami()
         print(f"Compte Hugging Face : {account['name']}", flush=True)
 
-    selected = DATASETS if args.dataset == "all" else {
-        args.dataset: DATASETS[args.dataset]
-    }
+    if args.repo_id:
+        selected = {"custom": args.repo_id}
+    elif args.dataset == "all":
+        selected = DATASETS
+    else:
+        selected = {args.dataset: DATASETS[args.dataset]}
     plans = []
     remaining = 0
     for repo_id in selected.values():
@@ -151,7 +189,7 @@ def main():
     if remaining > free:
         raise RuntimeError(f"Espace insuffisant : il faut encore environ {volume(remaining)}")
 
-    # Persist both revisions before starting the first large transfer.
+    # Persist all revisions before starting the first large transfer.
     for directory, plan in plans:
         save_plan(directory, plan)
     for directory, plan in plans:
