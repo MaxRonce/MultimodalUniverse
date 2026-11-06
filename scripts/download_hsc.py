@@ -48,6 +48,7 @@ def validated_repo_id(value):
 def get_plan(api, repo_id, directory, verify_only=False):
     manifest = directory / MANIFEST
     if manifest.exists():
+        print(f"Lecture du manifeste local : {manifest}", flush=True)
         plan = json.loads(manifest.read_text())
         if plan["repo_id"] != repo_id:
             raise RuntimeError(f"Depot incompatible dans {manifest}")
@@ -84,17 +85,27 @@ def save_plan(directory, plan):
 
 
 def incomplete_files(directory, plan):
+    total = len(plan["files"])
+    print(f"Verification locale des presences et tailles : {total:,} fichiers "
+          "(sans lecture du contenu)...", flush=True)
     if not directory.exists():
+        print("  Dossier absent : tous les fichiers sont a telecharger.", flush=True)
         return plan["files"]
     missing = []
-    for entry in plan["files"]:
+    started = last_report = time.monotonic()
+    for checked, entry in enumerate(plan["files"], 1):
         try:
             local = (directory / entry["path"]).stat()
         except (FileNotFoundError, NotADirectoryError):
             missing.append(entry)
-            continue
-        if not stat.S_ISREG(local.st_mode) or local.st_size != entry["size"]:
-            missing.append(entry)
+        else:
+            if not stat.S_ISREG(local.st_mode) or local.st_size != entry["size"]:
+                missing.append(entry)
+        now = time.monotonic()
+        if now - last_report >= 5 or checked == total:
+            print(f"  {checked:,}/{total:,} controles, {len(missing):,} a telecharger "
+                  f"({now - started:.0f} s)", flush=True)
+            last_report = now
     return missing
 
 
@@ -160,10 +171,12 @@ def main():
         selected = {args.dataset: DATASETS[args.dataset]}
     plans = []
     remaining = 0
+    has_incomplete = False
     for repo_id in selected.values():
         directory = args.root / repo_id
         plan = get_plan(api, repo_id, directory, args.verify_only)
         missing = incomplete_files(directory, plan)
+        has_incomplete = has_incomplete or bool(missing)
         pending_size = sum(entry["size"] for entry in missing)
         remaining += pending_size
         print(f"\n{repo_id}\n  Commit : {plan['revision']}\n  Dossier : {directory}")
@@ -174,7 +187,7 @@ def main():
         plans.append((directory, plan))
 
     if args.verify_only:
-        if any(incomplete_files(directory, plan) for directory, plan in plans):
+        if has_incomplete:
             raise RuntimeError("Verification echouee : fichiers absents ou tailles incorrectes.")
         print("\nVerification OK (presences et tailles ; sans calcul de checksum).")
         return

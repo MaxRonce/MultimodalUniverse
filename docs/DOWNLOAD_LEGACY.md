@@ -140,6 +140,12 @@ Relancer la même commande pour reprendre. Garder les fichiers terminés,
 Le script conserve le commit enregistré, même si le dépôt distant évolue.
 Un fichier partiel peut devoir être retransféré selon le backend.
 
+À la reprise, la lecture du manifeste puis le contrôle des présences et tailles
+des 148 968 fichiers sur Ceph peuvent prendre plusieurs minutes. Le script affiche
+désormais ces étapes et une progression environ toutes les cinq secondes lorsque
+les appels au filesystem répondent. Les workers ne s'appliquent qu'au téléchargement,
+pas à ce contrôle local. Un appel Ceph bloqué peut retarder le prochain message.
+
 Ne pas lancer plusieurs instances sur ce même dépôt. Une répartition sur plusieurs
 nœuds nécessite des listes de fichiers disjointes et n'est pas réalisée par ce script.
 
