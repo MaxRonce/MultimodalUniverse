@@ -4,6 +4,7 @@ Default: dry-run. Pass --run to download. No Xet; one curl at a time.
 Requires an existing .hf-download-manifest.json from download_hsc.py.
 The 100,000,000 B/s cap is ~0.8 Gb/s, leaving headroom below 1 Gb/s.
 curl rate limiting is averaged over several seconds, not kernel traffic shaping.
+Pass --unlimited to omit the curl rate cap while keeping transfers serial.
 """
 import argparse
 import fcntl
@@ -42,7 +43,10 @@ def run(args):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         total = len(plan["files"])
         print(f"Depot : {REPO}\nCommit : {plan['revision']}", flush=True)
-        print("Un fichier a la fois. Plafond curl : 100 Mo/s (~0.8 Gb/s).", flush=True)
+        if args.unlimited:
+            print("Un fichier a la fois. Aucun plafond de debit curl.", flush=True)
+        else:
+            print("Un fichier a la fois. Plafond curl : 100 Mo/s (~0.8 Gb/s).", flush=True)
         if not args.run:
             print("Mode inventaire seulement. Ajouter --run pour telecharger.", flush=True)
         count = present = 0
@@ -85,7 +89,8 @@ def run(args):
                   dynamic_ncols=True) as progress:
             progress.set_postfix_str(f"{count}/{total} fichiers", refresh=False)
             for entry, target, initial_partial in pending:
-                download(curl, plan, entry, target, progress, initial_partial)
+                download(curl, plan, entry, target, progress, initial_partial,
+                         unlimited=args.unlimited)
                 count += 1
                 progress.set_postfix_str(f"{count}/{total} fichiers", refresh=True)
         print("Termine : presences et tailles verifiees, sans checksum.", flush=True)
@@ -101,7 +106,7 @@ def partial_size(path, expected):
     return size
 
 
-def download(curl, plan, entry, target, progress, initial_partial):
+def download(curl, plan, entry, target, progress, initial_partial, unlimited=False):
     target.parent.mkdir(parents=True, exist_ok=True)
     # Do not treat Xet's preallocated incomplete files as resumable HTTP data.
     partial = target.with_name(target.name + ".curl.incomplete")
@@ -138,7 +143,8 @@ def download(curl, plan, entry, target, progress, initial_partial):
                 curl, "--disable", "--silent", "--show-error", "--fail", "--location", "--globoff",
                 "--proto", "=https", "--proto-redir", "=https",
                 "--connect-timeout", "60", "--speed-time", "300", "--speed-limit", "1024",
-                "--limit-rate", str(RATE), "--continue-at", "-",
+                *([] if unlimited else ["--limit-rate", str(RATE)]),
+                "--continue-at", "-",
                 "--header", "@" + headers.name, "--output", str(partial), url,
             ]
             child = subprocess.Popen(command)
@@ -172,6 +178,8 @@ if __name__ == "__main__":
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--run", action="store_true",
                         help="Telecharger ; sans cette option, inventaire local uniquement.")
+    parser.add_argument("--unlimited", action="store_true",
+                        help="Retirer le plafond curl ; un seul transfert a la fois.")
     arguments = parser.parse_args()
     signal.signal(signal.SIGTERM, stop)
     try:
