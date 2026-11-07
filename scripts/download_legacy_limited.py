@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Serial Legacy restart using curl's average payload rate cap.
-Default: dry-run. Pass --run to download. No Xet; one curl at a time.
+"""Resumable Legacy downloads with bounded curl parallelism.
+Default: dry-run. Pass --run to download. No Xet; 1, 2 or 4 curl transfers.
 Requires an existing .hf-download-manifest.json from download_hsc.py.
 The 100,000,000 B/s cap is ~0.8 Gb/s, leaving headroom below 1 Gb/s.
 curl rate limiting is averaged over several seconds, not kernel traffic shaping.
-Pass --unlimited to omit the curl rate cap while keeping transfers serial.
+With 2 or 4 workers, caps sum to 200 MB/s (~1.6 Gb/s).
+--unlimited is available only with one worker.
 """
 import argparse
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 import fcntl
 import json
 import os
@@ -16,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 from huggingface_hub import HfApi, get_token, hf_hub_url
@@ -43,10 +46,14 @@ def run(args):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         total = len(plan["files"])
         print(f"Depot : {REPO}\nCommit : {plan['revision']}", flush=True)
-        if args.unlimited:
+        rate = None if args.unlimited else (
+            RATE if args.workers == 1 else 200_000_000 // args.workers
+        )
+        if rate is None:
             print("Un fichier a la fois. Aucun plafond de debit curl.", flush=True)
         else:
-            print("Un fichier a la fois. Plafond curl : 100 Mo/s (~0.8 Gb/s).", flush=True)
+            print(f"{args.workers} transfert(s) : {rate / 1e6:g} Mo/s maximum chacun ; "
+                  f"{rate * args.workers / 1e6:g} Mo/s au total.", flush=True)
         if not args.run:
             print("Mode inventaire seulement. Ajouter --run pour telecharger.", flush=True)
         count = present = 0
@@ -88,11 +95,36 @@ def run(args):
                   mininterval=1, miniters=1, smoothing=0,
                   dynamic_ncols=True) as progress:
             progress.set_postfix_str(f"{count}/{total} fichiers", refresh=False)
-            for entry, target, initial_partial in pending:
-                download(curl, plan, entry, target, progress, initial_partial,
-                         unlimited=args.unlimited)
-                count += 1
-                progress.set_postfix_str(f"{count}/{total} fichiers", refresh=True)
+            tasks = iter(pending)
+            task_lock = threading.Lock()
+            cancelled = threading.Event()
+
+            def worker():
+                nonlocal count
+                while not cancelled.is_set():
+                    with task_lock:
+                        task = next(tasks, None)
+                    if task is None:
+                        return
+                    entry, target, initial_partial = task
+                    download(curl, plan, entry, target, progress, initial_partial,
+                             rate=rate, cancelled=cancelled)
+                    with tqdm.get_lock():
+                        count += 1
+                        progress.set_postfix_str(f"{count}/{total} fichiers", refresh=True)
+
+            # Only submit workers, not one Future per catalog file.
+            pool = ThreadPoolExecutor(max_workers=args.workers)
+            try:
+                futures = [pool.submit(worker) for _ in range(args.workers)]
+                done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+                for future in done:
+                    future.result()
+            except BaseException:
+                cancelled.set()
+                raise
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
         print("Termine : presences et tailles verifiees, sans checksum.", flush=True)
 
 
@@ -106,7 +138,7 @@ def partial_size(path, expected):
     return size
 
 
-def download(curl, plan, entry, target, progress, initial_partial, unlimited=False):
+def download(curl, plan, entry, target, progress, initial_partial, rate=RATE, cancelled=None):
     target.parent.mkdir(parents=True, exist_ok=True)
     # Do not treat Xet's preallocated incomplete files as resumable HTTP data.
     partial = target.with_name(target.name + ".curl.incomplete")
@@ -116,10 +148,13 @@ def download(curl, plan, entry, target, progress, initial_partial, unlimited=Fal
     def report():
         nonlocal reported
         current = partial_size(partial, expected)
-        progress.update(current - reported)
-        reported = current
+        with tqdm.get_lock():
+            progress.update(current - reported)
+            reported = current
 
     for attempt in range(1, 6):
+        if cancelled is not None and cancelled.is_set():
+            raise InterruptedError("Transfert arrete.")
         if partial.exists():
             if partial.stat().st_size > expected:
                 raise RuntimeError(f"Fichier partiel trop grand : {partial}")
@@ -143,20 +178,25 @@ def download(curl, plan, entry, target, progress, initial_partial, unlimited=Fal
                 curl, "--disable", "--silent", "--show-error", "--fail", "--location", "--globoff",
                 "--proto", "=https", "--proto-redir", "=https",
                 "--connect-timeout", "60", "--speed-time", "300", "--speed-limit", "1024",
-                *([] if unlimited else ["--limit-rate", str(RATE)]),
+                *([] if rate is None else ["--limit-rate", str(rate)]),
                 "--continue-at", "-",
                 "--header", "@" + headers.name, "--output", str(partial), url,
             ]
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError("Transfert arrete.")
             child = subprocess.Popen(command)
             try:
                 while True:
+                    if cancelled is not None and cancelled.is_set():
+                        raise InterruptedError("Transfert arrete.")
                     try:
                         result = child.wait(timeout=1)
                         report()
                         break
                     except subprocess.TimeoutExpired:
                         report()
-                        progress.refresh()
+                        with tqdm.get_lock():
+                            progress.refresh()
 
             except BaseException:
                 if child.poll() is None:
@@ -168,7 +208,10 @@ def download(curl, plan, entry, target, progress, initial_partial, unlimited=Fal
             return
         if attempt < 5:
             progress.write(f"Echec curl ({result}), nouvelle tentative dans 30 s.")
-            time.sleep(30)
+            if cancelled is None:
+                time.sleep(30)
+            elif cancelled.wait(30):
+                raise InterruptedError("Transfert arrete.")
     raise RuntimeError(f"Telechargement incomplet : {entry['path']}. "
                        "Verifier le login, le quota et la connexion avant de reprendre.")
 
@@ -180,7 +223,11 @@ if __name__ == "__main__":
                         help="Telecharger ; sans cette option, inventaire local uniquement.")
     parser.add_argument("--unlimited", action="store_true",
                         help="Retirer le plafond curl ; un seul transfert a la fois.")
+    parser.add_argument("--workers", type=int, choices=[1, 2, 4], default=1,
+                        help="Transferts simultanes ; a 2 ou 4, plafond total 200 Mo/s.")
     arguments = parser.parse_args()
+    if arguments.unlimited and arguments.workers != 1:
+        parser.error("--unlimited est reserve a --workers 1.")
     signal.signal(signal.SIGTERM, stop)
     try:
         run(arguments)
