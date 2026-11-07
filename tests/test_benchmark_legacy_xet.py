@@ -2,7 +2,7 @@
 from pathlib import Path
 import tempfile
 import unittest
-from scripts.benchmark_legacy_xet import select_batch
+from scripts.benchmark_legacy_xet import select_batch, select_remaining
 
 
 class SelectionTests(unittest.TestCase):
@@ -36,6 +36,34 @@ class SelectionTests(unittest.TestCase):
             plan = {"files": [{"path": "../escape.parquet", "size": 512_000_000}]}
             with self.assertRaises(ValueError):
                 select_batch(Path(root), plan, 500_000_000, 1)
+
+
+    def test_full_resume_includes_metadata_large_files_and_curl_partials(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            (directory / "done.parquet").write_bytes(b"abc")
+            (directory / "part.parquet.curl.incomplete").write_bytes(b"abcd")
+            plan = {"files": [
+                {"path": "done.parquet", "size": 3},
+                {"path": "collection.properties", "size": 1},
+                {"path": "large.parquet", "size": 5_000_000_000},
+                {"path": "part.parquet", "size": 20},
+            ]}
+            entries, pending, complete, count = select_remaining(directory, plan)
+            self.assertEqual([e["path"] for e in entries],
+                             ["collection.properties", "large.parquet", "part.parquet"])
+            self.assertEqual(pending, 5_000_000_021)
+            self.assertEqual((complete, count), (3, 1))
+            self.assertEqual((directory / "part.parquet.curl.incomplete").read_bytes(), b"abcd")
+
+    def test_full_resume_schedules_a_wrong_sized_final_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            (directory / "bad.parquet").write_bytes(b"x")
+            plan = {"files": [{"path": "bad.parquet", "size": 2}]}
+            entries, pending, complete, count = select_remaining(directory, plan)
+            self.assertEqual(len(entries), 1)
+            self.assertEqual((pending, complete, count), (2, 0, 0))
 
 
 if __name__ == "__main__":
