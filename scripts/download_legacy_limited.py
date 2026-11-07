@@ -5,7 +5,7 @@ Requires an existing .hf-download-manifest.json from download_hsc.py.
 The 100,000,000 B/s cap is ~0.8 Gb/s, leaving headroom below 1 Gb/s.
 curl rate limiting is averaged over several seconds, not kernel traffic shaping.
 With 2 or 4 workers, caps sum to 200 MB/s (~1.6 Gb/s).
---unlimited is available only with one worker.
+--unlimited removes the rate cap for the selected number of workers.
 """
 import argparse
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
@@ -41,7 +41,7 @@ def run(args):
     plan = json.loads(manifest.read_text())
     if plan["repo_id"] != REPO or not plan.get("revision"):
         raise RuntimeError("Manifeste incompatible.")
-    # Hold a lock for this serial downloader; the previous HF job must be stopped.
+    # Hold a repository lock; the previous downloader must be stopped.
     with (directory / ".serial-download.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         total = len(plan["files"])
@@ -50,7 +50,7 @@ def run(args):
             RATE if args.workers == 1 else 200_000_000 // args.workers
         )
         if rate is None:
-            print("Un fichier a la fois. Aucun plafond de debit curl.", flush=True)
+            print(f"{args.workers} transfert(s). Aucun plafond de debit curl.", flush=True)
         else:
             print(f"{args.workers} transfert(s) : {rate / 1e6:g} Mo/s maximum chacun ; "
                   f"{rate * args.workers / 1e6:g} Mo/s au total.", flush=True)
@@ -222,12 +222,10 @@ if __name__ == "__main__":
     parser.add_argument("--run", action="store_true",
                         help="Telecharger ; sans cette option, inventaire local uniquement.")
     parser.add_argument("--unlimited", action="store_true",
-                        help="Retirer le plafond curl ; un seul transfert a la fois.")
+                        help="Retirer le plafond curl pour tous les transferts selectionnes.")
     parser.add_argument("--workers", type=int, choices=[1, 2, 4], default=1,
                         help="Transferts simultanes ; a 2 ou 4, plafond total 200 Mo/s.")
     arguments = parser.parse_args()
-    if arguments.unlimited and arguments.workers != 1:
-        parser.error("--unlimited est reserve a --workers 1.")
     signal.signal(signal.SIGTERM, stop)
     try:
         run(arguments)
