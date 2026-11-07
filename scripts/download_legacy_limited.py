@@ -18,6 +18,7 @@ import tempfile
 import time
 
 from huggingface_hub import HfApi, get_token, hf_hub_url
+from tqdm import tqdm
 
 REPO = "hugging-science/mmu_legacysurvey_dr10_south_21"
 RATE = 100_000_000
@@ -44,43 +45,75 @@ def run(args):
         print("Un fichier a la fois. Plafond curl : 100 Mo/s (~0.8 Gb/s).", flush=True)
         if not args.run:
             print("Mode inventaire seulement. Ajouter --run pour telecharger.", flush=True)
-        missing = count = size = 0
-        last = time.monotonic()
-        for i, entry in enumerate(plan["files"], 1):
-            relative = Path(entry["path"])
-            if relative.is_absolute() or ".." in relative.parts:
-                raise RuntimeError("Chemin incompatible dans le manifeste.")
-            target = directory / relative
-            expected = entry["size"]
-            try:
-                complete = target.is_file() and target.stat().st_size == expected
-            except FileNotFoundError:
-                complete = False
-            if complete:
-                count += 1
-            else:
-                missing += 1
-                size += expected
-                if args.run:
-                    print(f"\n[{i}/{total}] {relative} ({expected / 1e9:.3f} Go)", flush=True)
-                    download(curl, plan, entry, target)
+        count = present = 0
+        pending = []
+        expected_total = sum(entry["size"] for entry in plan["files"])
+        print("Inventaire local : fichiers termines et partiels curl.", flush=True)
+        with tqdm(total=total, desc="Inventaire", unit="fichier",
+                  mininterval=1, dynamic_ncols=True) as scan:
+            for entry in plan["files"]:
+                relative = Path(entry["path"])
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise RuntimeError("Chemin incompatible dans le manifeste.")
+                target = directory / relative
+                expected = entry["size"]
+                try:
+                    complete = target.is_file() and target.stat().st_size == expected
+                except FileNotFoundError:
+                    complete = False
+                if complete:
                     count += 1
-            now = time.monotonic()
-            if now - last >= 10 or i == total:
-                print(f"{i}/{total} controles ; {count} complets ; "
-                      f"{missing} initialement manquants ou incorrects.", flush=True)
-                last = now
-        if args.run:
-            print("Termine : presences et tailles verifiees, sans checksum.", flush=True)
-        else:
-            print(f"A recuperer : {missing} fichiers, {size / 1e12:.3f} To.", flush=True)
+                    present += expected
+                else:
+                    partial = target.with_name(target.name + ".curl.incomplete")
+                    initial_partial = partial_size(partial, expected)
+                    present += initial_partial
+                    pending.append((entry, target, initial_partial))
+                scan.update(1)
+        print(f"{count:,}/{total:,} fichiers termines ; "
+              f"{present / 1e12:.3f}/{expected_total / 1e12:.3f} To presents "
+              "(partiels curl inclus).", flush=True)
+        if not args.run:
+            print(f"A reprendre : {len(pending):,} fichiers ; "
+                  f"{(expected_total - present) / 1e12:.3f} To restants.", flush=True)
+            return
+        # The denominator is the whole repository, not just the current batch.
+        # Initial bytes are excluded from the rate/ETA calculation by tqdm.
+        with tqdm(total=expected_total, initial=present, desc="Legacy global",
+                  unit="B", unit_scale=True, unit_divisor=1000,
+                  mininterval=1, miniters=1, smoothing=0,
+                  dynamic_ncols=True) as progress:
+            progress.set_postfix_str(f"{count}/{total} fichiers", refresh=False)
+            for entry, target, initial_partial in pending:
+                download(curl, plan, entry, target, progress, initial_partial)
+                count += 1
+                progress.set_postfix_str(f"{count}/{total} fichiers", refresh=True)
+        print("Termine : presences et tailles verifiees, sans checksum.", flush=True)
 
 
-def download(curl, plan, entry, target):
+def partial_size(path, expected):
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return 0
+    if not 0 <= size <= expected:
+        raise RuntimeError(f"Fichier partiel de taille incorrecte : {path}")
+    return size
+
+
+def download(curl, plan, entry, target, progress, initial_partial):
     target.parent.mkdir(parents=True, exist_ok=True)
     # Do not treat Xet's preallocated incomplete files as resumable HTTP data.
     partial = target.with_name(target.name + ".curl.incomplete")
     expected = entry["size"]
+    reported = initial_partial
+
+    def report():
+        nonlocal reported
+        current = partial_size(partial, expected)
+        progress.update(current - reported)
+        reported = current
+
     for attempt in range(1, 6):
         if partial.exists():
             if partial.stat().st_size > expected:
@@ -102,7 +135,7 @@ def download(curl, plan, entry, target):
             headers.write("Authorization: Bearer " + token + "\n")
             headers.flush()
             command = [
-                curl, "--disable", "--fail", "--location", "--globoff",
+                curl, "--disable", "--silent", "--show-error", "--fail", "--location", "--globoff",
                 "--proto", "=https", "--proto-redir", "=https",
                 "--connect-timeout", "60", "--speed-time", "300", "--speed-limit", "1024",
                 "--limit-rate", str(RATE), "--continue-at", "-",
@@ -110,7 +143,15 @@ def download(curl, plan, entry, target):
             ]
             child = subprocess.Popen(command)
             try:
-                result = child.wait()
+                while True:
+                    try:
+                        result = child.wait(timeout=1)
+                        report()
+                        break
+                    except subprocess.TimeoutExpired:
+                        report()
+                        progress.refresh()
+
             except BaseException:
                 if child.poll() is None:
                     child.terminate()
@@ -120,7 +161,7 @@ def download(curl, plan, entry, target):
             partial.replace(target)
             return
         if attempt < 5:
-            print(f"Echec curl ({result}), nouvelle tentative dans 30 s.", flush=True)
+            progress.write(f"Echec curl ({result}), nouvelle tentative dans 30 s.")
             time.sleep(30)
     raise RuntimeError(f"Telechargement incomplet : {entry['path']}. "
                        "Verifier le login, le quota et la connexion avant de reprendre.")
