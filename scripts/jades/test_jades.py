@@ -9,6 +9,9 @@ from astropy.wcs import WCS
 
 from scripts.jades.audit_catalog import summarize_snr
 from scripts.jades.build_parent_sample_hats import (
+    HST_BANDS,
+    JWST_BANDS,
+    apparent_mag_from_njy,
     flux_conversion,
     process_field,
     variance_to_ivar,
@@ -29,6 +32,14 @@ def test_unit_conversion_requires_pixel_area():
         flux_conversion(fits.Header(), "MJy/sr")
     header = fits.Header({"PIXAR_SR": 1e-14})
     assert flux_conversion(header, "MJy/sr") == pytest.approx(10.0)
+
+
+def test_instrument_separation_and_ab_magnitude():
+    assert len(JWST_BANDS) == 26
+    assert len(HST_BANDS) == 9
+    assert not (JWST_BANDS & HST_BANDS)  # Distinct instrument namespace (see below).
+    assert apparent_mag_from_njy([1000.0])[0] == pytest.approx(23.9)
+    assert np.isnan(apparent_mag_from_njy([0.0])[0])
 
 
 def _wcs():

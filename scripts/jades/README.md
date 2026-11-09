@@ -1,7 +1,16 @@
 # JADES DR5 → MMU v2 HATS
 
 This builder targets **JADES DR5 photometric catalogues and imaging mosaics** in
-GOODS-N and GOODS-S. It uses the MMU v2 `image` struct and the shared
+GOODS-N and GOODS-S. It produces two separate MMU datasets:
+
+- `jades_jwst`: 18 JWST/NIRCam + 8 JWST/MIRI filters (as available).
+- `jades_hst`: 5 HST/ACS + 4 HST/WFC3 filters (as available).
+
+They have **independent magnitude-selection and image-size settings**, output directories,
+and future Hugging Face publishing targets. The current scripts build HATS,
+but **do not publish to Hugging Face automatically**.
+
+It uses the MMU v2 `image` struct and the shared
 `mmu.hats_import.write_hats_from_parquet_dir` utility. It does **not** modify
 the legacy JWST/DJA builder. These datasets may overlap on the sky; do not
 assume that their object samples are independent.
@@ -66,18 +75,39 @@ python -m scripts.jades.download_data \
 python -m scripts.jades.audit_catalog \
   /path/to/GOODS-S.fits /path/to/GOODS-N.fits \
   --bands F090W F115W F150W F200W F277W F356W F410M F444W \
+  --mag-band F277W --mag-cuts 26 27 28 29 30 \
   --output /path/to/jades_snr_audit.json
 
 python -m scripts.jades.build_parent_sample_hats \
+  --instrument jwst \
   --manifest /path/to/jades_dr5_manifest.json \
   --raw-root /mnt/ceph/users/polymathic/external_data/astro/JADES_DR5 \
-  --scratch-dir /mnt/ceph/users/polymathic/jades_dr5_hats_scratch \
+  --scratch-dir /mnt/ceph/users/polymathic/jades_jwst_hats_scratch \
   --download --max-objects 1000
+
+python -m scripts.jades.build_parent_sample_hats \
+  --instrument hst \
+  --manifest /path/to/jades_dr5_manifest.json \
+  --raw-root /mnt/ceph/users/polymathic/external_data/astro/JADES_DR5 \
+  --scratch-dir /mnt/ceph/users/polymathic/jades_hst_hats_scratch \
+  --max-objects 1000
 ```
 
 Omit `--max-objects` for the full build. **Use a separate scratch directory
 for each sample/configuration**: completion markers are used for restart.
 Do not run a smoke-test and full production in the same scratch directory.
+
+Each build also accepts its own `--image-size` (native pixels). Choose this
+after comparing angular footprint and pixel scale across JWST and HST; keeping
+the same pixel count does *not* guarantee the same angular field of view.
+
+Once the scientific completeness analysis has selected independent magnitude
+limits, add `--mag-band F277W --mag-max <JWST_LIMIT>` for JWST and, for
+example, `--mag-band F160W --mag-max <HST_LIMIT>` for HST. This computes
+AB apparent magnitudes from **positive KRON fluxes** (nJy) using
+`m_AB = 31.4 - 2.5 log10(flux_nJy)`. The reference bands and magnitude limits
+are **not prescribed by JADES** and must be justified independently for both
+instruments. A reference band absent from a source means it fails that cut.
 
 ## Selection and schema
 
@@ -86,6 +116,9 @@ Do not run a smoke-test and full production in the same scratch directory.
   separately by the audit, using `CIRC3 / CIRC3_e` (r=0.25 arcsec) and 1/2/4
   detected bands. The paper's segmentation thresholds must **not** be
   interpreted as object-level photometric cuts.
+- Two independent optional apparent-magnitude cuts are supported, using the
+  relevant reference-band `KRON` flux. They are intentionally unset until
+  catalogue counts and physical completeness are assessed.
 - Include all available bands (up to 35 in DR5) with **real pixel-level
   inverse variance**. For a given source, absent bands are omitted from the
   variable-length `image.band` list. A source without any valid band is skipped.

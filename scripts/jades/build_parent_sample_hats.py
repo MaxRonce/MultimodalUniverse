@@ -26,9 +26,24 @@ from mmu.hats_configs import MMU_V2_HATS_ROOT, RAW_DATA_ROOT
 from scripts.jades.download_data import fetch_manifest
 
 
-CATALOG_NAME = "jades"
 DEFAULT_ROOT = Path(RAW_DATA_ROOT) / "JADES_DR5"
 IMAGE_SIZE = 160
+JWST_BANDS = {
+    "F070W", "F090W", "F115W", "F150W", "F162M", "F182M", "F200W", "F210M",
+    "F250M", "F277W", "F300M", "F335M", "F356W", "F410M", "F430M", "F444W",
+    "F460M", "F480M", "F560W", "F770W", "F1000W", "F1280W", "F1500W",
+    "F1800W", "F2100W", "F2550W",
+}
+HST_BANDS = {"F435W", "F606W", "F775W", "F814W", "F850LP", "F105W", "F125W", "F140W", "F160W"}
+
+
+def apparent_mag_from_njy(flux):
+    """AB apparent magnitude from positive total flux in nJy; others are NaN."""
+    flux = np.asarray(flux, dtype=np.float64)
+    result = np.full(flux.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(flux) & (flux > 0)
+    result[valid] = 31.4 - 2.5 * np.log10(flux[valid])
+    return result
 
 
 def _input(raw_root: Path, value: str) -> Path:
@@ -81,9 +96,10 @@ def flux_conversion(header: fits.Header, unit: str) -> float:
     raise ValueError(f"Unsupported SCI unit {unit!r}; refusing implicit conversion")
 
 
-def _cutout(data: np.ndarray, wcs: WCS, ra: float, dec: float, fill: float) -> np.ndarray:
+def _cutout(data: np.ndarray, wcs: WCS, ra: float, dec: float, fill: float,
+            image_size: int = IMAGE_SIZE) -> np.ndarray:
     x, y = wcs.all_world2pix(ra, dec, 0)
-    return np.asarray(Cutout2D(data, (x, y), (IMAGE_SIZE, IMAGE_SIZE), mode="partial", fill_value=fill).data)
+    return np.asarray(Cutout2D(data, (x, y), (image_size, image_size), mode="partial", fill_value=fill).data)
 
 
 def _catalog_columns(hdus: fits.HDUList, name: str):
@@ -118,7 +134,8 @@ def _open_mosaics(stack: ExitStack, entries: list[dict], raw_root: Path) -> list
     return mosaics
 
 
-def _record(index: int, size, circ, flags, mosaics: list[dict], field: str) -> dict | None:
+def _record(index: int, size, circ, flags, mosaics: list[dict], field: str,
+            image_size: int = IMAGE_SIZE) -> dict | None:
     ra, dec = float(size["RA"][index]), float(size["DEC"][index])
     if not np.isfinite(ra) or not np.isfinite(dec):
         return None
@@ -131,8 +148,8 @@ def _record(index: int, size, circ, flags, mosaics: list[dict], field: str) -> d
             if not np.isfinite(flags[f"{band}_TEXP"][index]) or flags[f"{band}_TEXP"][index] <= 0:
                 continue
         try:
-            f = _cutout(m["sci"], m["wcs"], ra, dec, np.nan).astype(np.float32)
-            u = _cutout(m["uncertainty"], m["wcs"], ra, dec, np.nan).astype(np.float32)
+            f = _cutout(m["sci"], m["wcs"], ra, dec, np.nan, image_size).astype(np.float32)
+            u = _cutout(m["uncertainty"], m["wcs"], ra, dec, np.nan, image_size).astype(np.float32)
         except (ValueError, TypeError, IndexError):
             continue  # Outside mosaic footprint; try the next non-overlapping mosaic.
         weight = variance_to_ivar(u, m["kind"])
@@ -186,7 +203,9 @@ def _table(records: list[dict]) -> pa.Table:
 
 
 def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root: Path,
-                  scratch: Path, chunk_size: int, max_objects: int | None) -> int:
+                  scratch: Path, chunk_size: int, max_objects: int | None,
+                  mag_band: str | None = None, mag_max: float | None = None,
+                  image_size: int = IMAGE_SIZE) -> int:
     done = scratch / f"{field}.done"
     if done.exists():
         return int(done.read_text())
@@ -205,13 +224,24 @@ def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root:
             flags = None
         if flags is not None and not _ids_aligned(size, flags):
             raise ValueError(f"{field}: SIZE and FLAG IDs not aligned")
+        magnitude = None
+        if mag_max is not None:
+            kron, kron_columns = _catalog_columns(catalog_hdus, "KRON")
+            if not _ids_aligned(size, kron):
+                raise ValueError(f"{field}: SIZE and KRON IDs not aligned")
+            flux_column = f"{mag_band}_KRON"
+            if flux_column not in kron_columns:
+                raise ValueError(f"{field}: requested apparent magnitude requires {flux_column}")
+            magnitude = apparent_mag_from_njy(kron[flux_column])
         images = _open_mosaics(stack, mosaics, raw_root)
         if not images:
             raise ValueError(f"{field}: no mosaics configured")
         count, chunk, shard = 0, [], 0
         n = min(len(size), max_objects) if max_objects else len(size)
         for i in range(n):
-            row = _record(i, size, circ, flags, images, field)
+            if magnitude is not None and (not np.isfinite(magnitude[i]) or magnitude[i] >= mag_max):
+                continue
+            row = _record(i, size, circ, flags, images, field, image_size)
             if row is None:
                 continue
             chunk.append(row)
@@ -237,12 +267,19 @@ def main() -> None:
     from mmu.hats_import import write_hats_from_parquet_dir
 
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--instrument", choices=("jwst", "hst"), required=True,
+                   help="Build a separate MMU catalogue for JWST (NIRCam+MIRI) or HST (ACS+WFC3)")
     p.add_argument("--manifest", type=Path, required=True)
     p.add_argument("--raw-root", type=Path, default=DEFAULT_ROOT)
-    p.add_argument("--output-root", type=Path, default=Path(MMU_V2_HATS_ROOT) / CATALOG_NAME)
+    p.add_argument("--output-root", type=Path,
+                   help="Defaults to MMU_V2_HATS_ROOT/jades_{instrument}")
     p.add_argument("--scratch-dir", type=Path, required=True)
     p.add_argument("--download", action="store_true")
     p.add_argument("--max-objects", type=int)
+    p.add_argument("--image-size", type=int, default=IMAGE_SIZE,
+                   help="Native-pixel cutout side length; configure separately for JWST/HST")
+    p.add_argument("--mag-band", help="Reference filter for the apparent-magnitude cut")
+    p.add_argument("--mag-max", type=float, help="Optional AB Kron apparent magnitude upper limit")
     p.add_argument("--chunk-size", type=int, default=50)
     p.add_argument("--pixel-threshold", type=int, default=8192)
     p.add_argument("--ingest-workers", type=int, default=4)
@@ -250,6 +287,16 @@ def main() -> None:
     args = p.parse_args()
     if args.chunk_size <= 0:
         p.error("--chunk-size must be > 0")
+    if args.image_size <= 0:
+        p.error("--image-size must be > 0")
+    if (args.mag_band is None) != (args.mag_max is None):
+        p.error("--mag-band and --mag-max must be set together")
+    allowed = JWST_BANDS if args.instrument == "jwst" else HST_BANDS
+    if args.mag_band and args.mag_band.upper() not in allowed:
+        p.error(f"--mag-band {args.mag_band} is not a {args.instrument.upper()} filter")
+    mag_band = args.mag_band.upper() if args.mag_band else None
+    catalog_name = f"jades_{args.instrument}"
+    output_root = args.output_root or Path(MMU_V2_HATS_ROOT) / catalog_name
     manifest = json.loads(args.manifest.read_text())
     if manifest.get("release") != "JADES_DR5":
         p.error("Manifest must pin release JADES_DR5")
@@ -259,18 +306,20 @@ def main() -> None:
     total = 0
     for cat in manifest["catalogs"]:
         field = cat["field"]
-        entries = [m for m in manifest["mosaics"] if m["field"] == field]
+        entries = [m for m in manifest["mosaics"]
+                   if m["field"] == field and m["band"].upper() in allowed]
         n = process_field(field, _input(args.raw_root, cat["path"]), entries,
-                          args.raw_root, args.scratch_dir, args.chunk_size, args.max_objects)
+                          args.raw_root, args.scratch_dir, args.chunk_size, args.max_objects,
+                          mag_band, args.mag_max, args.image_size)
         print(f"{field}: {n} objects with real image inverse variance", flush=True)
         total += n
     if total == 0:
         raise RuntimeError("No valid JADES images; refusing to write empty HATS catalog")
-    write_hats_from_parquet_dir(str(args.scratch_dir), output_path=str(args.output_root),
-                               catalog_name=CATALOG_NAME, pixel_threshold=args.pixel_threshold,
+    write_hats_from_parquet_dir(str(args.scratch_dir), output_path=str(output_root),
+                               catalog_name=catalog_name, pixel_threshold=args.pixel_threshold,
                                n_workers=args.ingest_workers,
                                tmp_dir=str(args.tmp_dir) if args.tmp_dir else None)
-    print(f"JADES HATS output: {args.output_root} ({total} objects)")
+    print(f"JADES HATS output: {output_root} ({total} objects)")
 
 
 if __name__ == "__main__":

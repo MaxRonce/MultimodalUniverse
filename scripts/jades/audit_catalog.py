@@ -10,6 +10,8 @@ import numpy as np
 from astropy.io import fits
 from astropy.table import Table
 
+from scripts.jades.build_parent_sample_hats import apparent_mag_from_njy
+
 
 def read_extension(path: Path, extension: str) -> Table:
     with fits.open(path, memmap=True) as hdus:
@@ -19,7 +21,8 @@ def read_extension(path: Path, extension: str) -> Table:
         return Table(hdus[names[extension.upper()]].data)
 
 
-def summarize_snr(catalogs: list[Path], bands: list[str], aperture: str = "CIRC3") -> dict:
+def summarize_snr(catalogs: list[Path], bands: list[str], aperture: str = "CIRC3",
+                  mag_band: str | None = None, mag_cuts: tuple[float, ...] = ()) -> dict:
     summaries = {}
     for path in catalogs:
         table = read_extension(path, "CIRC")
@@ -43,6 +46,18 @@ def summarize_snr(catalogs: list[Path], bands: list[str], aperture: str = "CIRC3
                 "at_least_2_bands": int((count >= 2).sum()),
                 "at_least_4_bands": int((count >= 4).sum()),
             }
+        if mag_band is not None:
+            kron = read_extension(path, "KRON")
+            if len(kron) != n or not np.array_equal(kron["ID"], table["ID"]):
+                raise ValueError(f"{path}: KRON and CIRC IDs not aligned")
+            name = f"{mag_band}_KRON"
+            if name not in kron.colnames:
+                raise ValueError(f"{path}: missing {name} for AB magnitude counts")
+            mag = apparent_mag_from_njy(kron[name])
+            summary["magnitude_reference"] = mag_band
+            summary["magnitude_cuts"] = {
+                str(cut): int((np.isfinite(mag) & (mag < cut)).sum()) for cut in mag_cuts
+            }
         summaries[path.stem] = summary
     return summaries
 
@@ -52,9 +67,13 @@ def main() -> None:
     parser.add_argument("catalogs", nargs="+", type=Path)
     parser.add_argument("--bands", nargs="+", required=True)
     parser.add_argument("--aperture", default="CIRC3")
+    parser.add_argument("--mag-band", help="Reference band for a magnitude completeness audit (KRON)")
+    parser.add_argument("--mag-cuts", nargs="+", type=float, default=[26, 27, 28, 29, 30])
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    summary = summarize_snr(args.catalogs, [b.upper() for b in args.bands], args.aperture)
+    summary = summarize_snr(args.catalogs, [b.upper() for b in args.bands], args.aperture,
+                            args.mag_band.upper() if args.mag_band else None,
+                            tuple(args.mag_cuts))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(summary, indent=2) + "\n")
     print(f"Wrote {args.output}")
