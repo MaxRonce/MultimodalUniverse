@@ -6,6 +6,8 @@ RUN_ROOT=${DESI_RUN_ROOT:-/mnt/ceph/users/polymathic/mronceray/desi_dr1_main}
 RAW_ROOT=${DESI_RAW_ROOT:-/mnt/ceph/users/polymathic/external_data/astro/DESI_DR1}
 ZCATALOG=${DESI_ZCATALOG:-$RAW_ROOT/zall-pix-iron.fits}
 DOWNLOAD_ZCATALOG_V1=0
+STATUS=0
+WATCH=0
 SHARDS=${DESI_SHARDS:-8}
 WORKERS=${DESI_WORKERS:-16}
 JOBS=${DESI_CONCURRENT:-2}
@@ -19,15 +21,23 @@ while (($#)); do
       RUN_ROOT="${DESI_RUN_ROOT:-/mnt/ceph/users/polymathic/mronceray/desi_dr1_main_smoke}"
       SHARDS=2; MAX_GROUPS=8; GATHER_WORKERS=2; GATHER_MEM=64000; shift ;;
     --dry-run) DRY_RUN=(--dry-run); shift ;;
+    --status) STATUS=1; shift ;;
+    --watch) STATUS=1; WATCH=1; shift ;;
     --download-zcatalog-v1) DOWNLOAD_ZCATALOG_V1=1; shift ;;
     --help|-h)
-      echo "Usage: bash scripts/desi/launch_dr1_main.sh [--smoke] [--dry-run] [--download-zcatalog-v1]"
+      echo "Usage: bash scripts/desi/launch_dr1_main.sh [--smoke] [--dry-run] [--status|--watch] [--download-zcatalog-v1]"
       echo "Default: read DESI_ZCATALOG or the shared zall-pix-iron.fits; no network/copy."
+      echo "Monitoring only: --status (once) or --watch (every 10 seconds); no jobs submitted."
       echo "Environment: DESI_RUN_ROOT, DESI_RAW_ROOT, DESI_PARTITION (genx), DESI_CONCURRENT (2)."
       exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+if ((STATUS)); then
+  STATUS_ARGS=("$RUN_ROOT")
+  if ((WATCH)); then STATUS_ARGS+=(--watch); fi
+  exec "$REPO/.venv/bin/python" "$REPO/scripts/desi/status_dr1_main.py" "${STATUS_ARGS[@]}"
+fi
 for VALUE in "$SHARDS" "$WORKERS" "$JOBS" "$GATHER_WORKERS" "$GATHER_MEM"; do
   [[ "$VALUE" =~ ^[1-9][0-9]*$ ]] || { echo "Resource values must be positive integers" >&2; exit 2; }
 done
@@ -71,6 +81,12 @@ fi
 CORES=$((JOBS * WORKERS))
 if ((GATHER_WORKERS > CORES)); then CORES=$GATHER_WORKERS; fi
 if ((CORES < 2)); then CORES=2; fi
+if ((MAX_GROUPS)); then MODE_LABEL='SMOKE : 8 coadds maximum'; else MODE_LABEL='COMPLÈTE'; fi
+echo "DESI DR1 Main — campagne $MODE_LABEL"
+echo "Entrées : $RAW_ROOT (lecture seule)"
+echo "Sortie  : $RUN_ROOT"
+printf 'Suivi dans un autre terminal : %q %q %q --watch\n' "$PYTHON" "$REPO/scripts/desi/status_dr1_main.py" "$RUN_ROOT"
+echo "Les messages suivants proviennent de Snakemake/Slurm ; les logs détaillés sont conservés."
 exec "$PYTHON" -m snakemake --snakefile "$REPO/scripts/desi/dr1_main.smk" \
   --directory "$RUN_ROOT/workflow" --executor slurm --jobs "$JOBS" --cores "$CORES" \
   --rerun-incomplete --latency-wait 120 --printshellcmds \

@@ -154,6 +154,35 @@ les contrôles de cette campagne.
 
 ## 5. Suivre et reprendre
 
+Un suivi lisible en lecture seule est disponible, y compris pour une campagne
+déjà lancée :
+
+```bash
+cd "$HOME/MultimodalUniverse"
+python3 scripts/desi/status_dr1_main.py smoke_local --watch
+```
+
+Les raccourcis `smoke_local`, `smoke` et `full` correspondent aux dossiers de
+campagne de ces noms sous `/mnt/ceph/users/polymathic/mronceray`. Un chemin
+complet est aussi accepté. L'écran affiche les trois étapes, les morceaux
+terminés, les jobs et leurs états Slurm, les dernières lignes des logs et le
+rapport final. Il se rafraîchit toutes les dix secondes. `Ctrl-C` arrête le
+suivi uniquement, sans annuler de job. Sans `--watch`, il affiche un instantané.
+Ce script n'importe pas le constructeur DESI et ne modifie aucune donnée.
+
+Les messages `MinJobAge`, `Provided remote nodes` et les soumissions viennent
+de Snakemake et de son plugin Slurm. `Provided remote nodes: 2` désigne la
+limite de deux jobs simultanés, pas deux nœuds immédiatement réservés.
+L'erreur `sacct: invalid option -- '1'` provient d'un bug de la détection
+automatique du compte dans le plugin installé : il transmet les arguments
+de `| tail -1` directement à `sacct`. Une soumission avec un identifiant de
+job a toutefois réussi. Le moniteur appelle les commandes Slurm correctement,
+sans pipeline shell. Pour une future campagne, `DESI_ACCOUNT` permet de
+fournir un compte Slurm connu explicitement ; ne pas en inventer un.
+
+Le contrôleur Snakemake initial doit toujours rester actif dans sa session
+tmux. Le moniteur se lance dans un autre terminal et ne le remplace pas.
+
 ```bash
 squeue -u "$USER"
 tail -f /mnt/ceph/users/polymathic/mronceray/desi_dr1_main/logs/prepare.log
