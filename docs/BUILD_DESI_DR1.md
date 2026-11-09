@@ -11,12 +11,22 @@ Les coadds existants sont lus dans :
 /mnt/ceph/users/polymathic/external_data/astro/DESI_DR1/
 ```
 
-Ils ne sont ni copiés, ni modifiés. Aucun transfert Globus n'est nécessaire.
-Le vieux `zall-pix-iron.fits` partagé n'a pas de provenance v1 vérifiée.
-Chaque campagne récupère donc seulement le **catalogue officiel v1 corrigé**
-dans son espace personnel : **22 371 272 640 octets, soit 22,37 Go / 20,84 Gio**
-(taille HTTP vérifiée le 9 novembre 2026). Le téléchargement reprend avec curl ;
-l'URL, l'ETag, la taille, la date HTTP et le SHA256 sont enregistrés.
+Le catalogue `/mnt/ceph/users/polymathic/external_data/astro/DESI_DR1/zall-pix-iron.fits`
+est lui aussi **lu directement sur place**. Aucun téléchargement ni copie n'est
+effectué par défaut. Les entrées partagées restent en lecture seule ; le chemin,
+les en-têtes FITS, la taille, la date du fichier et son SHA256 sont enregistrés.
+
+La version v0/v1 du catalogue local n'a pas encore été vérifiée indépendamment.
+Le workflow l'indique avec `catalog_version: unverified` et `source_warnings`
+dans le rapport, au lieu de remplacer automatiquement le fichier. `PASS`
+valide la structure et les contrôles du build, pas la certification de la version
+du catalogue d'entrée. Les limites connues des métadonnées v0 restent à examiner
+si c'est effectivement cette version qui est disponible localement.
+
+Pour utiliser un autre catalogue déjà local, définir `DESI_ZCATALOG=/chemin/catalogue.fits`.
+Le téléchargement officiel v1 exige désormais l'option explicite
+`--download-zcatalog-v1` (environ **22,37 Go / 20,84 Gio**). Il est optionnel et
+n'est déclenché ni par `--smoke`, ni par l'absence d'un fichier local.
 
 Source : [catalogue v1](https://data.desi.lbl.gov/public/dr1/spectro/redux/iron/zcatalog/v1/zall-pix-iron.fits),
 [différences v0/v1 et limites DR1](https://data.desi.lbl.gov/doc/releases/dr1/known-issues/).
@@ -55,8 +65,8 @@ module load slurm
 ```
 
 Le Python utilisé est celui de `$HOME/MultimodalUniverse/.venv`, pas le petit
-environnement de téléchargement Hugging Face. `curl` doit être disponible sur
-les nœuds de calcul. Aucun GPU n'est utilisé.
+environnement de téléchargement Hugging Face. `curl` n'est requis que pour
+l'option explicite de téléchargement v1. Aucun GPU n'est utilisé.
 
 ## 3. Lancer d'abord un petit build réel
 
@@ -74,7 +84,7 @@ bash scripts/desi/launch_dr1_main.sh --smoke
 Se détacher avec `Ctrl-b`, puis `d`. Le processus Snakemake doit rester vivant
 dans tmux pour soumettre la suite des jobs. Les jobs exécutent successivement :
 
-1. téléchargement du petit catalogue v1, sélection et contrôle de présence de
+1. lecture du catalogue local, sélection et contrôle de présence de
    **tous** les coadds nécessaires ;
 2. extraction parallèle et nettoyage des spectres, Parquet intermédiaires atomiques ;
 3. assemblage HATS, marge par défaut de **10 arcsec**, validation, publication locale.
@@ -87,6 +97,19 @@ cat /mnt/ceph/users/polymathic/mronceray/desi_dr1_main_smoke/validation.json
 
 Il doit indiquer `"status": "PASS"` et `"scope": "smoke"`. Si un job échoue,
 ne pas lancer le full avant d'avoir résolu l'erreur du log.
+
+Si l'ancienne version a déjà lancé un téléchargement, arrêter le contrôleur
+Snakemake et annuler uniquement les jobs de cette campagne **avant** le `git pull`.
+Ne pas toucher aux autres jobs HSC/Legacy/LSST. Laisser les fichiers partiels
+existants en place et repartir dans un dossier distinct après mise à jour :
+
+```bash
+DESI_RUN_ROOT=/mnt/ceph/users/polymathic/mronceray/desi_dr1_main_smoke_local \
+  bash scripts/desi/launch_dr1_main.sh --smoke
+```
+
+Ce nouveau test n'effectue aucun téléchargement. Son rapport sera dans
+`desi_dr1_main_smoke_local/validation.json`.
 
 ## 4. Lancer le catalogue complet
 
@@ -154,7 +177,7 @@ Une campagne n'est pas réutilisable avec un nombre de morceaux différent.
 
 ```text
 /mnt/ceph/users/polymathic/mronceray/desi_dr1_main/
-├── inputs/                     # catalogue v1 personnel, reçu et SHA256
+├── inputs/                     # uniquement si téléchargement v1 explicitement demandé
 ├── selection.parquet           # sélection exacte ; un row group par coadd
 ├── plan.json                   # sélection, sources, limites, code et versions
 ├── preflight.json              # comptages et contrôle des coadds

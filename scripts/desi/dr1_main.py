@@ -1,7 +1,7 @@
 """Auditable DESI DR1 Main -> MMU HATS production (see docs/BUILD_DESI_DR1.md).
 
-The shared coadds are read-only. A run owns its corrected v1 zcatalog,
-compact selection, atomic/resumable group parquets, HATS collection and QA.
+The shared coadds and local zcatalog are read-only. A run owns its compact
+selection, atomic/resumable group parquets, HATS collection and QA.
 No S/N, redshift or spectral-class cut is imposed on otherwise usable spectra.
 """
 
@@ -90,7 +90,7 @@ def validate_paths(run, raw):
 def fetch_catalog(run):
     """Download ONLY the official corrected v1 summary, with curl resume.
 
-    The unknown-version shared summary is intentionally not used. A receipt
+    Called only with the explicit --download-zcatalog-v1 option. A receipt
     pins both HTTP identity and the SHA256 of the completed personal copy.
     """
     import requests
@@ -169,19 +169,37 @@ def arrow_columns(cat, names, mask):
     return pa.table(columns)
 
 
-def prepare(run, raw, shards, max_groups=None):
+def prepare(run, raw, shards, max_groups=None, zcatalog=None, download_v1=False):
     plan_path = run / "plan.json"
+    if download_v1 and zcatalog is not None:
+        raise ValueError("Choose a local catalog or an explicit v1 download, not both")
+    catalog_path = ((run / "inputs/zall-pix-iron-v1.fits") if download_v1
+                    else Path(zcatalog or raw / "zall-pix-iron.fits")).resolve()
     config = {"raw_root": str(raw), "shards": shards, "max_groups": max_groups,
-              "builder_sha256": digest(__file__), "zcatalog_url": ZCAT_URL}
+              "builder_sha256": digest(__file__), "zcatalog_path": str(catalog_path),
+              "catalog_source": "official_v1" if download_v1 else "local"}
     if plan_path.exists():
         plan = read_json(plan_path)
         if plan["config"] != config or plan["selection_sha256"] != digest(run / "selection.parquet"):
             raise RuntimeError("Run configuration/code/selection changed; use a new run")
-        if plan["catalog"]["sha256"] != digest(run / "inputs/zall-pix-iron-v1.fits"):
+        if plan["catalog"]["sha256"] != digest(catalog_path):
             raise RuntimeError("Catalog changed since preparation")
         print(f"Reusing plan: {len(plan['groups'])} groups, {plan['selected_rows']} targets", flush=True)
         return
-    zcat, receipt = fetch_catalog(run)
+    if download_v1:
+        zcat, receipt = fetch_catalog(run)
+        receipt = {**receipt, "path": str(zcat.resolve()), "source": "official_v1",
+                   "catalog_version": "v1"}
+    else:
+        zcat = catalog_path
+        if not zcat.is_file():
+            raise FileNotFoundError(f"Local zcatalog missing: {zcat}. No download attempted. "
+                                    "Provide --zcatalog or explicitly request --download-zcatalog-v1.")
+        print(f"Reading local zcatalog in place (no download, no copy): {zcat}", flush=True)
+        print("Catalog release is DR1 iron; summary version v0/v1 is unverified. "
+              "This limitation will be recorded in provenance and validation.", flush=True)
+        receipt = {"path": str(zcat), "source": "local", "catalog_version": "unverified",
+                   **signature(zcat), "sha256": digest(zcat)}
     with fits.open(zcat, memmap=True) as hdus:
         cat = hdus[1].data
         missing = sorted(set(REQUIRED) - set(cat.names))
@@ -192,7 +210,10 @@ def prepare(run, raw, shards, max_groups=None):
         mask, counts = selection_masks(cat)
         table = arrow_columns(cat, names, mask)
         header = {key: hdus[1].header.get(key, hdus[0].header.get(key))
-                  for key in ("SPECPROD", "SURVEY", "EXTNAME", "NAXIS2")}
+                  for key in ("SPECPROD", "SURVEY", "EXTNAME", "NAXIS2", "ZCATVER", "VERSION")}
+        specprod = header.get("SPECPROD")
+        if specprod is not None and str(specprod).strip().lower() != "iron":
+            raise RuntimeError(f"Expected DR1 iron, got SPECPROD={specprod!r}")
     if table.num_rows == 0:
         raise RuntimeError("No targets selected")
     tids = table["TARGETID"].to_numpy()
@@ -486,11 +507,16 @@ def gather(run, workers, pixel_threshold=8192, debug=False):
         os.replace(staged, final)
     totals = {k: sum(r[k] for r in reports) for k in
               ("input_rows", "retained_rows", "all_masked_rejected", "good_redshift_rows", "masked_pixels")}
+    source_warnings = ([] if plan["catalog"]["catalog_version"] == "v1" else
+                       ["Local zcatalog summary version v0/v1 has not been independently verified."])
     atomic_json(final / "provenance.json", {"plan_sha256": plan_id, "plan": plan,
                                            "release": "DR1", "survey": "main", "license": "CC-BY-4.0",
+                                           "source_warnings": source_warnings,
                                            "quality": totals, "lsf": "per-coadd mean Gaussian sigma, pixels"})
     (final / "README.md").write_text(
         f"# DESI DR1 Main — MMU HATS\n\n{expected:,} spectra; default margin: 10 arcsec.\n\n"
+        f"Input summary version: {plan['catalog']['catalog_version']}. "
+        f"Source warnings: {source_warnings}. See provenance.json for the path and SHA256.\n\n"
         "Selection: SURVEY=main, MAIN_PRIMARY, OBJTYPE=TGT, COADD_FIBERSTATUS=0; "
         "NODATA and invalid coordinates excluded. Known missing handles excluded. "
         "All Main programs and spectral classes retained; no S/N or redshift-success cut. "
@@ -505,7 +531,9 @@ def gather(run, workers, pixel_threshold=8192, debug=False):
         "Known DR1 caveats: https://data.desi.lbl.gov/doc/releases/dr1/known-issues/\n"
     )
     atomic_json(run / "validation.json", {**report, "collection": str(final),
-                                          "scope": plan["scope"], "quality": totals})
+                                          "scope": plan["scope"], "quality": totals,
+                                          "catalog_version": plan["catalog"]["catalog_version"],
+                                          "source_warnings": source_warnings})
     print(f"HATS PASS: {final} ({expected:,} rows)", flush=True)
 
 
@@ -514,6 +542,11 @@ def main(argv=None):
     parser.add_argument("stage", choices=["prepare", "scatter", "gather"])
     parser.add_argument("--run-root", default=DEFAULT_RUN)
     parser.add_argument("--raw-root", default=RAW_ROOT)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--zcatalog", type=Path,
+                        help="Read this local summary in place; defaults to RAW_ROOT/zall-pix-iron.fits")
+    source.add_argument("--download-zcatalog-v1", action="store_true",
+                        help="Explicitly opt into downloading the official corrected v1 summary")
     parser.add_argument("--shards", type=int, default=8)
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--workers", type=int, default=16)
@@ -526,7 +559,7 @@ def main(argv=None):
     run.mkdir(parents=True, exist_ok=True)
     with FileLock(str(run / f".{args.stage}-{args.shard if args.stage == 'scatter' else 0}.lock"), timeout=0):
         if args.stage == "prepare":
-            prepare(run, raw, args.shards, args.max_groups)
+            prepare(run, raw, args.shards, args.max_groups, args.zcatalog, args.download_zcatalog_v1)
         elif args.stage == "scatter":
             scatter(run, raw, args.shard, args.workers)
         else:

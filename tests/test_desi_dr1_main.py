@@ -91,8 +91,7 @@ def fixture_plan(tmp_path, monkeypatch, *, missing=False, duplicate=False):
     cat["ZWARN"][1] = 4
     if duplicate:
         cat["TARGETID"][1] = cat["TARGETID"][0]
-    zcat = run / "inputs/zall-pix-iron-v1.fits"
-    zcat.parent.mkdir()
+    zcat = raw / "zall-pix-iron.fits"
     fits.HDUList([fits.PrimaryHDU(), fits.BinTableHDU(Table(cat))]).writeto(zcat)
     receipt = {"url": build.ZCAT_URL, "sha256": build.digest(zcat)}
     monkeypatch.setattr(build, "fetch_catalog", lambda root: (zcat, receipt))
@@ -100,6 +99,41 @@ def fixture_plan(tmp_path, monkeypatch, *, missing=False, duplicate=False):
         for program in ("bright", "dark"):
             (raw / f"coadd-main-{program}-1001.fits").touch()
     return run, raw, cat
+
+
+def test_local_default_never_downloads_or_copies(tmp_path, monkeypatch):
+    import requests
+    run, raw, _ = fixture_plan(tmp_path, monkeypatch)
+    source = raw / "zall-pix-iron.fits"
+    original = source.read_bytes()
+    fail = lambda *a, **kw: pytest.fail("Local preparation attempted network/download")
+    monkeypatch.setattr(build, "fetch_catalog", fail)
+    monkeypatch.setattr(requests, "head", fail)
+    monkeypatch.setattr(build.subprocess, "run", fail)
+    build.prepare(run, raw, 2)
+    plan = build.read_json(run / "plan.json")
+    assert plan["catalog"]["path"] == str(source)
+    assert plan["catalog"]["source"] == "local"
+    assert plan["catalog"]["catalog_version"] == "unverified"
+    assert source.read_bytes() == original
+    assert not (run / "inputs").exists()
+    build.prepare(run, raw, 2)  # Resume also uses the original local source.
+
+
+def test_explicit_local_catalog_path(tmp_path, monkeypatch):
+    run, raw, _ = fixture_plan(tmp_path, monkeypatch)
+    alternative = tmp_path / "other-local.fits"
+    (raw / "zall-pix-iron.fits").rename(alternative)
+    build.prepare(run, raw, 2, zcatalog=alternative)
+    assert build.read_json(run / "plan.json")["catalog"]["path"] == str(alternative)
+
+
+def test_missing_local_catalog_is_not_an_implicit_download(tmp_path, monkeypatch):
+    run, raw, _ = fixture_plan(tmp_path, monkeypatch)
+    (raw / "zall-pix-iron.fits").unlink()
+    monkeypatch.setattr(build, "fetch_catalog", lambda *a: pytest.fail("Unexpected download"))
+    with pytest.raises(FileNotFoundError, match="No download attempted"):
+        build.prepare(run, raw, 2)
 
 
 def test_preflight_rejects_missing_files(tmp_path, monkeypatch):
@@ -201,6 +235,8 @@ def test_real_fits_to_validated_hats(tmp_path, monkeypatch, fully_mask_dark):
     build.gather(run, workers=1, debug=True)
     report = build.read_json(run / "validation.json")
     assert report["status"] == "PASS"
+    assert report["catalog_version"] == "unverified"
+    assert report["source_warnings"]
     assert report["rows"] == (2 if fully_mask_dark else 3)
     assert report["quality"]["all_masked_rejected"] == (2 if fully_mask_dark else 1)
     assert report["quality"]["good_redshift_rows"] == (1 if fully_mask_dark else 2)
@@ -244,6 +280,7 @@ def test_launcher_slurm_dry_run_preserves_requested_threads(tmp_path):
     bin_dir, raw = tmp_path / "bin", tmp_path / "raw"
     bin_dir.mkdir()
     raw.mkdir()
+    (raw / "zall-pix-iron.fits").touch()  # Launcher only checks existence in dry-run.
     sbatch = bin_dir / "sbatch"
     sbatch.write_text("#!/bin/sh\nexit 99\n")  # Must never be invoked in dry-run.
     sbatch.chmod(0o755)
