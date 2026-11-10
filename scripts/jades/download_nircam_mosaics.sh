@@ -20,11 +20,12 @@ SOUTH=(f070w f090w f115w f150w f162m f182m f200w f210m f250m f277w f300m f335m f
 NORTH=(f070w f090w f115w f150w f162m f182m f200w f210m f277w f300m f335m f356w f410m f430m f444w f460m)
 declare -a NAMES URLS DESTS SIZES PIDS STATES
 declare -A PID_TO_INDEX
+INDEX=0
 mkdir -p "$LOG"
 stop_children() {
   trap - INT TERM
-  for pid in "${PIDS[@]}"; do [[ -z "${pid:-}" ]] || kill "$pid" 2>/dev/null || true; done
-  for pid in "${PIDS[@]}"; do [[ -z "${pid:-}" ]] || wait "$pid" 2>/dev/null || true; done
+  for pid in "${PIDS[@]-}"; do [[ -z "${pid:-}" ]] || kill "$pid" 2>/dev/null || true; done
+  for pid in "${PIDS[@]-}"; do [[ -z "${pid:-}" ]] || wait "$pid" 2>/dev/null || true; done
 }
 on_interrupt() {
   printf '\nInterrupted. Stopping active downloads; rerun to resume.\n' >&2
@@ -43,7 +44,8 @@ for FIELD in GOODS-S GOODS-N; do
     DEST="$RAW/mosaics/$FIELD/$FILENAME"
     SIZE=$(curl -fsSI --max-time 60 "$URL" | awk 'tolower($1)=="content-length:" {gsub("\r", "", $2); print $2}' | tail -n 1)
     if [[ ! "$SIZE" =~ ^[1-9][0-9]*$ ]]; then echo "ERROR: missing Content-Length: $FIELD $BAND" >&2; exit 1; fi
-    i=${#NAMES[@]}
+    i=$INDEX
+    INDEX=$((INDEX + 1))
     NAMES[i]="$FIELD $BAND"; URLS[i]="$URL"; DESTS[i]="$DEST"; SIZES[i]="$SIZE"
     PIDS[i]=""; STATES[i]="pending"
     local_size=0
@@ -52,7 +54,7 @@ for FIELD in GOODS-S GOODS-N; do
     if (( local_size == SIZE )); then STATES[i]="done"; fi
   done
 done
-TOTAL=${#NAMES[@]}
+TOTAL=$INDEX
 TOTAL_BYTES=0
 BASELINE=0
 for ((i=0; i<TOTAL; i++)); do
@@ -96,7 +98,8 @@ while :; do
     field=${NAMES[i]%% *}; band=${NAMES[i]#* }
     log_file="$LOG/${field}_${band}.log"
     echo "START ${NAMES[i]} — $log_file"
-    wget --continue --tries=20 --timeout=120 --progress=dot:giga \
+    # 20 MiB/s per transfer: even 8 concurrent jobs remain < 200 MB/s total.
+    wget --continue --tries=20 --timeout=120 --limit-rate=20m --progress=dot:giga \
       --output-document="${DESTS[i]}" "${URLS[i]}" >> "$log_file" 2>&1 &
     pid=$!; PIDS[i]="$pid"; PID_TO_INDEX[$pid]=$i; STATES[i]="running"
     running=$((running + 1))
