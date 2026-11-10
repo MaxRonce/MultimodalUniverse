@@ -66,13 +66,15 @@ overlapping products should be deduplicated during manifest review.
 ### Download all NIRCam DR5 mosaics with live progress
 
 The standalone downloader handles the 34 global NIRCam GOODS-S/GOODS-N
-mosaics with a visible `wget` progress bar, a `[file/34]` counter, and
-per-band logs. It resumes existing `.fits` files from previous `wget -c`
-runs, compares each final size to HTTP `Content-Length`, and reports success
-only after all 34 are complete. It does **not** fetch MIRI or HST products.
+mosaics with **four simultaneous transfers** by default. Every 10 seconds it
+prints total bytes, global percentage, aggregate transfer rate, estimated time
+remaining, and progress of each active band. Each transfer has its own log.
+It resumes existing `.fits` files from previous `wget -c` runs, compares each
+final size to HTTP `Content-Length`, and reports success only after all 34
+are complete. It does **not** fetch MIRI or HST products.
 
 ```bash
-bash scripts/jades/download_nircam_mosaics.sh
+bash scripts/jades/download_nircam_mosaics.sh --jobs 4
 # To override locations:
 # RAW=/path/to/JADES_DR5 LOG=/path/to/logs bash scripts/jades/download_nircam_mosaics.sh
 ```
