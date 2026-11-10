@@ -63,6 +63,26 @@ overlapping products should be deduplicated during manifest review.
 
 ## Commands
 
+### Download all NIRCam DR5 mosaics with live progress
+
+The standalone downloader handles the 34 global NIRCam GOODS-S/GOODS-N
+mosaics with a visible `wget` progress bar, a `[file/34]` counter, and
+per-band logs. It resumes existing `.fits` files from previous `wget -c`
+runs, compares each final size to HTTP `Content-Length`, and reports success
+only after all 34 are complete. It does **not** fetch MIRI or HST products.
+
+```bash
+bash scripts/jades/download_nircam_mosaics.sh
+# To override locations:
+# RAW=/path/to/JADES_DR5 LOG=/path/to/logs bash scripts/jades/download_nircam_mosaics.sh
+```
+
+Run it in `tmux` or another persistent session. The current HTTP mirror is
+not authenticated; verify provider-supplied checksums when available. A size
+match alone is not a cryptographic integrity check.
+
+### Manifest-pinned downloader
+
 Run on the Flatiron/JADES-enabled processing environment with MMU v2
 dependencies installed. The first command downloads the pinned inputs;
 partial downloads resume if the HTTP server supports range requests.
