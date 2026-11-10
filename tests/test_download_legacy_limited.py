@@ -38,6 +38,9 @@ class Bar:
     def refresh(self):
         pass
 
+    def write(self, message):
+        pass
+
     def set_postfix_str(self, *args, **kwargs):
         pass
 
@@ -114,6 +117,83 @@ class LimitedTests(unittest.TestCase):
             self.assertEqual(len(rates), 8)
             self.assertEqual(Bar.instances[-1].n, 8)
             self.assertTrue(all((directory / f["path"]).is_file() for f in files))
+
+
+    def test_resolver_url_changes_but_revision_and_path_stay_pinned(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        plan = {"revision": "a" * 40}
+        entry = {"path": "dataset/Npix=123.parquet"}
+        first = urlsplit(dl.transfer_url(plan, entry))
+        second = urlsplit(dl.transfer_url(plan, entry))
+        self.assertEqual(first.path, second.path)
+        self.assertIn(plan["revision"], first.path)
+        self.assertEqual(parse_qs(first.query)["download"], ["true"])
+        self.assertNotEqual(first.query, second.query)
+
+    def test_retry_gets_fresh_url_and_keeps_resume_and_cap(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root) / "sample.parquet"
+            partial = Path(str(target) + ".curl.incomplete")
+            partial.write_bytes(b"abcd")
+            failed, succeeded = Mock(), Mock()
+            failed.wait.return_value = 22
+
+            def finish(timeout=None):
+                partial.write_bytes(b"abcdefghijkl")
+                return 0
+
+            succeeded.wait.side_effect = finish
+            cancelled = Mock()
+            cancelled.is_set.return_value = False
+            cancelled.wait.return_value = False
+            with patch.object(dl, "HfApi"), \
+                    patch.object(dl, "get_token", return_value="fake-token"), \
+                    patch.object(dl.subprocess, "Popen", side_effect=[failed, succeeded]) as launch:
+                dl.download("curl", {"revision": "a" * 40},
+                            {"path": "sample.parquet", "size": 12},
+                            target, Bar(12, initial=4), 4,
+                            rate=50_000_000, cancelled=cancelled)
+            commands = [call.args[0] for call in launch.call_args_list]
+            self.assertNotEqual(commands[0][-1], commands[1][-1])
+            for command in commands:
+                self.assertIn("--continue-at", command)
+                self.assertEqual(command[command.index("--limit-rate") + 1], "50000000")
+                self.assertNotIn("fake-token", " ".join(command))
+            self.assertEqual(target.read_bytes(), b"abcdefghijkl")
+
+    def test_keep_going_records_failure_and_downloads_other_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / dl.REPO
+            directory.mkdir(parents=True)
+            files = [{"path": "bad.parquet", "size": 1},
+                     {"path": "good.parquet", "size": 1}]
+            (directory / ".hf-download-manifest.json").write_text(json.dumps({
+                "repo_id": dl.REPO, "revision": "a" * 40, "files": files
+            }))
+            visited = []
+
+            def fake_download(curl, plan, entry, target, progress, initial, rate, cancelled):
+                visited.append(entry["path"])
+                if entry["path"] == "bad.parquet":
+                    raise dl.TransferFailed("HTTP error")
+                target.write_bytes(b"x")
+                progress.update(1)
+
+            args = SimpleNamespace(root=Path(root), run=True, workers=1,
+                                   unlimited=False, keep_going=True)
+            with patch.object(dl.shutil, "which", return_value="curl"), \
+                    patch.object(dl, "tqdm", Bar), \
+                    patch.object(dl, "download", side_effect=fake_download), \
+                    redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "encore incomplet"):
+                    dl.run(args)
+            self.assertEqual(visited, ["bad.parquet", "good.parquet"])
+            self.assertTrue((directory / "good.parquet").is_file())
+            self.assertFalse((directory / "bad.parquet").exists())
+            failure = json.loads((directory / ".curl-failures.json").read_text())
+            self.assertEqual([f["path"] for f in failure["files"]], ["bad.parquet"])
+            self.assertEqual(Bar.instances[-1].n, 1)
 
 
 if __name__ == "__main__":

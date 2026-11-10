@@ -20,12 +20,24 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 
 from huggingface_hub import HfApi, get_token, hf_hub_url
 from tqdm import tqdm
 
 REPO = "hugging-science/mmu_legacysurvey_dr10_south_21"
 RATE = 100_000_000
+
+
+class TransferFailed(RuntimeError):
+    """Retries exhausted for one file; other files may still be accessible."""
+
+
+def transfer_url(plan, entry):
+    # A fresh resolver request avoids reusing an expired cached signed redirect.
+    # The immutable revision and destination path stay unchanged.
+    return hf_hub_url(REPO, filename=entry["path"], repo_type="dataset",
+                      revision=plan["revision"]) + "?download=true&mmu_retry=" + uuid.uuid4().hex
 
 
 def stop(*_):
@@ -98,6 +110,15 @@ def run(args):
             tasks = iter(pending)
             task_lock = threading.Lock()
             cancelled = threading.Event()
+            failures = []
+            failure_path = directory / ".curl-failures.json"
+
+            def save_failures():
+                temporary = failure_path.with_suffix(".json.tmp")
+                temporary.write_text(json.dumps({
+                    "repo_id": REPO, "revision": plan["revision"], "files": failures
+                }, indent=2) + "\n")
+                temporary.replace(failure_path)
 
             def worker():
                 nonlocal count
@@ -107,8 +128,17 @@ def run(args):
                     if task is None:
                         return
                     entry, target, initial_partial = task
-                    download(curl, plan, entry, target, progress, initial_partial,
-                             rate=rate, cancelled=cancelled)
+                    try:
+                        download(curl, plan, entry, target, progress, initial_partial,
+                                 rate=rate, cancelled=cancelled)
+                    except TransferFailed as error:
+                        if not getattr(args, "keep_going", False):
+                            raise
+                        with task_lock:
+                            failures.append({**entry, "error": str(error)})
+                            save_failures()
+                        progress.write(f"Fichier laisse incomplet : {entry['path']}")
+                        continue
                     with tqdm.get_lock():
                         count += 1
                         progress.set_postfix_str(f"{count}/{total} fichiers", refresh=True)
@@ -125,6 +155,12 @@ def run(args):
                 raise
             finally:
                 pool.shutdown(wait=True, cancel_futures=True)
+        # A run with skipped failures must never be reported as complete.
+        if failures:
+            raise RuntimeError(f"{len(failures)} fichier(s) encore incomplet(s). "
+                               f"Liste : {failure_path}. Relancer pour les retenter.")
+        if failure_path.exists():
+            failure_path.unlink()
         print("Termine : presences et tailles verifiees, sans checksum.", flush=True)
 
 
@@ -169,10 +205,9 @@ def download(curl, plan, entry, target, progress, initial_partial, rate=RATE, ca
             raise RuntimeError("Login requis : hf auth login")
         if "\n" in token or "\r" in token:
             raise RuntimeError("Token invalide.")
-        url = hf_hub_url(REPO, filename=entry["path"],
-                         repo_type="dataset", revision=plan["revision"])
+        url = transfer_url(plan, entry)
         with tempfile.NamedTemporaryFile(mode="w", prefix="hf-header-", encoding="utf-8") as headers:
-            headers.write("Authorization: Bearer " + token + "\n")
+            headers.write("Authorization: Bearer " + token + "\nCache-Control: no-cache\n")
             headers.flush()
             command = [
                 curl, "--disable", "--silent", "--show-error", "--fail", "--location", "--globoff",
@@ -207,12 +242,12 @@ def download(curl, plan, entry, target, progress, initial_partial, rate=RATE, ca
             partial.replace(target)
             return
         if attempt < 5:
-            progress.write(f"Echec curl ({result}), nouvelle tentative dans 30 s.")
+            progress.write(f"Echec curl ({result}) : {entry['path']}, nouvelle tentative dans 30 s.")
             if cancelled is None:
                 time.sleep(30)
             elif cancelled.wait(30):
                 raise InterruptedError("Transfert arrete.")
-    raise RuntimeError(f"Telechargement incomplet : {entry['path']}. "
+    raise TransferFailed(f"Telechargement incomplet : {entry['path']}. "
                        "Verifier le login, le quota et la connexion avant de reprendre.")
 
 
@@ -221,6 +256,9 @@ if __name__ == "__main__":
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--run", action="store_true",
                         help="Telecharger ; sans cette option, inventaire local uniquement.")
+    parser.add_argument("--keep-going", action="store_true",
+                        help="Poursuivre les autres fichiers apres epuisement des tentatives ; "
+                             "enregistrer les echecs dans .curl-failures.json.")
     parser.add_argument("--unlimited", action="store_true",
                         help="Retirer le plafond curl pour tous les transferts selectionnes.")
     parser.add_argument("--workers", type=int, choices=[1, 2, 4], default=1,
