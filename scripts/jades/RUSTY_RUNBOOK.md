@@ -14,8 +14,52 @@ export JADES_RUN=/mnt/ceph/users/polymathic/mronceray/jades_dr5_runs
 mkdir -p "$JADES_RUN"
 ```
 
-Run long builds in `tmux new -s jades-build`. Reattach later with
-`tmux attach -t jades-build`; detach with `Ctrl+B`, then `D`.
+## 0a. Reserve a Rusty CPU worker inside tmux (Slurm)
+
+Do not run the image extraction on a `rusty` login node. If one is already
+running there, interrupt it with `Ctrl+C`; its existing committed Parquet
+checkpoints remain reusable with the **same** command and scratch directory.
+
+Start or reattach a tmux session on the login node:
+
+```bash
+tmux new -s jades-build
+# If it already exists, instead use: tmux attach -t jades-build
+```
+
+**Inside tmux**, request an interactive compute shell through Slurm:
+
+```bash
+command -v srun || module load slurm
+sinfo -p genx -o '%P %a %l %D %C'
+srun --job-name=jades-dr5 --partition=genx \
+  --nodes=1 --ntasks=1 --cpus-per-task=4 \
+  --mem=32G --time=04:00:00 --pty bash -l
+```
+
+Wait for the allocation, then verify that `hostname` is a **compute** node,
+not `rusty1`–`rusty4`, and that `SLURM_JOB_ID` is set:
+
+```bash
+hostname
+echo "$SLURM_JOB_ID"
+cd /mnt/ceph/users/polymathic/mronceray/MultimodalUniverse-jades
+export JADES_RAW=/mnt/ceph/users/polymathic/external_data/Astro/JADES_DR5
+export JADES_RUN=/mnt/ceph/users/polymathic/mronceray/jades_dr5_runs
+command -v uv
+```
+
+If `srun` rejects `genx`, account, memory or wall time, inspect the actual
+Slurm error and available partitions before changing resource flags. The
+interactive allocation lasts at most four hours; resume the identical
+checkpointed command in a new allocation if the limit expires. **No GPU** is
+needed. The image extraction is currently mostly serial, so reserving four
+CPUs does not itself create four Python image workers; moving from login to a
+compute node is the first goal. Profile real I/O before attempting parallelism.
+
+Detach with `Ctrl+B`, then `D`; reattach from a new login shell with
+`tmux attach -t jades-build`. To release the allocation deliberately, run
+`exit` from the compute shell.
 
 If Rusty `uv` reports that the project SCM version cannot be determined, use
 `SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 uv run ...` with the same command.
