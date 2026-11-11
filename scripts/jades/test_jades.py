@@ -13,9 +13,12 @@ from scripts.jades.build_parent_sample_hats import (
     JWST_BANDS,
     apparent_mag_from_njy,
     flux_conversion,
+    _pixel_cutout,
     process_field,
     variance_to_ivar,
 )
+from scripts.jades.make_manifest import make_manifest
+from scripts.jades.inspect_cutouts import inspect
 
 
 def test_real_inverse_variance_only():
@@ -91,3 +94,124 @@ def test_snr_and_cutouts(tmp_path):
     assert image["band"] == ["F277W"]
     assert image["ivar"][0][0][0] == pytest.approx(0.25)
     assert process_field("GOODS-S", catalog, entries, tmp_path, scratch, 1, None) == 2
+
+
+def test_native_cutout_matches_astropy_partial_edges():
+    from astropy.nddata import Cutout2D
+
+    data = np.arange(200, dtype=np.float32).reshape(10, 20)
+    for x, y in [(0, 0), (0.5, 3.5), (5, 5), (18.9, 9), (19.5, 1.1)]:
+        actual = _pixel_cutout(data, x, y, np.nan, 6)
+        expected = Cutout2D(data, (x, y), (6, 6), mode="partial", fill_value=np.nan).data
+        np.testing.assert_allclose(actual, expected, equal_nan=True)
+    assert _pixel_cutout(data, -20, 5, np.nan, 6) is None
+
+
+def test_miri_photometry_mosaic_overlap_photoz_and_checkpoint(tmp_path):
+    catalog = tmp_path / "catalog.fits"
+    _catalog(catalog)
+    ids = fits.Column(name="ID", format="J", array=np.array([1, 2], dtype=np.int32))
+    with fits.open(catalog, mode="update") as hdus:
+        hdus.append(fits.BinTableHDU.from_columns([
+            ids,
+            fits.Column(name="F770W_CIRC3", format="E", array=[101., 202.]),
+            fits.Column(name="F770W_CIRC3_e", format="E", array=[4., 5.]),
+        ], name="MIRI"))
+        hdus.append(fits.BinTableHDU.from_columns([
+            ids,
+            fits.Column(name="z_spec", format="E", array=[5.1, -99.]),
+            fits.Column(name="z_peak", format="E", array=[5.2, 4.7]),
+        ], name="PHOTOZ"))
+    entries = []
+    for i, sigma in enumerate((4., 1.)):
+        path = tmp_path / f"miri{i}.fits"
+        fits.HDUList([
+            fits.PrimaryHDU(),
+            fits.ImageHDU(np.full((200, 200), 3 + i, np.float32), _wcs().to_header(), name="SCI"),
+            fits.ImageHDU(np.full((200, 200), sigma, np.float32), name="ERR"),
+        ]).writeto(path)
+        entries.append({"path": path.name, "field": "GOODS-S", "band": "F770W",
+                        "sci_hdu": "SCI", "uncertainty_hdu": "ERR",
+                        "uncertainty_kind": "sigma", "unit": "nJy"})
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    assert process_field("GOODS-S", catalog, entries, tmp_path, scratch,
+                         chunk_size=1, max_objects=2, rows_per_file=1, image_size=8) == 2
+    import pyarrow.parquet as pq
+    first = pq.read_table(scratch / "GOODS-S_00000.parquet").to_pylist()[0]
+    assert first["image"]["band"] == ["F770W"]
+    assert first["image_sources"] == ["miri1.fits"]
+    assert first["photometry"]["flux_circ3_njy"] == [101.0]
+    assert first["photometry"]["flux_err_circ3_njy"] == [4.0]
+    assert first["image"]["ivar"][0][0][0] == pytest.approx(1.)
+    assert first["redshift"]["z_peak"] == pytest.approx(5.2)
+    second = pq.read_table(scratch / "GOODS-S_00001.parquet").to_pylist()[0]
+    assert np.isnan(second["redshift"]["z_spec"])
+
+    # Simulate a crash after the first committed Parquet shard: the second is
+    # present but not checkpointed, and must be safely rebuilt on resume.
+    (scratch / "GOODS-S.done").unlink()
+    progress = scratch / "GOODS-S.progress.json"
+    checkpoint = json.loads(progress.read_text())
+    checkpoint.update(next_index=1, next_shard=1, count=1)
+    progress.write_text(json.dumps(checkpoint))
+    assert process_field("GOODS-S", catalog, entries, tmp_path, scratch,
+                         chunk_size=1, max_objects=2, rows_per_file=1, image_size=8) == 2
+    assert len(list(scratch.glob("GOODS-S_*.parquet"))) == 2
+    with pytest.raises(ValueError, match="configuration differs"):
+        process_field("GOODS-S", catalog, entries, tmp_path, scratch,
+                      chunk_size=1, max_objects=1, rows_per_file=1, image_size=8)
+    report, _ = inspect(scratch)
+    assert report["total_objects"] == 2
+    assert report["sample_band_occurrences"]["F770W"] == 2
+
+
+def test_miri_focused_sample_filters_catalog_exposures(tmp_path):
+    catalog = tmp_path / "catalog.fits"
+    _catalog(catalog)
+    with fits.open(catalog, mode="update") as hdus:
+        old_flag = hdus["FLAG"]
+        columns = old_flag.columns + fits.ColDefs([
+            fits.Column(name="F770W_TEXP", format="E", array=[0., 100.])])
+        hdus["FLAG"] = fits.BinTableHDU.from_columns(columns, name="FLAG")
+    mosaic = tmp_path / "miri.fits"
+    fits.HDUList([
+        fits.PrimaryHDU(),
+        fits.ImageHDU(np.ones((200, 200), np.float32), _wcs().to_header(), name="SCI"),
+        fits.ImageHDU(np.ones((200, 200), np.float32), name="ERR"),
+    ]).writeto(mosaic)
+    scratch = tmp_path / "scratch_miri"
+    scratch.mkdir()
+    entries = [{"field": "GOODS-S", "band": "F770W", "path": "miri.fits",
+                "sci_hdu": "SCI", "uncertainty_hdu": "ERR",
+                "uncertainty_kind": "sigma", "unit": "nJy"}]
+    assert process_field("GOODS-S", catalog, entries, tmp_path, scratch,
+                         chunk_size=1, max_objects=1, image_size=8,
+                         sample_mode="miri") == 1
+    import pyarrow.parquet as pq
+    row = pq.read_table(scratch / "GOODS-S_00000.parquet").to_pylist()[0]
+    assert row["object_id"] == "GOODS-S:2"
+
+
+def test_manifest_detects_correct_products_and_requires_complete_set(tmp_path):
+    for field in ("GOODS-S", "GOODS-N"):
+        folder = tmp_path / "catalogs"
+        folder.mkdir(exist_ok=True)
+        (folder / f"{field}.fits").write_bytes(b"catalog-placeholder")
+    folder = tmp_path / "mosaics" / "GOODS-S"
+    folder.mkdir(parents=True)
+    filename = "hlsp_jades_jwst_nircam_goods-s_f277w_v5.0_drz.fits"
+    header = _wcs().to_header()
+    header["BUNIT"] = "MJy/sr"
+    header["PIXAR_SR"] = 1e-14
+    fits.HDUList([
+        fits.PrimaryHDU(),
+        fits.ImageHDU(np.ones((10, 10), np.float32), header, name="SCI"),
+        fits.ImageHDU(np.ones((10, 10), np.float32), fits.Header({"BUNIT": "MJy/sr"}), name="ERR"),
+    ]).writeto(folder / filename)
+    manifest = make_manifest(tmp_path, allow_partial=True)
+    assert len(manifest["catalogs"]) == 2
+    assert manifest["mosaics"][0]["band"] == "F277W"
+    assert manifest["mosaics"][0]["uncertainty_kind"] == "sigma"
+    with pytest.raises(ValueError, match="Unexpected input counts"):
+        make_manifest(tmp_path)
