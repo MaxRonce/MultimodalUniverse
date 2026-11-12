@@ -59,7 +59,8 @@ class LimitedTests(unittest.TestCase):
 
             child.wait.side_effect = finish
             progress = Bar(total=12, initial=4)
-            with patch.object(dl, "HfApi"), patch.object(dl, "get_token", return_value="fake-token"), \
+            with patch("huggingface_hub.HfApi.whoami",
+                       side_effect=AssertionError("Unexpected /whoami-v2 call")) as whoami, patch.object(dl, "get_token", return_value="fake-token"), \
                     patch.object(dl.subprocess, "Popen", return_value=child) as launch:
                 dl.download("curl", {"revision": "a" * 40}, {"path": "sample.parquet", "size": 12},
                             target, progress, 4, rate=50_000_000)
@@ -69,6 +70,7 @@ class LimitedTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"abcdefghijkl")
             self.assertFalse(partial.exists())
             launch.assert_called_once()
+            whoami.assert_not_called()
 
     def test_cancellation_does_not_start_another_transfer(self):
         cancelled = threading.Event()
@@ -147,13 +149,16 @@ class LimitedTests(unittest.TestCase):
             cancelled = Mock()
             cancelled.is_set.return_value = False
             cancelled.wait.return_value = False
-            with patch.object(dl, "HfApi"), \
-                    patch.object(dl, "get_token", return_value="fake-token"), \
+            with patch("huggingface_hub.HfApi.whoami",
+                       side_effect=AssertionError("Unexpected /whoami-v2 call")) as whoami, \
+                    patch.object(dl, "get_token", side_effect=["fake-token-1", "fake-token-2"]) as token, \
                     patch.object(dl.subprocess, "Popen", side_effect=[failed, succeeded]) as launch:
                 dl.download("curl", {"revision": "a" * 40},
                             {"path": "sample.parquet", "size": 12},
                             target, Bar(12, initial=4), 4,
                             rate=50_000_000, cancelled=cancelled)
+            whoami.assert_not_called()
+            self.assertEqual(token.call_count, 2)
             commands = [call.args[0] for call in launch.call_args_list]
             self.assertNotEqual(commands[0][-1], commands[1][-1])
             for command in commands:
@@ -194,6 +199,20 @@ class LimitedTests(unittest.TestCase):
             failure = json.loads((directory / ".curl-failures.json").read_text())
             self.assertEqual([f["path"] for f in failure["files"]], ["bad.parquet"])
             self.assertEqual(Bar.instances[-1].n, 1)
+
+
+    def test_missing_token_stops_before_starting_curl(self):
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(dl, "get_token", return_value=None), \
+                patch("huggingface_hub.HfApi.whoami",
+                      side_effect=AssertionError("Unexpected /whoami-v2 call")) as whoami, \
+                patch.object(dl.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(RuntimeError, "Login requis"):
+                dl.download("curl", {"revision": "a" * 40},
+                            {"path": "sample.parquet", "size": 12},
+                            Path(root) / "sample.parquet", Bar(12), 0)
+        launch.assert_not_called()
+        whoami.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 
-from huggingface_hub import HfApi, get_token, hf_hub_url
+from huggingface_hub import get_token, hf_hub_url
 from tqdm import tqdm
 
 REPO = "hugging-science/mmu_legacysurvey_dr10_south_21"
@@ -197,9 +197,9 @@ def download(curl, plan, entry, target, progress, initial_partial, rate=RATE, ca
             if partial.stat().st_size == expected:
                 partial.replace(target)
                 return
-        # whoami lets the Hub manage OAuth refresh before retrieving the token.
-        # Authorization is stored in a private temporary file, not process arguments.
-        HfApi(token=True).whoami()
+        # get_token() refreshes browser OAuth credentials when needed.
+        # Do not call /whoami-v2 per file or retry: it is strictly rate-limited.
+        # Re-read the token each attempt, and keep it out of process arguments.
         token = get_token()
         if not token:
             raise RuntimeError("Login requis : hf auth login")
