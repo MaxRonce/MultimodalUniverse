@@ -1,7 +1,8 @@
 """Build a JADES DR5 image + photometry HATS catalog from pinned FITS inputs.
 
 The JSON input manifest declares one catalogue per GOODS field and one or more
-non-overlapping mosaics per (field, band).  Each mosaic explicitly declares the
+mosaics per (field, band), including overlapping MIRI parallel pointings.
+Each mosaic explicitly declares the
 SCI and real variance/ERR/IVAR HDUs.  No synthetic inverse variance is allowed.
 Run ``download_data.py`` first or pass ``--download`` for the full workflow.
 """
@@ -13,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -29,6 +31,10 @@ from scripts.jades.download_data import fetch_manifest
 
 DEFAULT_ROOT = Path(RAW_DATA_ROOT) / "JADES_DR5"
 IMAGE_SIZE = 160
+SCHEMA_VERSION = "jades-v2-multimodal-2"
+MIRI_BANDS = {
+    "F560W", "F770W", "F1000W", "F1280W", "F1500W", "F1800W", "F2100W", "F2550W",
+}
 JWST_BANDS = {
     "F070W", "F090W", "F115W", "F150W", "F162M", "F182M", "F200W", "F210M",
     "F250M", "F277W", "F300M", "F335M", "F356W", "F410M", "F430M", "F444W",
@@ -36,6 +42,79 @@ JWST_BANDS = {
     "F1800W", "F2100W", "F2550W",
 }
 HST_BANDS = {"F435W", "F606W", "F775W", "F814W", "F850LP", "F105W", "F125W", "F140W", "F160W"}
+
+# EAZY photo-z products in both JADES DR5 PHOTOZ (native CIRC1) and
+# PHOTOZ_KRON (common-PSF Kron) HDUs. z_spec is *not* a photo-z.
+PHOTOZ_SCALAR_FIELDS = (
+    "z_a", "z_ml", "chi_a", "l68", "u68", "l95", "u95", "l99", "u99",
+    "nfilt", "z_peak", "chi_peak", "z025", "z160", "z500", "z840", "z975",
+    "prob_gt_5", "prob_gt_6", "prob_gt_7", "prob_gt_8", "prob_gt_9",
+    "chisq_z_lt_7", "z_chisq_z_lt_7", "chisq_z_lt_6", "z_chisq_z_lt_6",
+    "chisq_z_lt_5", "z_chisq_z_lt_5", "chisq_z_lt_4", "z_chisq_z_lt_4",
+)
+PHOTOZ_ARRAY_FIELDS = ("z_bins", "prob_z_bins")
+PHOTOZ_FIELDS = PHOTOZ_SCALAR_FIELDS + PHOTOZ_ARRAY_FIELDS
+
+
+def _band_sort_key(band: str) -> tuple[int, str]:
+    return int(re.search(r"\d+", band).group()), band
+
+
+def _column_key(name: str) -> str:
+    """Match FITS column spelling/case while keeping output names stable."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _column_views(table, requested: tuple[str, ...] | list[str]) -> dict[str, np.ndarray]:
+    """Create zero-copy views only for required FITS columns, once per field."""
+    if table is None:
+        return {}
+    actual = {_column_key(name): name for name in table.names}
+    return {_column_key(name): table[actual[_column_key(name)]]
+            for name in requested if _column_key(name) in actual}
+
+
+def _value(columns: dict[str, np.ndarray], name: str, index: int,
+           *, nonnegative: bool = False, positive: bool = False) -> float | None:
+    values = columns.get(_column_key(name))
+    if values is None:
+        return None
+    value = float(values[index])
+    if not np.isfinite(value) or (nonnegative and value < 0) or (positive and value <= 0):
+        return None
+    return value
+
+
+def _photoz_record(columns: dict[str, np.ndarray], index: int) -> dict:
+    values = {name: _value(columns, name, index, nonnegative=True)
+              for name in PHOTOZ_SCALAR_FIELDS}
+    for name in PHOTOZ_ARRAY_FIELDS:
+        column = columns.get(_column_key(name))
+        if column is None:
+            values[name] = None
+        else:
+            array = np.asarray(column[index], dtype=np.float32).ravel()
+            values[name] = [float(v) if np.isfinite(v) else None for v in array]
+    return values
+
+
+def _photometry_record(index: int, bands: tuple[str, ...],
+                       circ: dict, kron: dict, kron_conv: dict, miri: dict) -> dict:
+    values = {}
+    for band in bands:
+        for method in ("circ3", "kron", "kron_conv"):
+            if method == "kron_conv" and band in MIRI_BANDS:
+                continue
+            columns = (miri if band in MIRI_BANDS else
+                       circ if method == "circ3" else
+                       kron if method == "kron" else kron_conv)
+            fits_name = f"{band}_{method.upper() if method != 'kron_conv' else 'KRON'}"
+            for suffix, measure in (("", "flux"), ("_e", "err")):
+                # KRON_CONV is an HDU; the column name still ends in _KRON.
+                value = _value(columns, fits_name + suffix, index,
+                               positive=(measure == "err"))
+                values[f"phot_{band.lower()}_{method}_{measure}_njy"] = value
+    return values
 
 
 def apparent_mag_from_njy(flux):
@@ -151,10 +230,16 @@ def _open_mosaics(stack: ExitStack, entries: list[dict], raw_root: Path) -> list
             raise ValueError(f"No SCI unit for {entry['path']}")
         scale = flux_conversion(science.header, unit)
         wcs = WCS(science.header)
+        psf_fwhm = entry.get("psf_fwhm_arcsec")
+        if psf_fwhm is not None:
+            psf_fwhm = float(psf_fwhm)
+            if not np.isfinite(psf_fwhm) or psf_fwhm <= 0:
+                raise ValueError(f"Invalid psf_fwhm_arcsec for {entry['path']}: {psf_fwhm}")
         # Store the raw FITS arrays; process only the requested cutouts.
         mosaics.append({"band": entry["band"].upper(), "sci": science.data,
                         "uncertainty": uncertainty.data, "kind": entry["uncertainty_kind"],
                         "wcs": wcs, "path": entry["path"], "flux_scale": scale,
+                        "psf_fwhm_arcsec": psf_fwhm,
                         "scale_arcsec": float(np.mean(np.abs(proj_plane_pixel_scales(wcs.celestial))) * 3600)})
     return mosaics
 
@@ -167,16 +252,11 @@ def _prepare_positions(mosaics: list[dict], size, selected_indices: np.ndarray) 
         mosaic["x"], mosaic["y"] = mosaic["wcs"].all_world2pix(ra, dec, 0)
 
 
-def _catalog_photoz(photoz, index: int) -> dict:
-    result = {}
-    for name in ("z_spec", "z_peak", "z_ml", "l68", "u68"):
-        value = float(photoz[name][index]) if photoz is not None and name in photoz.names else np.nan
-        result[name] = value if np.isfinite(value) and value >= 0 else np.nan
-    return result
-
-
-def _record(index: int, size, circ, flags, mosaics: list[dict], field: str,
-            image_size: int = IMAGE_SIZE, miri=None, photoz=None,
+def _record(index: int, size, flags, mosaics: list[dict], field: str,
+            image_size: int = IMAGE_SIZE, phot_bands: tuple[str, ...] = (),
+            phot_columns: dict | None = None,
+            photoz_columns: dict | None = None,
+            photoz_kron_columns: dict | None = None,
             coord_index: int | None = None) -> dict | None:
     ra, dec = float(size["RA"][index]), float(size["DEC"][index])
     if not np.isfinite(ra) or not np.isfinite(dec):
@@ -201,7 +281,10 @@ def _record(index: int, size, circ, flags, mosaics: list[dict], field: str,
         weight = variance_to_ivar(u, m["kind"])
         # Check raw validity first, then transform uncertainties with flux units.
         valid = np.isfinite(f) & (weight > 0)
-        if not np.any(valid):
+        # A band is present for a *galaxy* only if its centroid is covered.
+        # An image intersecting a few remote edge pixels is not an observation
+        # of the source, even though the partial stamp is nonempty.
+        if not valid[image_size // 2, image_size // 2]:
             continue
         weight = np.where(valid, weight / m["flux_scale"]**2, 0).astype(np.float32)
         score = (int(valid.sum()), float(np.median(weight[valid])))
@@ -211,24 +294,32 @@ def _record(index: int, size, circ, flags, mosaics: list[dict], field: str,
 
     if not candidates:
         return None
-    bands = list(candidates)
-    fluxes, ivars, masks, scales, sources, scalar_flux, scalar_err = [], [], [], [], [], [], []
-    for band, (_, f, weight, valid, m) in candidates.items():
+    bands = sorted(candidates, key=_band_sort_key)
+    fluxes, ivars, masks, scales, psfs, sources = [], [], [], [], [], []
+    for band in bands:
+        _, f, weight, valid, m = candidates[band]
         fluxes.append(f)
         ivars.append(weight)
         masks.append(valid)
         scales.append(m["scale_arcsec"])
+        psfs.append(m["psf_fwhm_arcsec"])
         sources.append(m["path"])
-        phot_table = miri if band in {"F560W", "F770W", "F1000W", "F1280W", "F1500W", "F1800W", "F2100W", "F2550W"} else circ
-        phot = f"{band}_CIRC3"
-        err = f"{band}_CIRC3_e"
-        scalar_flux.append(float(phot_table[phot][index]) if phot_table is not None and phot in phot_table.names else np.nan)
-        scalar_err.append(float(phot_table[err][index]) if phot_table is not None and err in phot_table.names else np.nan)
+    phot_columns = phot_columns or {}
+    photoz_columns = photoz_columns or {}
+    photoz_kron_columns = photoz_kron_columns or {}
+    z_spec = _value(photoz_columns, "z_spec", index, nonnegative=True)
+    if z_spec is None:
+        z_spec = _value(photoz_kron_columns, "z_spec", index, nonnegative=True)
     return {"object_id": f"{field}:{int(size['ID'][index])}", "ra": ra, "dec": dec,
-            "field": field, "bands": bands, "flux": fluxes, "ivar": ivars,
-            "mask": masks, "scale": scales, "image_sources": sources, "phot_flux": scalar_flux,
-            "phot_err": scalar_err, "size_a": float(size["A"][index]),
-            "size_b": float(size["B"][index]), "redshift": _catalog_photoz(photoz, index)}
+            "field": field, "bands": [band.lower() for band in bands], "flux": fluxes,
+            "ivar": ivars, "mask": masks, "scale": scales, "psf_fwhm": psfs,
+            "image_sources": sources, "photometry": _photometry_record(
+                index, phot_bands, phot_columns.get("circ", {}), phot_columns.get("kron", {}),
+                phot_columns.get("kron_conv", {}), phot_columns.get("miri", {})),
+            "photoz": _photoz_record(photoz_columns, index),
+            "photoz_kron": _photoz_record(photoz_kron_columns, index),
+            "z_spec": z_spec,
+            "size_a": float(size["A"][index]), "size_b": float(size["B"][index])}
 
 
 def _table(records: list[dict]) -> pa.Table:
@@ -256,33 +347,87 @@ def _table(records: list[dict]) -> pa.Table:
         cube("flux", np.float32, f32),
         cube("ivar", np.float32, f32),
         cube("mask", np.bool_, pa.bool_()),
+        pa.array([r["psf_fwhm"] for r in records], type=pa.list_(f32)),
         pa.array([r["scale"] for r in records], type=pa.list_(f32)),
-    ], names=["band", "flux", "ivar", "mask", "scale"])
-    phot = pa.StructArray.from_arrays([
-        pa.array([r["bands"] for r in records], type=pa.list_(pa.string())),
-        pa.array([r["phot_flux"] for r in records], type=pa.list_(f32)),
-        pa.array([r["phot_err"] for r in records], type=pa.list_(f32)),
-    ], names=["band", "flux_circ3_njy", "flux_err_circ3_njy"])
-    return pa.table({"object_id": pa.array([r["object_id"] for r in records]),
-                     "ra": pa.array([r["ra"] for r in records], type=pa.float64()),
-                     "dec": pa.array([r["dec"] for r in records], type=pa.float64()),
-                     "field": pa.array([r["field"] for r in records]), "image": image,
-                     "image_sources": pa.array([r["image_sources"] for r in records],
-                                               type=pa.list_(pa.string())),
-                     "photometry": phot,
-                     "redshift": pa.StructArray.from_arrays([
-                         pa.array([r["redshift"][name] for r in records], type=f32)
-                         for name in ("z_spec", "z_peak", "z_ml", "l68", "u68")
-                     ], names=["z_spec", "z_peak", "z_ml", "l68", "u68"]),
-                     "size_a": pa.array([r["size_a"] for r in records], type=f32),
-                     "size_b": pa.array([r["size_b"] for r in records], type=f32)})
+    ], names=["band", "flux", "ivar", "mask", "psf_fwhm", "scale"])
+
+    def photoz_struct(name: str) -> pa.StructArray:
+        return pa.StructArray.from_arrays([
+            pa.array([r[name][field] for r in records],
+                     type=pa.list_(f32) if field in PHOTOZ_ARRAY_FIELDS else
+                     pa.int32() if field == "nfilt" else f32)
+            for field in PHOTOZ_FIELDS
+        ], names=list(PHOTOZ_FIELDS))
+
+    columns = {"object_id": pa.array([r["object_id"] for r in records]),
+               "ra": pa.array([r["ra"] for r in records], type=pa.float64()),
+               "dec": pa.array([r["dec"] for r in records], type=pa.float64()),
+               "field": pa.array([r["field"] for r in records]),
+               "image": image,
+               "image_sources": pa.array([r["image_sources"] for r in records],
+                                         type=pa.list_(pa.string())),
+               "photoz": photoz_struct("photoz"),
+               "photoz_kron": photoz_struct("photoz_kron"),
+               "z_spec": pa.array([r["z_spec"] for r in records], type=f32),
+               "size_a": pa.array([r["size_a"] for r in records], type=f32),
+               "size_b": pa.array([r["size_b"] for r in records], type=f32)}
+    for name in records[0]["photometry"]:
+        columns[name] = pa.array([r["photometry"][name] for r in records], type=f32)
+    return pa.table(columns)
+
+
+def shard_directory(root: Path, shard_index: int, num_shards: int) -> Path:
+    """Keep each Slurm task's checkpoints and Parquet files independent."""
+    if num_shards < 1 or not 0 <= shard_index < num_shards:
+        raise ValueError(f"Invalid shard {shard_index} of {num_shards}")
+    return root if num_shards == 1 else root / f"shard_{shard_index:04d}_of_{num_shards:04d}"
+
+
+def verify_completed_shards(scratch: Path, fields: list[str], num_shards: int) -> dict:
+    """Refuse HATS ingestion if any extraction task is missing or unfinished."""
+    totals = {field: 0 for field in fields}
+    shard_counts = {}
+    for index in range(num_shards):
+        directory = shard_directory(scratch, index, num_shards)
+        if not directory.is_dir():
+            raise FileNotFoundError(f"Missing JADES extraction shard: {directory}")
+        for field in fields:
+            done = directory / f"{field}.done"
+            progress = directory / f"{field}.progress.json"
+            if not done.is_file() or not progress.is_file():
+                raise RuntimeError(f"Incomplete JADES extraction: {directory}/{field}")
+            checkpoint = json.loads(progress.read_text())
+            count = int(done.read_text())
+            if count < 0 or checkpoint.get("count") != count:
+                raise ValueError(f"Inconsistent JADES checkpoint for {field} in {directory}")
+            if num_shards > 1 and (checkpoint.get("schema_version") != SCHEMA_VERSION or
+                                    checkpoint.get("num_shards") != num_shards or
+                                    checkpoint.get("shard_index") != index):
+                raise ValueError(f"Wrong JADES shard/schema identity in {progress}")
+            expected_files = {directory / f"{field}_{part:05d}.parquet"
+                              for part in range(int(checkpoint["next_shard"]))}
+            found_files = set(directory.glob(f"{field}_*.parquet"))
+            if found_files != expected_files:
+                raise RuntimeError(f"Missing, extra or misnumbered Parquet for {field} in {directory}")
+            actual_rows = sum(pq.read_metadata(path).num_rows for path in sorted(found_files))
+            if actual_rows != count:
+                raise RuntimeError(f"Parquet row-count mismatch for {field} in {directory}: "
+                                   f"checkpoint={count}, files={actual_rows}")
+            totals[field] += count
+            shard_counts[f"{index}:{field}"] = count
+    if sum(totals.values()) == 0:
+        raise ValueError("All extraction shards are empty")
+    return {"num_shards": num_shards, "total_objects": sum(totals.values()),
+            "field_counts": totals, "shard_counts": shard_counts}
 
 
 def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root: Path,
                   scratch: Path, chunk_size: int, max_objects: int | None,
                   mag_band: str | None = None, mag_max: float | None = None,
                   image_size: int = IMAGE_SIZE, rows_per_file: int = 64,
-                  sample_mode: str = "first") -> int:
+                  sample_mode: str = "first",
+                  phot_bands: tuple[str, ...] | None = None,
+                  num_shards: int = 1, shard_index: int = 0) -> int:
     """Extract a field to bounded-memory Parquet shards with crash checkpoints.
 
     A checkpoint is committed only after a shard is atomically published. On
@@ -290,12 +435,17 @@ def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root:
     """
     done = scratch / f"{field}.done"
     progress = scratch / f"{field}.progress.json"
-    identity = {"field": field, "catalog": str(catalog_path),
+    shard_directory(scratch, shard_index, num_shards)  # validate before doing any I/O
+    phot_bands = tuple(sorted(phot_bands or JWST_BANDS, key=_band_sort_key))
+    identity = {"schema_version": SCHEMA_VERSION, "field": field,
+                "photometric_bands": phot_bands, "catalog": str(catalog_path),
                 "catalog_size": catalog_path.stat().st_size,
                 "mosaics": mosaics, "chunk_size": chunk_size,
                 "rows_per_file": rows_per_file, "max_objects": max_objects,
                 "sample_mode": sample_mode,
                 "mag_band": mag_band, "mag_max": mag_max, "image_size": image_size}
+    if num_shards > 1:
+        identity.update(num_shards=num_shards, shard_index=shard_index)
     fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     if progress.exists():
         checkpoint = json.loads(progress.read_text())
@@ -320,6 +470,9 @@ def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root:
     def commit(next_index: int, count: int, shard: int) -> None:
         state = {"fingerprint": fingerprint, "next_index": next_index,
                  "next_shard": shard, "count": count}
+        if num_shards > 1:
+            state.update(schema_version=SCHEMA_VERSION, num_shards=num_shards,
+                         shard_index=shard_index)
         temporary = progress.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(state) + "\n")
         os.replace(temporary, progress)
@@ -343,18 +496,50 @@ def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root:
         if miri is not None and not _ids_aligned(size, miri):
             raise ValueError(f"{field}: SIZE and MIRI IDs not aligned")
         try:
+            kron, _ = _catalog_columns(catalog_hdus, "KRON")
+        except ValueError:
+            kron = None
+        if kron is not None and not _ids_aligned(size, kron):
+            raise ValueError(f"{field}: SIZE and KRON IDs not aligned")
+        try:
+            kron_conv, _ = _catalog_columns(catalog_hdus, "KRON_CONV")
+        except ValueError:
+            kron_conv = None
+        if kron_conv is not None and not _ids_aligned(size, kron_conv):
+            raise ValueError(f"{field}: SIZE and KRON_CONV IDs not aligned")
+        try:
             photoz, _ = _catalog_columns(catalog_hdus, "PHOTOZ")
         except ValueError:
             photoz = None
         if photoz is not None and not _ids_aligned(size, photoz):
             raise ValueError(f"{field}: SIZE and PHOTOZ IDs not aligned")
+        try:
+            photoz_kron, _ = _catalog_columns(catalog_hdus, "PHOTOZ_KRON")
+        except ValueError:
+            photoz_kron = None
+        if photoz_kron is not None and not _ids_aligned(size, photoz_kron):
+            raise ValueError(f"{field}: SIZE and PHOTOZ_KRON IDs not aligned")
+
+        def phot_names(methods: tuple[str, ...], bands: tuple[str, ...]) -> list[str]:
+            return [f"{band}_{method}{suffix}" for band in bands
+                    for method in methods for suffix in ("", "_e")]
+
+        non_miri_bands = tuple(b for b in phot_bands if b not in MIRI_BANDS)
+        miri_bands = tuple(b for b in phot_bands if b in MIRI_BANDS)
+        phot_columns = {
+            "circ": _column_views(circ, phot_names(("CIRC3",), non_miri_bands)),
+            "kron": _column_views(kron, phot_names(("KRON",), non_miri_bands)),
+            "kron_conv": _column_views(kron_conv, phot_names(("KRON",), non_miri_bands)),
+            "miri": _column_views(miri, phot_names(("CIRC3", "KRON"), miri_bands)),
+        }
+        photoz_columns = _column_views(photoz, (*PHOTOZ_FIELDS, "z_spec"))
+        photoz_kron_columns = _column_views(photoz_kron, (*PHOTOZ_FIELDS, "z_spec"))
         magnitude = None
         if mag_max is not None:
-            kron, kron_columns = _catalog_columns(catalog_hdus, "KRON")
-            if not _ids_aligned(size, kron):
-                raise ValueError(f"{field}: SIZE and KRON IDs not aligned")
+            if kron is None:
+                raise ValueError(f"{field}: magnitude selection requires KRON HDU")
             flux_column = f"{mag_band}_KRON"
-            if flux_column not in kron_columns:
+            if flux_column not in kron.names:
                 raise ValueError(f"{field}: requested apparent magnitude requires {flux_column}")
             magnitude = apparent_mag_from_njy(kron[flux_column])
         images = _open_mosaics(stack, mosaics, raw_root)
@@ -378,6 +563,11 @@ def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root:
             raise ValueError(f"Unknown sampling mode: {sample_mode}")
         if max_objects is not None:
             selected = selected[:max_objects]
+        # A contiguous, non-overlapping partition of the *global* selection.
+        # max_objects means the same limit regardless of Slurm task count.
+        start = len(selected) * shard_index // num_shards
+        stop = len(selected) * (shard_index + 1) // num_shards
+        selected = selected[start:stop]
         n = len(selected)
         _prepare_positions(images, size, selected)
         count = checkpoint["count"]
@@ -387,8 +577,11 @@ def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root:
             i = int(selected[position])
             if magnitude is not None and (not np.isfinite(magnitude[i]) or magnitude[i] >= mag_max):
                 continue
-            row = _record(i, size, circ, flags, images, field, image_size,
-                          miri=miri, photoz=photoz, coord_index=position)
+            row = _record(i, size, flags, images, field, image_size,
+                          phot_bands=phot_bands, phot_columns=phot_columns,
+                          photoz_columns=photoz_columns,
+                          photoz_kron_columns=photoz_kron_columns,
+                          coord_index=position)
             if row is None:
                 continue
             chunk.append(row)
@@ -429,8 +622,6 @@ def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root:
 
 
 def main() -> None:
-    from mmu.hats_import import write_hats_from_parquet_dir
-
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--instrument", choices=("jwst", "hst"), required=True,
                    help="Build a separate MMU catalogue for JWST (NIRCam+MIRI) or HST (ACS+WFC3)")
@@ -441,6 +632,12 @@ def main() -> None:
     p.add_argument("--scratch-dir", type=Path, required=True)
     p.add_argument("--download", action="store_true")
     p.add_argument("--max-objects", type=int)
+    p.add_argument("--num-shards", type=int, default=1,
+                   help="Split each field's selected galaxies into this many independent Slurm tasks")
+    p.add_argument("--shard-index", type=int, default=0,
+                   help="Zero-based task number, 0 <= index < num-shards")
+    p.add_argument("--ingest-only", action="store_true",
+                   help="Verify all extraction shards, then build the unified HATS collection")
     p.add_argument("--sample-mode", choices=("first", "miri"), default="first",
                    help="Use first catalog rows or sources with MIRI exposure (for focused smoke tests)")
     p.add_argument("--image-size", type=int, default=IMAGE_SIZE,
@@ -457,6 +654,10 @@ def main() -> None:
                    help="Maximum records in a HATS import batch per worker")
     p.add_argument("--skip-hats", action="store_true",
                    help="Only extract and checkpoint cutouts as Parquet; defer the HATS ingest")
+    p.add_argument("--scheduler-file", type=Path,
+                   help="Connect HATS ingest to external multi-node Dask workers via a scheduler JSON")
+    p.add_argument("--min-ingest-workers", type=int, default=1,
+                   help="Wait for this many external Dask workers before starting HATS import")
     p.add_argument("--tmp-dir", type=Path)
     args = p.parse_args()
     if args.chunk_size <= 0:
@@ -465,6 +666,18 @@ def main() -> None:
         p.error("--max-objects must be > 0")
     if args.rows_per_file <= 0 or args.hats_batch_size <= 0:
         p.error("--rows-per-file and --hats-batch-size must be > 0")
+    if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
+        p.error("Require --num-shards >= 1 and 0 <= --shard-index < --num-shards")
+    if args.num_shards > 1 and not (args.skip_hats or args.ingest_only):
+        p.error("Distributed extraction requires --skip-hats; run --ingest-only after all shards finish")
+    if args.ingest_only and args.skip_hats:
+        p.error("--ingest-only and --skip-hats are mutually exclusive")
+    if args.ingest_only and args.shard_index:
+        p.error("--shard-index applies only to extraction, not --ingest-only")
+    if args.min_ingest_workers <= 0:
+        p.error("--min-ingest-workers must be > 0")
+    if args.min_ingest_workers > 1 and args.scheduler_file is None:
+        p.error("--min-ingest-workers > 1 requires --scheduler-file")
     if args.image_size <= 0:
         p.error("--image-size must be > 0")
     if (args.mag_band is None) != (args.mag_max is None):
@@ -481,28 +694,56 @@ def main() -> None:
     if args.download:
         fetch_manifest(args.manifest, args.raw_root)
     args.scratch_dir.mkdir(parents=True, exist_ok=True)
-    total = 0
-    for cat in manifest["catalogs"]:
-        field = cat["field"]
-        entries = [m for m in manifest["mosaics"]
-                   if m["field"] == field and m["band"].upper() in allowed]
-        n = process_field(field, _input(args.raw_root, cat["path"]), entries,
-                          args.raw_root, args.scratch_dir, args.chunk_size, args.max_objects,
-                          mag_band, args.mag_max, args.image_size, args.rows_per_file,
-                          sample_mode=args.sample_mode)
-        print(f"{field}: {n} objects with real image inverse variance", flush=True)
-        total += n
-    if total == 0:
-        raise RuntimeError("No valid JADES images; refusing to write empty HATS catalog")
-    if args.skip_hats:
-        print(f"JADES Parquet extraction complete: {args.scratch_dir} ({total} objects); "
-              "rerun without --skip-hats to build HATS", flush=True)
-        return
-    write_hats_from_parquet_dir(str(args.scratch_dir), output_path=str(output_root),
-                               catalog_name=catalog_name, pixel_threshold=args.pixel_threshold,
-                               n_workers=args.ingest_workers,
-                               chunksize=args.hats_batch_size,
-                               tmp_dir=str(args.tmp_dir) if args.tmp_dir else None)
+    if args.ingest_only:
+        report = verify_completed_shards(args.scratch_dir,
+                                         [cat["field"] for cat in manifest["catalogs"]],
+                                         args.num_shards)
+        total = report["total_objects"]
+        print(f"Verified all {args.num_shards} JADES extraction shards: "
+              f"{report['field_counts']} ({total} total objects)", flush=True)
+    else:
+        scratch = shard_directory(args.scratch_dir, args.shard_index, args.num_shards)
+        scratch.mkdir(parents=True, exist_ok=True)
+        total = 0
+        for cat in manifest["catalogs"]:
+            field = cat["field"]
+            entries = [m for m in manifest["mosaics"]
+                       if m["field"] == field and m["band"].upper() in allowed]
+            n = process_field(field, _input(args.raw_root, cat["path"]), entries,
+                              args.raw_root, scratch, args.chunk_size, args.max_objects,
+                              mag_band, args.mag_max, args.image_size, args.rows_per_file,
+                              sample_mode=args.sample_mode,
+                              phot_bands=tuple(sorted(allowed, key=_band_sort_key)),
+                              num_shards=args.num_shards, shard_index=args.shard_index)
+            print(f"{field} task {args.shard_index}/{args.num_shards}: "
+                  f"{n} objects with real image inverse variance", flush=True)
+            total += n
+        if total == 0 and args.num_shards == 1:
+            raise RuntimeError("No valid JADES images; refusing to write empty HATS catalog")
+        if args.skip_hats:
+            print(f"JADES extraction task {args.shard_index}/{args.num_shards} complete: "
+                  f"{scratch} ({total} objects); run --ingest-only after all tasks finish",
+                  flush=True)
+            return
+
+    if output_root.exists() and any(output_root.iterdir()):
+        raise FileExistsError(f"HATS output root already contains data: {output_root}. "
+                              "Choose a new --output-root to preserve existing results")
+    from mmu.hats_import import write_hats_from_parquet_dir
+
+    kwargs = {"output_path": str(output_root), "catalog_name": catalog_name,
+              "pixel_threshold": args.pixel_threshold, "n_workers": args.ingest_workers,
+              "chunksize": args.hats_batch_size,
+              "tmp_dir": str(args.tmp_dir) if args.tmp_dir else None}
+    if args.scheduler_file:
+        from dask.distributed import Client
+
+        with Client(scheduler_file=str(args.scheduler_file)) as client:
+            print(f"Waiting for {args.min_ingest_workers} Dask workers", flush=True)
+            client.wait_for_workers(n_workers=args.min_ingest_workers, timeout="20m")
+            write_hats_from_parquet_dir(str(args.scratch_dir), client=client, **kwargs)
+    else:
+        write_hats_from_parquet_dir(str(args.scratch_dir), **kwargs)
     print(f"JADES HATS output: {output_root} ({total} objects)")
 
 

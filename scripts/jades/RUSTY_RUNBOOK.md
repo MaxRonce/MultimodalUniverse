@@ -12,7 +12,12 @@ git pull --ff-only origin feat/jades-dr5
 export JADES_RAW=/mnt/ceph/users/polymathic/external_data/Astro/JADES_DR5
 export JADES_RUN=/mnt/ceph/users/polymathic/mronceray/jades_dr5_runs
 mkdir -p "$JADES_RUN"
+rg -n 'jades-v2-multimodal-2' scripts/jades/build_parent_sample_hats.py
 ```
+
+**Do not start the v2 run unless the final command finds the schema version.**
+If it prints nothing, the new implementation has not yet been synced to your
+Rusty checkout; fetching the previous remote branch is not enough.
 
 ## 0a. Reserve a Rusty CPU worker inside tmux (Slurm)
 
@@ -92,17 +97,19 @@ catalogs. The selected products are native DR5 mosaics, not PSF-homogenized
 images; the `ERR` map is a resampled per-pixel sigma, **not** a fully
 correlated-noise-aware aperture uncertainty.
 
-## 3. Run a tiny Parquet-only smoke test
+## 3. Run a tiny Parquet-only smoke test (new v2 schema)
 
 The limit is **per GOODS field** (100 for GOODS-S and 100 for GOODS-N).
-Do not reuse this scratch directory for a larger/different selection.
+Do not reuse this scratch directory for a larger/different selection. Previous
+`scratch_smoke100` and `scratch_miri100` belong to the old schema: **leave
+them intact** and use the new `_v2` directories below.
 
 ```bash
 uv run python -m scripts.jades.build_parent_sample_hats \
   --instrument jwst \
   --manifest "$JADES_RUN/jades_dr5_manifest.json" \
   --raw-root "$JADES_RAW" \
-  --scratch-dir "$JADES_RUN/scratch_smoke100" \
+  --scratch-dir "$JADES_RUN/scratch_smoke100_v2" \
   --image-size 160 --max-objects 100 \
   --chunk-size 4 --rows-per-file 32 --skip-hats
 ```
@@ -114,7 +121,7 @@ uv run python -m scripts.jades.build_parent_sample_hats \
   --instrument jwst \
   --manifest "$JADES_RUN/jades_dr5_manifest.json" \
   --raw-root "$JADES_RAW" \
-  --scratch-dir "$JADES_RUN/scratch_miri100" \
+  --scratch-dir "$JADES_RUN/scratch_miri100_v2" \
   --image-size 160 --sample-mode miri --max-objects 100 \
   --chunk-size 4 --rows-per-file 32 --skip-hats
 ```
@@ -128,27 +135,42 @@ all three MIRI filters.
 
 ```bash
 uv run --extra viz python -m scripts.jades.inspect_cutouts \
-  --scratch-dir "$JADES_RUN/scratch_smoke100" \
-  --output "$JADES_RUN/smoke100_audit.json" \
+  --scratch-dir "$JADES_RUN/scratch_smoke100_v2" \
+  --output "$JADES_RUN/smoke100_v2_audit.json" \
   --max-samples 24 \
-  --preview-dir "$JADES_RUN/smoke100_previews"
+  --require-photoz \
+  --preview-dir "$JADES_RUN/smoke100_v2_previews"
 ```
 
 For the MIRI-focused sample:
 
 ```bash
 uv run --extra viz python -m scripts.jades.inspect_cutouts \
-  --scratch-dir "$JADES_RUN/scratch_miri100" \
-  --output "$JADES_RUN/miri100_audit.json" \
+  --scratch-dir "$JADES_RUN/scratch_miri100_v2" \
+  --output "$JADES_RUN/miri100_v2_audit.json" \
   --max-samples 24 \
-  --require-any-band F770W F1280W F1500W \
-  --preview-dir "$JADES_RUN/miri100_previews"
+  --require-photoz \
+  --require-any-band f770w f1280w f1500w \
+  --preview-dir "$JADES_RUN/miri100_v2_previews"
 ```
 
 The audit checks 2-D shapes, non-finite pixels, positive IVAR only where the
-mask is true, unique band names, and photometry/provenance alignment. It also
-reports actual row counts and per-band valid-pixel fractions in the sampled
-objects. Preview RGB is display-scaled and not a scientific flux measurement.
+mask is true, unique lowercase band names, PSF/pixel-scale alignment, and
+photo-z PDF bin consistency. It requires exactly **160 × 160** pixels per
+band, samples up to **24 distinct objects across the full Parquet shard
+sequence** (not just one per file), and rejects an audit with no native or
+Kron photo-z estimates. It reports photo-z/photometry coverage, MIRI/NIRCam
+joint-source counts, photometry availability per measurement method
+(CIRC3/KRON/KRON_CONV), and per-band valid-pixel fractions. Preview RGB is
+display-scaled and not a scientific flux measurement.
+
+The final image struct is `image.{band,flux,ivar,mask,psf_fwhm,scale}`.
+NIRCam and MIRI share this one struct in a **single** `jades_jwst` catalog.
+Top-level `phot_f090w_circ3_flux_njy`, `phot_f770w_kron_flux_njy`, etc.,
+come from catalog HDUs whether or not that filter has a matching image.
+`photoz` and `photoz_kron` are two **photometric** EAZY estimates; `z_spec`
+is separate and optional. Image `psf_fwhm` is **null** unless a measured
+`psf_fwhm_arcsec` is supplied per mosaic in the manifest (arcseconds).
 
 **Check the audit and inspect the PNGs before any large run.** Inspect that
 the galaxy is centered, no cutout is all zeros, and MIRI bands genuinely show
@@ -164,9 +186,9 @@ uv run python -m scripts.jades.build_parent_sample_hats \
   --instrument jwst \
   --manifest "$JADES_RUN/jades_dr5_manifest.json" \
   --raw-root "$JADES_RAW" \
-  --scratch-dir "$JADES_RUN/scratch_smoke100" \
-  --output-root "$JADES_RUN/hats_smoke100" \
-  --tmp-dir "$JADES_RUN/hats_tmp" \
+  --scratch-dir "$JADES_RUN/scratch_smoke100_v2" \
+  --output-root "$JADES_RUN/hats_smoke100_v2" \
+  --tmp-dir "$JADES_RUN/hats_tmp_v2" \
   --image-size 160 --max-objects 100 \
   --chunk-size 4 --rows-per-file 32 \
   --pixel-threshold 256 --hats-batch-size 4 --ingest-workers 2
@@ -194,7 +216,7 @@ this histogram alone. No selection is imposed unless `--mag-band` and
 ## 7. Scale gradually; estimate storage from a pilot
 
 ```bash
-du -sh "$JADES_RUN/scratch_smoke100" "$JADES_RUN/hats_smoke100"
+du -sh "$JADES_RUN/scratch_smoke100_v2" "$JADES_RUN/hats_smoke100_v2"
 df -h "$JADES_RUN"
 ```
 
@@ -211,7 +233,7 @@ uv run python -m scripts.jades.build_parent_sample_hats \
   --instrument jwst \
   --manifest "$JADES_RUN/jades_dr5_manifest.json" \
   --raw-root "$JADES_RAW" \
-  --scratch-dir "$JADES_RUN/scratch_pilot1000" \
+  --scratch-dir "$JADES_RUN/scratch_pilot1000_v2" \
   --image-size 160 --max-objects 1000 \
   --chunk-size 4 --rows-per-file 64 --skip-hats
 ```
@@ -229,7 +251,9 @@ resumes from the latest committed per-field Parquet checkpoint. A crashed
 in-progress shard is reconstructed; completed shards are not re-extracted.
 If you change magnitude cuts, sample mode, image size, catalog or manifest,
 create a **new** scratch directory. Reusing a scratch with different settings
-is an error by design. Do not manually edit `.progress.json` or `.done` files.
+is an error by design. The checkpoint also records the schema version: old
+JADES Parquet shards cannot be reused after a schema change. Do not manually
+edit `.progress.json` or `.done` files.
 
 ### What is intentionally not validated by these scripts
 
@@ -239,7 +263,216 @@ is an error by design. Do not manually edit `.progress.json` or `.done` files.
 - Full build runtime and final dataset size on Rusty (must be measured);
 - HST mosaic production (a separate `jades_hst` workflow is pending).
 
-For MIRI, `MIRI` catalog `FxxxW_CIRC3` and `FxxxW_CIRC3_e` are used instead
-of the NIRCam/HST `CIRC` HDU; `PHOTOZ` provides `z_spec`, `z_peak`, `z_ml`,
-`l68`, `u68`. The selected input mosaic for each band is preserved in the
-top-level `image_sources` list, aligned to `image.band`.
+For MIRI, the `MIRI` HDU supplies CIRC3 and native KRON photometry rather
+than NIRCam's `CIRC`/`KRON` HDUs. `PHOTOZ` and `PHOTOZ_KRON` supply separate
+EAZY estimates (`z_a`, `z_peak`, `z_ml`, confidence intervals and 22-bin
+redshift distributions); spectroscopic `z_spec` is independent. The selected
+input mosaic is preserved in `image_sources`, aligned to lowercase
+`image.band`. A source with no MIRI cutout may still have MIRI photometry.
+
+## 8. Distributed JWST production (Slurm array + multi-node Dask)
+
+**This is the production path for the tutor-approved specification.** One
+galaxy row contains its available native-pixel NIRCam and MIRI bands. Each
+band has real pixel IVAR, mask, pixel scale and nullable PSF FWHM. All catalog
+photometry, both EAZY photo-z estimates and separate `z_spec` are retained.
+No magnitude or SNR cut is applied. A filter is included only when the galaxy
+centroid has a valid SCI/ERR pixel in that filter; boundary pixels elsewhere
+in a stamp do not create phantom bands.
+
+An extraction array performs **independent contiguous slices** of the
+GOODS-S and GOODS-N catalogs. Each Slurm task writes to
+`$JADES_SCRATCH/shard_XXXX_of_NNNN/`, with separate `.progress.json`, `.done`
+and Parquet checkpoints. An incomplete task can be resubmitted without
+regenerating completed tasks. The follow-up HATS ingestion validates **every**
+shard, checks Parquet row counts, and uses Dask workers on multiple nodes.
+The resulting dataset is still **one `jades_jwst` HATS collection**.
+
+### 8.1 Prepare on the Rusty login node (not inside a compute allocation)
+
+The code must first be **committed and pushed to the Git branch**, then pulled
+on Rusty. Uncommitted Codex workspace edits cannot be fetched by `git pull`.
+
+```bash
+cd /mnt/ceph/users/polymathic/mronceray/MultimodalUniverse-jades
+git pull --ff-only origin feat/jades-dr5
+rg -n -- '--num-shards|--ingest-only' scripts/jades/build_parent_sample_hats.py
+
+export JADES_RAW=/mnt/ceph/users/polymathic/external_data/Astro/JADES_DR5
+export JADES_RUN=/mnt/ceph/users/polymathic/mronceray/jades_dr5_runs
+export JADES_MANIFEST="$JADES_RUN/jades_dr5_manifest.json"
+mkdir -p "$JADES_RUN/logs"
+
+sinfo -p genx -o '%P %a %l %D %C'
+```
+
+Run `uv run --extra dev pytest -q scripts/jades/test_jades.py` before
+submitting jobs. The tests use synthetic data and are inexpensive.
+
+### 8.2 Distributed pilot: 1,000 sources per GOODS field
+
+Use **8 total shards, 4 concurrent Slurm workers**, to measure actual Ceph
+throughput and memory before submitting the entire catalog:
+
+```bash
+export JADES_NUM_SHARDS=8
+export JADES_MAX_OBJECTS=1000
+export JADES_SCRATCH="$JADES_RUN/scratch_jwst_pilot1000_dist_v2"
+
+PILOT_JOB=$(sbatch --parsable --export=ALL \
+  --job-name=jades-pilot --partition=genx \
+  --array=0-7%4 --nodes=1 --ntasks=1 --cpus-per-task=1 \
+  --mem=16G --time=04:00:00 \
+  --output="$JADES_RUN/logs/pilot_%A_%a.out" \
+  scripts/jades/slurm_extract.sh)
+echo "$PILOT_JOB"
+```
+
+Monitor `squeue -j "$PILOT_JOB"` and inspect
+`$JADES_RUN/logs/pilot_<job>_<task>.out`. Once all array elements have
+**COMPLETED successfully**, audit the *whole directory*, including its
+per-task subdirectories:
+
+```bash
+uv run --extra viz python -m scripts.jades.inspect_cutouts \
+  --scratch-dir "$JADES_SCRATCH" \
+  --output "$JADES_RUN/pilot1000_dist_v2_audit.json" \
+  --max-samples 48 --require-photoz \
+  --preview-dir "$JADES_RUN/pilot1000_dist_v2_previews"
+
+du -sh "$JADES_SCRATCH"
+df -h "$JADES_SCRATCH"
+```
+
+Before full production, test HATS import for this pilot on an allocated
+worker (e.g. `srun --partition=genx --cpus-per-task=4 --mem=32G
+--time=04:00:00 --pty bash -l`; re-export JADES variables inside that shell):
+
+```bash
+uv run python -m scripts.jades.build_parent_sample_hats \
+  --instrument jwst --manifest "$JADES_MANIFEST" --raw-root "$JADES_RAW" \
+  --scratch-dir "$JADES_SCRATCH" --num-shards 8 --ingest-only \
+  --output-root "$JADES_RUN/hats_pilot1000_dist_v2" \
+  --tmp-dir "$JADES_RUN/hats_pilot_tmp_v2" \
+  --hats-batch-size 4 --ingest-workers 4 --pixel-threshold 256
+```
+
+Do not run an identical HATS command again against an output path with existing
+files. Use a **new** `--output-root` for a retry. Original outputs are never
+removed by this JADES CLI, even if an old HATS import failed.
+
+### 8.3 Full JADES extraction: no cuts
+
+Return to the **login node**. Choose a fresh scratch root; **remove the
+pilot-only environment limit with `unset`**. The following uses 32 total
+shards and up to 8 simultaneous workers. Change `%8` only if your Slurm quota
+and measured shared-filesystem throughput support more concurrent requests.
+Each task stays restartable when its allocation expires.
+
+```bash
+unset JADES_MAX_OBJECTS
+export JADES_NUM_SHARDS=32
+export JADES_SCRATCH="$JADES_RUN/scratch_jades_jwst_full_dist_v2"
+
+EXTRACT_JOB=$(sbatch --parsable --export=ALL \
+  --job-name=jades-extract --partition=genx \
+  --array=0-31%8 --nodes=1 --ntasks=1 --cpus-per-task=1 \
+  --mem=16G --time=12:00:00 \
+  --output="$JADES_RUN/logs/extract_%A_%a.out" \
+  scripts/jades/slurm_extract.sh)
+echo "$EXTRACT_JOB"
+```
+
+Monitoring:
+
+```bash
+squeue -j "$EXTRACT_JOB"
+sacct -j "$EXTRACT_JOB" --format=JobID,State,Elapsed,MaxRSS
+du -sh "$JADES_SCRATCH"
+```
+
+If only array tasks 5 and 17 failed, resubmit those indices with **the same
+total `JADES_NUM_SHARDS=32`, same scratch directory and extraction settings**:
+
+```bash
+sbatch --export=ALL --job-name=jades-retry --partition=genx \
+  --array=5,17%2 --nodes=1 --ntasks=1 --cpus-per-task=1 \
+  --mem=16G --time=12:00:00 \
+  --output="$JADES_RUN/logs/retry_%A_%a.out" \
+  scripts/jades/slurm_extract.sh
+```
+
+These task indices are **examples**, not tasks to rerun automatically. Check
+`sacct` and logs before deciding which ones actually failed.
+
+### 8.4 Distributed HATS ingest across several compute nodes
+
+Start this stage **only after** every extraction task is complete, after
+reviewing the image audit and confirming available Ceph space. HATS ingestion
+can require substantial additional temporary space for partitioning and margin
+creation. It is a separate Dask stage, not 32 independent HATS catalogs.
+
+Choose a **new** output and scheduler filename for each attempt, and keep the
+staging directory on shared Ceph so every worker can access it:
+
+```bash
+export JADES_HATS_OUT="$JADES_RUN/hats_jades_jwst_full_dist_v2"
+export JADES_HATS_TMP="$JADES_RUN/hats_tmp_jwst_full_dist_v2"
+export JADES_DASK_FILE="$JADES_RUN/dask_jwst_full_dist_v2.json"
+export JADES_DASK_WORKERS=8
+export JADES_DASK_WORKER_MEMORY=12GiB
+
+DASK_SCHED_JOB=$(sbatch --parsable --export=ALL \
+  --job-name=jades-scheduler --partition=genx \
+  --nodes=1 --ntasks=1 --cpus-per-task=1 \
+  --mem=4G --time=24:00:00 \
+  --output="$JADES_RUN/logs/dask_scheduler_%j.out" \
+  scripts/jades/slurm_dask_scheduler.sh)
+echo "$DASK_SCHED_JOB"
+```
+
+When that job is RUNNING and the scheduler file exists:
+
+```bash
+DASK_WORKER_JOB=$(sbatch --parsable --export=ALL \
+  --job-name=jades-dask-worker --partition=genx \
+  --array=0-7%8 --nodes=1 --ntasks=1 --cpus-per-task=1 \
+  --mem=16G --time=24:00:00 \
+  --output="$JADES_RUN/logs/dask_worker_%A_%a.out" \
+  scripts/jades/slurm_dask_worker.sh)
+echo "$DASK_WORKER_JOB"
+```
+
+Then submit the HATS client job. It will **wait for all 8 Dask workers**
+before beginning the import; it verifies the 32 completed extraction shards
+and their actual Parquet row counts first:
+
+```bash
+HATS_JOB=$(sbatch --parsable --export=ALL \
+  --job-name=jades-hats --partition=genx \
+  --nodes=1 --ntasks=1 --cpus-per-task=2 \
+  --mem=16G --time=24:00:00 \
+  --output="$JADES_RUN/logs/hats_%j.out" \
+  scripts/jades/slurm_hats_ingest.sh)
+echo "$HATS_JOB"
+```
+
+Wait until `sacct -j "$HATS_JOB"` reports **COMPLETED**, then inspect:
+
+```bash
+du -sh "$JADES_HATS_OUT"
+find "$JADES_HATS_OUT" -maxdepth 3 -type f -name 'properties'
+```
+
+The collection is named `jades_jwst`. The HATS inner catalog is typically
+`$JADES_HATS_OUT/jades_jwst/jades_jwst` (with a margin catalog alongside it).
+After verifying successful import, explicitly release the two long-running
+Dask allocations with `scancel "$DASK_WORKER_JOB" "$DASK_SCHED_JOB"`.
+The scheduler file may already disappear when Dask stops; always select a new
+name on the next attempt.
+
+**Important constraints:** Slurm partitions/accounts/wall-time limits are
+site-specific; adjust these resource requests if Rusty rejects them. Scale
+the number of *concurrent* workers gradually because Ceph I/O can saturate.
+An interrupted extraction is resumable at committed Parquet checkpoints;
+an interrupted HATS import currently requires a fresh HATS output path.

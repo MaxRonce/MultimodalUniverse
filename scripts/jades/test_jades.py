@@ -1,6 +1,8 @@
 """Tiny synthetic-FITS checks; no network or HATS cluster required."""
 
 import json
+import sys
+from types import ModuleType
 
 import numpy as np
 import pytest
@@ -15,10 +17,13 @@ from scripts.jades.build_parent_sample_hats import (
     flux_conversion,
     _pixel_cutout,
     process_field,
+    shard_directory,
     variance_to_ivar,
+    verify_completed_shards,
 )
 from scripts.jades.make_manifest import make_manifest
 from scripts.jades.inspect_cutouts import inspect
+from scripts.jades import build_parent_sample_hats as builder
 
 
 def test_real_inverse_variance_only():
@@ -45,11 +50,11 @@ def test_instrument_separation_and_ab_magnitude():
     assert np.isnan(apparent_mag_from_njy([0.0])[0])
 
 
-def _wcs():
+def _wcs(scale_arcsec=0.03):
     wcs = WCS(naxis=2)
     wcs.wcs.crval = [53.0, -27.0]
     wcs.wcs.crpix = [100, 100]
-    wcs.wcs.cdelt = [-0.03 / 3600, 0.03 / 3600]
+    wcs.wcs.cdelt = [-scale_arcsec / 3600, scale_arcsec / 3600]
     wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
     return wcs
 
@@ -91,8 +96,13 @@ def test_snr_and_cutouts(tmp_path):
     import pyarrow.parquet as pq
     table = pq.read_table(sorted(scratch.glob("*.parquet"))[0])
     image = table.column("image")[0].as_py()
-    assert image["band"] == ["F277W"]
+    assert image["band"] == ["f277w"]
     assert image["ivar"][0][0][0] == pytest.approx(0.25)
+    assert image["psf_fwhm"] == [None]  # Never fabricate an unmeasured PSF.
+    assert image["scale"] == pytest.approx([0.03])
+    assert table.column("phot_f277w_circ3_flux_njy")[0].as_py() == pytest.approx(10.0)
+    assert "photometry" not in table.column_names
+    assert "redshift" not in table.column_names
     assert process_field("GOODS-S", catalog, entries, tmp_path, scratch, 1, None) == 2
 
 
@@ -107,6 +117,90 @@ def test_native_cutout_matches_astropy_partial_edges():
     assert _pixel_cutout(data, -20, 5, np.nan, 6) is None
 
 
+def test_partial_mosaic_without_covered_galaxy_center_is_not_a_band(tmp_path):
+    catalog = tmp_path / "catalog.fits"
+    mosaic = tmp_path / "edge.fits"
+    _catalog(catalog)
+    wcs = _wcs()
+    wcs.wcs.crpix = [-1, 6]  # Galaxy centroid lies just left of the mosaic.
+    fits.HDUList([
+        fits.PrimaryHDU(),
+        fits.ImageHDU(np.ones((10, 10), np.float32), wcs.to_header(), name="SCI"),
+        fits.ImageHDU(np.ones((10, 10), np.float32), name="ERR"),
+    ]).writeto(mosaic)
+    scratch = tmp_path / "edge_scratch"
+    scratch.mkdir()
+    entries = [{"field": "GOODS-S", "band": "F277W", "path": mosaic.name,
+                "sci_hdu": "SCI", "uncertainty_hdu": "ERR",
+                "uncertainty_kind": "sigma", "unit": "nJy"}]
+    assert process_field("GOODS-S", catalog, entries, tmp_path, scratch,
+                         chunk_size=1, max_objects=2, image_size=8) == 0
+    assert list(scratch.glob("*.parquet")) == []
+
+
+def test_distributed_shards_cover_each_source_once_and_validate_completion(tmp_path, monkeypatch):
+    catalog = tmp_path / "catalog.fits"
+    mosaic = tmp_path / "nircam.fits"
+    _catalog(catalog)
+    fits.HDUList([
+        fits.PrimaryHDU(),
+        fits.ImageHDU(np.ones((200, 200), np.float32), _wcs().to_header(), name="SCI"),
+        fits.ImageHDU(np.ones((200, 200), np.float32), name="ERR"),
+    ]).writeto(mosaic)
+    root = tmp_path / "distributed"
+    entries = [{"field": "GOODS-S", "band": "F277W", "path": "nircam.fits",
+                "sci_hdu": "SCI", "uncertainty_hdu": "ERR",
+                "uncertainty_kind": "sigma", "unit": "nJy"}]
+    for shard_index in range(3):
+        shard = shard_directory(root, shard_index, 3)
+        shard.mkdir(parents=True)
+        for field in ("GOODS-S", "GOODS-N"):
+            assert process_field(field, catalog, entries, tmp_path, shard,
+                                 chunk_size=1, max_objects=None, rows_per_file=1,
+                                 image_size=8, num_shards=3, shard_index=shard_index) in (0, 1)
+    summary = verify_completed_shards(root, ["GOODS-S", "GOODS-N"], num_shards=3)
+    assert summary["total_objects"] == 4
+    assert summary["field_counts"] == {"GOODS-S": 2, "GOODS-N": 2}
+    report, samples = inspect(root, max_samples=4, expected_size=8)
+    assert report["sampled_objects"] == 4
+    assert {r["object_id"] for r in samples} == {
+        "GOODS-S:1", "GOODS-S:2", "GOODS-N:1", "GOODS-N:2",
+    }
+
+    # CLI ingest-only must consume the recursive shard tree, not re-extract
+    # the catalog. Mock the HATS package (not needed for extraction tests).
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "release": "JADES_DR5",
+        "catalogs": [{"field": f, "path": catalog.name} for f in ("GOODS-S", "GOODS-N")],
+        "mosaics": [],
+    }))
+    calls = []
+    fake_importer = ModuleType("mmu.hats_import")
+    fake_importer.write_hats_from_parquet_dir = lambda *args, **kwargs: calls.append((args, kwargs))
+    monkeypatch.setitem(sys.modules, "mmu.hats_import", fake_importer)
+    monkeypatch.setattr(sys, "argv", [
+        "build_parent_sample_hats", "--instrument", "jwst", "--manifest", str(manifest),
+        "--raw-root", str(tmp_path), "--scratch-dir", str(root),
+        "--output-root", str(tmp_path / "hats"), "--num-shards", "3", "--ingest-only",
+    ])
+    builder.main()
+    assert len(calls) == 1
+    assert calls[0][0] == (str(root),)
+    assert calls[0][1]["catalog_name"] == "jades_jwst"
+    hats_output = tmp_path / "hats"
+    hats_output.mkdir()
+    (hats_output / "user_data.txt").write_text("preserve")
+    with pytest.raises(FileExistsError, match="already contains data"):
+        builder.main()
+    assert (hats_output / "user_data.txt").read_text() == "preserve"
+
+    missing_done = shard_directory(root, 1, 3) / "GOODS-N.done"
+    missing_done.unlink()
+    with pytest.raises(RuntimeError, match="Incomplete JADES extraction"):
+        verify_completed_shards(root, ["GOODS-S", "GOODS-N"], num_shards=3)
+
+
 def test_miri_photometry_mosaic_overlap_photoz_and_checkpoint(tmp_path):
     catalog = tmp_path / "catalog.fits"
     _catalog(catalog)
@@ -116,12 +210,36 @@ def test_miri_photometry_mosaic_overlap_photoz_and_checkpoint(tmp_path):
             ids,
             fits.Column(name="F770W_CIRC3", format="E", array=[101., 202.]),
             fits.Column(name="F770W_CIRC3_e", format="E", array=[4., 5.]),
+            fits.Column(name="F770W_KRON", format="E", array=[131., 231.]),
+            fits.Column(name="F770W_KRON_e", format="E", array=[7., 8.]),
+            fits.Column(name="F1280W_CIRC3", format="E", array=[33., np.nan]),
+            fits.Column(name="F1280W_CIRC3_e", format="E", array=[2., -99.]),
         ], name="MIRI"))
         hdus.append(fits.BinTableHDU.from_columns([
             ids,
             fits.Column(name="z_spec", format="E", array=[5.1, -99.]),
+            fits.Column(name="z_a", format="E", array=[5.3, 4.8]),
             fits.Column(name="z_peak", format="E", array=[5.2, 4.7]),
+            fits.Column(name="l68", format="E", array=[4.9, 4.1]),
+            fits.Column(name="u68", format="E", array=[5.5, 5.2]),
+            fits.Column(name="z_bins", format="22D", array=np.tile(np.linspace(0, 11, 22), (2, 1))),
+            fits.Column(name="Prob_z_bins", format="22D", array=np.tile(np.ones(22) / 22, (2, 1))),
         ], name="PHOTOZ"))
+        hdus.append(fits.BinTableHDU.from_columns([
+            ids,
+            fits.Column(name="z_a", format="E", array=[5.6, 4.6]),
+            fits.Column(name="z_peak", format="E", array=[5.4, 4.5]),
+        ], name="PHOTOZ_KRON"))
+        hdus.append(fits.BinTableHDU.from_columns([
+            ids,
+            fits.Column(name="F277W_KRON", format="E", array=[16., 3.]),
+            fits.Column(name="F277W_KRON_e", format="E", array=[2., 1.]),
+        ], name="KRON"))
+        hdus.append(fits.BinTableHDU.from_columns([
+            ids,
+            fits.Column(name="F277W_KRON", format="E", array=[15., 4.]),
+            fits.Column(name="F277W_KRON_e", format="E", array=[2.5, 1.5]),
+        ], name="KRON_CONV"))
     entries = []
     for i, sigma in enumerate((4., 1.)):
         path = tmp_path / f"miri{i}.fits"
@@ -132,21 +250,35 @@ def test_miri_photometry_mosaic_overlap_photoz_and_checkpoint(tmp_path):
         ]).writeto(path)
         entries.append({"path": path.name, "field": "GOODS-S", "band": "F770W",
                         "sci_hdu": "SCI", "uncertainty_hdu": "ERR",
-                        "uncertainty_kind": "sigma", "unit": "nJy"})
+                        "uncertainty_kind": "sigma", "unit": "nJy",
+                        "psf_fwhm_arcsec": 0.25 + 0.01 * i})
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     assert process_field("GOODS-S", catalog, entries, tmp_path, scratch,
                          chunk_size=1, max_objects=2, rows_per_file=1, image_size=8) == 2
     import pyarrow.parquet as pq
     first = pq.read_table(scratch / "GOODS-S_00000.parquet").to_pylist()[0]
-    assert first["image"]["band"] == ["F770W"]
+    assert first["image"]["band"] == ["f770w"]
     assert first["image_sources"] == ["miri1.fits"]
-    assert first["photometry"]["flux_circ3_njy"] == [101.0]
-    assert first["photometry"]["flux_err_circ3_njy"] == [4.0]
+    assert first["image"]["psf_fwhm"] == pytest.approx([0.26])
+    assert first["phot_f770w_circ3_flux_njy"] == pytest.approx(101.0)
+    assert first["phot_f770w_circ3_err_njy"] == pytest.approx(4.0)
+    assert first["phot_f770w_kron_flux_njy"] == pytest.approx(131.0)
+    assert first["phot_f1280w_circ3_flux_njy"] == pytest.approx(33.0)
+    assert first["phot_f277w_circ3_flux_njy"] == pytest.approx(10.0)
+    assert first["phot_f277w_kron_conv_flux_njy"] == pytest.approx(15.0)
+    assert "phot_f770w_kron_conv_flux_njy" not in first
     assert first["image"]["ivar"][0][0][0] == pytest.approx(1.)
-    assert first["redshift"]["z_peak"] == pytest.approx(5.2)
+    assert first["photoz"]["z_peak"] == pytest.approx(5.2)
+    assert first["photoz"]["z_a"] == pytest.approx(5.3)
+    assert first["photoz_kron"]["z_a"] == pytest.approx(5.6)
+    assert len(first["photoz"]["z_bins"]) == 22
+    assert len(first["photoz"]["prob_z_bins"]) == 22
+    assert first["z_spec"] == pytest.approx(5.1)
     second = pq.read_table(scratch / "GOODS-S_00001.parquet").to_pylist()[0]
-    assert np.isnan(second["redshift"]["z_spec"])
+    assert second["z_spec"] is None
+    assert second["phot_f1280w_circ3_flux_njy"] is None
+    assert second["phot_f1280w_circ3_err_njy"] is None
 
     # Simulate a crash after the first committed Parquet shard: the second is
     # present but not checkpointed, and must be safely rebuilt on resume.
@@ -163,7 +295,9 @@ def test_miri_photometry_mosaic_overlap_photoz_and_checkpoint(tmp_path):
                       chunk_size=1, max_objects=1, rows_per_file=1, image_size=8)
     report, _ = inspect(scratch)
     assert report["total_objects"] == 2
-    assert report["sample_band_occurrences"]["F770W"] == 2
+    assert report["sample_band_occurrences"]["f770w"] == 2
+    assert report["sample_photometric_band_occurrences"]["f1280w"] == 1
+    assert report["sample_photoz_occurrences"]["photoz_kron"] == 2
 
 
 def test_miri_focused_sample_filters_catalog_exposures(tmp_path):
@@ -191,6 +325,90 @@ def test_miri_focused_sample_filters_catalog_exposures(tmp_path):
     import pyarrow.parquet as pq
     row = pq.read_table(scratch / "GOODS-S_00000.parquet").to_pylist()[0]
     assert row["object_id"] == "GOODS-S:2"
+
+
+def test_jwst_one_row_combines_nircam_and_miri_at_native_scales(tmp_path):
+    catalog = tmp_path / "cat.fits"
+    _catalog(catalog)
+    ids = fits.Column(name="ID", format="J", array=np.array([1, 2], dtype=np.int32))
+    with fits.open(catalog, mode="update") as hdus:
+        hdus.append(fits.BinTableHDU.from_columns([
+            ids,
+            fits.Column(name="F770W_CIRC3", format="E", array=[10., 20.]),
+            fits.Column(name="F770W_CIRC3_e", format="E", array=[1., 2.]),
+            fits.Column(name="F1280W_CIRC3", format="E", array=[3., 4.]),
+        ], name="MIRI"))
+    entries = []
+    for band, scale, psf in (("F770W", 0.06, 0.27), ("F277W", 0.03, None)):
+        path = tmp_path / f"{band.lower()}.fits"
+        sci_header = _wcs(scale).to_header()
+        if band == "F770W":
+            sci_header["PIXAR_SR"] = 1e-14
+            sci_header["BUNIT"] = "MJy/sr"
+        fits.HDUList([
+            fits.PrimaryHDU(),
+            fits.ImageHDU(np.ones((200, 200), dtype=np.float32), sci_header, name="SCI"),
+            fits.ImageHDU(np.ones((200, 200), dtype=np.float32), name="ERR"),
+        ]).writeto(path)
+        entry = {"path": path.name, "field": "GOODS-S", "band": band,
+                 "sci_hdu": "SCI", "uncertainty_hdu": "ERR",
+                 "uncertainty_kind": "sigma",
+                 "unit": "MJy/sr" if band == "F770W" else "nJy"}
+        if psf is not None:
+            entry["psf_fwhm_arcsec"] = psf
+        entries.append(entry)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    assert process_field("GOODS-S", catalog, entries, tmp_path, scratch,
+                         chunk_size=1, max_objects=2, image_size=8) == 2
+    import pyarrow.parquet as pq
+    table = pq.read_table(scratch / "GOODS-S_00000.parquet")
+    row = table.to_pylist()[0]
+    image = row["image"]
+    assert image["band"] == ["f277w", "f770w"]
+    assert image["scale"] == pytest.approx([0.03, 0.06])
+    assert image["psf_fwhm"][0] is None
+    assert image["psf_fwhm"][1] == pytest.approx(0.27)
+    assert row["image_sources"] == ["f277w.fits", "f770w.fits"]
+    assert len(image["flux"]) == len(image["ivar"]) == len(image["mask"]) == 2
+    assert np.asarray(image["flux"]).shape == (2, 8, 8)
+    assert image["flux"][0][0][0] == pytest.approx(1.)
+    assert image["flux"][1][0][0] == pytest.approx(10.)  # MJy/sr -> nJy/pixel.
+    assert image["ivar"][1][0][0] == pytest.approx(0.01)  # Sigma rescales too.
+    assert "phot_f1280w_circ3_flux_njy" in table.column_names
+    assert row["phot_f1280w_circ3_flux_njy"] == pytest.approx(3.0)
+    assert row["photoz"]["z_a"] is None
+    assert row["photoz_kron"]["z_a"] is None
+    assert row["z_spec"] is None
+    # Both rows share a single Parquet shard. The audit must sample rows,
+    # rather than merely inspecting the first row of each file.
+    report, samples = inspect(scratch, max_samples=2, expected_size=8)
+    assert report["sampled_objects"] == 2
+    assert report["sample_field_occurrences"] == {"GOODS-S": 2}
+    assert report["sample_miri_objects"] == 2
+    assert report["sample_joint_nircam_miri_objects"] == 2
+    assert {row["object_id"] for row in samples} == {"GOODS-S:1", "GOODS-S:2"}
+    with pytest.raises(ValueError, match="Incorrect cutout size"):
+        inspect(scratch, max_samples=1, expected_size=160)
+
+
+def test_manifest_rejects_invalid_psf_calibration(tmp_path):
+    catalog = tmp_path / "cat.fits"
+    _catalog(catalog)
+    mosaic = tmp_path / "img.fits"
+    fits.HDUList([
+        fits.PrimaryHDU(),
+        fits.ImageHDU(np.ones((200, 200), np.float32), _wcs().to_header(), name="SCI"),
+        fits.ImageHDU(np.ones((200, 200), np.float32), name="ERR"),
+    ]).writeto(mosaic)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    entry = {"path": "img.fits", "field": "GOODS-S", "band": "F277W",
+             "sci_hdu": "SCI", "uncertainty_hdu": "ERR",
+             "uncertainty_kind": "sigma", "unit": "nJy",
+             "psf_fwhm_arcsec": -1.0}
+    with pytest.raises(ValueError, match="Invalid psf_fwhm_arcsec"):
+        process_field("GOODS-S", catalog, [entry], tmp_path, scratch, 1, 1, image_size=8)
 
 
 def test_manifest_detects_correct_products_and_requires_complete_set(tmp_path):
