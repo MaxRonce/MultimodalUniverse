@@ -5,6 +5,13 @@ photometry from the two FITS catalogs, without opening the image mosaics or
 modifying any dataset files. It finishes after one pass; repeated polling is
 unnecessary for the complete parent-catalog statistics.
 
+The Slurm launcher uses `uv run --no-project --isolated` with only numpy,
+astropy, matplotlib and pyarrow. It does not build/install MMU or modify the
+repository's `.venv`. This avoids failures when setuptools-scm encounters
+non-version tags such as `demo-2026-04-07-hackathon`, and ignores any active
+AION environment inherited by the job. First launch may install the small audit
+dependency set into uv's cache.
+
 From the MMU repository root on the Rusty login node:
 
 ```bash
@@ -104,12 +111,16 @@ For parent-catalog-only statistics again, use `unset JADES_AUDIT_SCRATCH`.
 ## Direct CLI / tests
 
 ```bash
-uv run --extra viz python -m scripts.jades.audit_selection \
+uv run --no-project --isolated --python 3.11 \
+  --with numpy --with astropy --with matplotlib --with pyarrow \
+  python -m scripts.jades.audit_selection \
   --raw-root "$JADES_RAW" --manifest "$JADES_MANIFEST" \
   --mag-band F277W --mag-cuts 21 22 23 24 25 26 27 28 29 \
   --output-dir "$JADES_AUDIT_OUT" --plots
 
-uv run --extra dev --extra viz python -m pytest -q scripts/jades/test_audit_selection.py
+uv run --no-project --isolated --python 3.11 \
+  --with numpy --with astropy --with matplotlib --with pyarrow --with pytest \
+  python -m pytest -q scripts/jades/test_audit_selection.py
 ```
 
 `--bands`, `--aperture` and `--snr-edges` are configurable. Omit `--plots` to
