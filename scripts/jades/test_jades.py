@@ -191,12 +191,31 @@ def test_distributed_shards_cover_each_source_once_and_validate_completion(tmp_p
     assert len(calls) == 1
     assert calls[0][0] == (str(root),)
     assert calls[0][1]["catalog_name"] == "jades_jwst"
+    assert calls[0][1]["highest_healpix_order"] == 13
+    assert calls[0][1]["expected_total_rows"] == 4
     hats_output = tmp_path / "hats"
     hats_output.mkdir()
     (hats_output / "user_data.txt").write_text("preserve")
     with pytest.raises(FileExistsError, match="already contains data"):
         builder.main()
     assert (hats_output / "user_data.txt").read_text() == "preserve"
+
+    # Resuming a nonempty output requires an existing staging identity.
+    resume_tmp = tmp_path / "resume_tmp"
+    monkeypatch.setattr(sys, "argv", [
+        "build_parent_sample_hats", "--instrument", "jwst", "--manifest", str(manifest),
+        "--raw-root", str(tmp_path), "--scratch-dir", str(root),
+        "--output-root", str(hats_output), "--num-shards", "3", "--ingest-only",
+        "--tmp-dir", str(resume_tmp), "--hats-resume", "--hats-mapping-retries", "1",
+    ])
+    with pytest.raises(FileExistsError, match="already contains data"):
+        builder.main()
+    identity = resume_tmp / "hats_import_jades_jwst_resume" / "_mmu_resume_identity.json"
+    identity.parent.mkdir(parents=True)
+    identity.write_text("{}")
+    builder.main()  # The mocked importer receives the configuration to verify.
+    assert calls[-1][1]["resumable"] is True
+    assert calls[-1][1]["mapping_retries"] == 1
 
     missing_done = shard_directory(root, 1, 3) / "GOODS-N.done"
     missing_done.unlink()

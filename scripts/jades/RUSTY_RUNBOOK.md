@@ -524,15 +524,50 @@ reviewing the image audit and confirming available Ceph space. HATS ingestion
 can require substantial additional temporary space for partitioning and margin
 creation. It is a separate Dask stage, not 32 independent HATS catalogs.
 
-Choose a **new** output and scheduler filename for each attempt, and keep the
-staging directory on shared Ceph so every worker can access it:
+For the **first run**, choose a new output, staging, and scheduler filename,
+and keep the HATS staging directory on shared Ceph so every worker can access
+it. The ingest script now enables HATS checkpoints and one bounded retry of an
+incomplete mapping stage. It also exposes the maximum HEALPix order and the
+per-partition row threshold; defaults are order 13 / 1,024 rows. **Run the
+preflight below** before accepting them. The upstream default of order 10 is
+too coarse for dense JADES fields, while order 15 would require a dense
+~96 GiB histogram for a single map, exceeding the old 12 GiB worker limit.
+The importer checks that all 484,219 rows reach the main catalog.
+
+If an older ingest failed **without** `--hats-resume`, its temporary checkpoints
+were deleted: start with a fresh output and temp path. Never reuse an existing
+partially written HATS output from an old non-resumable run.
+
+Run the read-only coordinate/partition audit first. It reads only `ra` and
+`dec` from the existing Parquet files (not the 160×160 cutout arrays) and
+reports the maximum occupancy and theoretical *single-array* dense histogram
+RAM for orders 10–13. The selected threshold must be at least as large as
+the maximum occupancy at the selected finest order, and actual binning peak
+RAM is higher than the histogram size alone:
 
 ```bash
-export JADES_HATS_OUT="$JADES_RUN/hats_jades_jwst_full_dist_v2"
-export JADES_HATS_TMP="$JADES_RUN/hats_tmp_jwst_full_dist_v2"
-export JADES_DASK_FILE="$JADES_RUN/dask_jwst_full_dist_v2.json"
+uv run python -m scripts.jades.hats_healpix_preflight \
+  --scratch-dir "$JADES_SCRATCH" \
+  --highest-order 13 --pixel-threshold 1024 --expected-rows 484219
+```
+
+If the audit fails, **do not submit the HATS jobs**. Adjust the threshold or
+order based on the printed occupancies and rerun the preflight. A higher order
+increases RAM quickly (`~1.5 GiB` for order 12, `~6 GiB` for order 13, and
+`~24 GiB` for order 14 *per dense histogram*, before intermediate arrays).
+For order 13 we provision 64 GiB workers to leave room for the binning and
+reduction stages; start with fewer workers if the scheduler has limited RAM.
+
+```bash
+export JADES_HATS_TAG="$(date -u +%Y%m%dT%H%M%SZ)"
+export JADES_HATS_OUT="$JADES_RUN/hats_jades_jwst_${JADES_HATS_TAG}"
+export JADES_HATS_TMP="$JADES_RUN/hats_tmp_jwst_${JADES_HATS_TAG}"
+export JADES_DASK_FILE="$JADES_RUN/dask_jwst_${JADES_HATS_TAG}.json"
 export JADES_DASK_WORKERS=8
-export JADES_DASK_WORKER_MEMORY=12GiB
+export JADES_DASK_WORKER_MEMORY=56GiB
+export JADES_HATS_MAX_ORDER=13
+export JADES_HATS_PIXEL_THRESHOLD=1024
+export JADES_HATS_MAPPING_RETRIES=1
 
 DASK_SCHED_JOB=$(sbatch --parsable --export=ALL \
   --job-name=jades-scheduler --partition=genx \
@@ -549,7 +584,7 @@ When that job is RUNNING and the scheduler file exists:
 DASK_WORKER_JOB=$(sbatch --parsable --export=ALL \
   --job-name=jades-dask-worker --partition=genx \
   --array=0-7%8 --nodes=1 --ntasks=1 --cpus-per-task=1 \
-  --mem=16G --time=24:00:00 \
+  --mem=64G --time=24:00:00 \
   --output="$JADES_RUN/logs/dask_worker_%A_%a.out" \
   scripts/jades/slurm_dask_worker.sh)
 echo "$DASK_WORKER_JOB"
@@ -573,7 +608,19 @@ Wait until `sacct -j "$HATS_JOB"` reports **COMPLETED**, then inspect:
 
 ```bash
 du -sh "$JADES_HATS_OUT"
-find "$JADES_HATS_OUT" -maxdepth 3 -type f -name 'properties'
+find "$JADES_HATS_OUT" -maxdepth 4 -type f -name 'hats.properties'
+uv run python - <<'PY'
+import os
+from pathlib import Path
+import pyarrow.parquet as pq
+
+main = Path(os.environ["JADES_HATS_OUT"]) / "jades_jwst" / "jades_jwst"
+leaves = list((main / "dataset").rglob("Npix=*.parquet"))
+rows = sum(pq.read_metadata(leaf).num_rows for leaf in leaves)
+print(f"HATS main catalog: {len(leaves)} HEALPix partitions; {rows:,} rows")
+assert rows == 484219, "HATS row count differs from extracted JADES objects"
+assert (main / "hats.properties").exists(), "Missing main HATS metadata"
+PY
 ```
 
 The collection is named `jades_jwst`. The HATS inner catalog is typically
@@ -583,8 +630,35 @@ Dask allocations with `scancel "$DASK_WORKER_JOB" "$DASK_SCHED_JOB"`.
 The scheduler file may already disappear when Dask stops; always select a new
 name on the next attempt.
 
+**If HATS ingestion fails:** check `sacct` and the client log. A message like
+`some map stages did not complete successfully` means that at least one of the
+mapping histograms is missing; a 100% Dask progress bar only means that all
+futures *finished*, not that all succeeded. The patched importer reports the
+number and first 20 missing `map_N.npz` checkpoints and keeps the staging
+directory on Ceph. A mapping retry can reuse already completed histogram files.
+
+For a subsequent resume, keep **the same** `JADES_HATS_OUT` and
+`JADES_HATS_TMP` (including the automatically written
+`hats_import_jades_jwst_resume/_mmu_resume_identity.json`), but select a
+**new** `JADES_DASK_FILE` and start a new scheduler, worker array, and HATS
+client with the commands above. The resumed run checks input paths, catalog
+name, output path and import parameters against its stored fingerprint before
+touching any partial output. Do not edit or delete the checkpoint directory.
+Never have two HATS client jobs writing to the same output/staging pair.
+
+To watch mapping checkpoints while the map stage runs:
+
+```bash
+find "$JADES_HATS_TMP/hats_import_jades_jwst_resume" -name 'map_*.npz' | wc -l
+tail -n 40 "$JADES_RUN/logs/hats_${HATS_JOB}.out"
+```
+
+Mapping histograms can disappear after a *successful* mapping stage, when the
+pipeline advances to binning. Do not interpret a later zero count as failure.
+
 **Important constraints:** Slurm partitions/accounts/wall-time limits are
 site-specific; adjust these resource requests if Rusty rejects them. Scale
 the number of *concurrent* workers gradually because Ceph I/O can saturate.
 An interrupted extraction is resumable at committed Parquet checkpoints;
-an interrupted HATS import currently requires a fresh HATS output path.
+with the updated import script, HATS is also resumable when its source inputs,
+configuration and persistent temporary directory are unchanged.

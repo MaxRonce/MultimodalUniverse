@@ -17,10 +17,14 @@ build their own PyArrow tables from the survey-native raw inputs and call
 
 import contextlib
 import glob
+import hashlib
+import json
 import logging
 import os
+import re
 import shutil
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -216,12 +220,16 @@ def write_hats_from_parquet_dir(
     *,
     pixel_threshold: int = 100_000,
     lowest_healpix_order: int = 4,
+    highest_healpix_order: int = 10,
     margin_threshold_arcsec: float = 10.0,
     chunksize: int = 500_000,
     n_workers: int = 32,
     debug: bool = False,
     client: Client | None = None,
     tmp_dir: str | None = None,
+    resumable: bool = False,
+    mapping_retries: int = 0,
+    expected_total_rows: int | None = None,
 ) -> str:
     """Write a HATS catalog by streaming parquet files from a directory.
 
@@ -246,18 +254,34 @@ def write_hats_from_parquet_dir(
         catalog_name: Name of the output catalog.
         pixel_threshold: Max rows per HATS partition.
         lowest_healpix_order: Coarsest HEALPix order used for partitioning.
+        highest_healpix_order: Finest HEALPix order allowed by adaptive binning.
         margin_threshold_arcsec: Width of the margin cache in arcseconds.
         chunksize: ``ParquetPyarrowReader.iter_batches`` batch size; controls
             map-stage memory per dask worker.
         n_workers: Dask workers (ignored if ``client`` is provided).
         debug: Single-process mode if no client provided.
         client: Pre-built dask ``Client`` to reuse.
+        resumable: Retain mapping checkpoints after failure and reuse them on
+            an identical retry. Requires a persistent ``tmp_dir``.
+        mapping_retries: Bounded attempts to resume an incomplete mapping
+            stage in the same invocation (requires ``resumable=True``).
+        expected_total_rows: Verify the un-margined catalog row count after import.
 
     Returns:
         The path to the inner catalog directory.
     """
     if not os.path.isdir(parquet_dir):
         raise FileNotFoundError(f"parquet_dir does not exist: {parquet_dir}")
+    if mapping_retries < 0:
+        raise ValueError("mapping_retries must be >= 0")
+    if resumable and tmp_dir is None:
+        raise ValueError("resumable HATS import requires a persistent tmp_dir")
+    if mapping_retries and not resumable:
+        raise ValueError("mapping_retries requires resumable=True")
+    if highest_healpix_order < lowest_healpix_order:
+        raise ValueError("highest_healpix_order must be >= lowest_healpix_order")
+    if expected_total_rows is not None and expected_total_rows <= 0:
+        raise ValueError("expected_total_rows must be positive")
 
     # Enumerate parquet files explicitly. We pass them via input_file_list
     # rather than relying on hats-import's input_path glob, because the
@@ -279,26 +303,68 @@ def write_hats_from_parquet_dir(
         output_path, catalog_name,
     )
 
-    # Clean stale output from a previous failed gather. hats-import's
-    # Finishing stage scans the entire dataset/ dir for parquet files; if
-    # a prior run left partial output at a different pixel_threshold, the
-    # row counts won't match and the pipeline errors with a cryptic
-    # "Number of rows does not match expectation" ValueError.
-    inner_catalog = os.path.join(output_path, catalog_name, catalog_name)
-    if os.path.isdir(inner_catalog):
-        LOGGER.warning(
-            "Cleaning stale output dir %s from a previous failed gather",
-            inner_catalog,
-        )
-        shutil.rmtree(inner_catalog)
-
-    # Let very large image datasets place hats-import's staging area on a
-    # scratch filesystem with enough capacity. Existing callers are unchanged.
+    # A fixed staging directory lets hats-import resume the successfully
+    # mapped inputs after a transient Dask cancellation. Fingerprint the run
+    # so a changed input inventory or threshold cannot reuse stale histograms.
     if tmp_dir is not None:
         os.makedirs(tmp_dir, exist_ok=True)
-    staging_dir = tempfile.mkdtemp(prefix=f"hats_import_{catalog_name}_", dir=tmp_dir)
-    try:
-        import_args = (
+    if resumable:
+        staging_dir = os.path.join(tmp_dir, f"hats_import_{catalog_name}_resume")
+        identity_path = Path(staging_dir) / "_mmu_resume_identity.json"
+        identity = {
+            "parquet_dir": os.path.realpath(parquet_dir),
+            "output_path": os.path.realpath(output_path),
+            "catalog_name": catalog_name,
+            "input_count": len(parquet_files),
+            "input_paths_sha256": hashlib.sha256(
+                "\n".join(parquet_files).encode("utf-8")
+            ).hexdigest(),
+            "pixel_threshold": pixel_threshold,
+            "lowest_healpix_order": lowest_healpix_order,
+            "highest_healpix_order": highest_healpix_order,
+            "margin_threshold_arcsec": margin_threshold_arcsec,
+            "chunksize": chunksize,
+            "expected_total_rows": expected_total_rows,
+        }
+        if os.path.exists(staging_dir):
+            if not identity_path.is_file():
+                raise FileExistsError(
+                    f"Refusing HATS resume without MMU identity: {staging_dir}"
+                )
+            if json.loads(identity_path.read_text()) != identity:
+                raise ValueError(f"HATS resume identity mismatch: {staging_dir}")
+        else:
+            os.makedirs(staging_dir)
+            identity_path.write_text(json.dumps(identity, indent=2) + "\n")
+    else:
+        staging_dir = tempfile.mkdtemp(prefix=f"hats_import_{catalog_name}_", dir=tmp_dir)
+
+    # Preserve partial HATS output when resuming; hats-import needs its own
+    # output checkpoints. Keep the prior cleanup behavior for other callers.
+    inner_catalog = os.path.join(output_path, catalog_name, catalog_name)
+    if not resumable and os.path.isdir(inner_catalog):
+        LOGGER.warning("Cleaning stale output dir %s", inner_catalog)
+        shutil.rmtree(inner_catalog)
+
+    def _report_missing_maps():
+        pattern = re.compile(r"map_(\d+)\.npz")
+        histogram_ids = {
+            int(match.group(1))
+            for path in Path(staging_dir).rglob("*.npz")
+            if (match := pattern.fullmatch(path.name))
+        }
+        missing = sorted(set(range(len(parquet_files))) - histogram_ids)
+        LOGGER.error(
+            "HATS mapping checkpoints: %d/%d found; %d input files missing histograms",
+            len(histogram_ids), len(parquet_files), len(missing),
+        )
+        for index in missing[:20]:
+            LOGGER.error("Missing HATS map_%d.npz: %s", index, parquet_files[index])
+        if len(missing) > 20:
+            LOGGER.error("... and %d more files missing histograms", len(missing) - 20)
+
+    def _import_arguments():
+        return (
             CollectionArguments(
                 output_artifact_name=catalog_name,
                 output_path=output_path,
@@ -311,12 +377,37 @@ def write_hats_from_parquet_dir(
                 dec_column="dec",
                 pixel_threshold=pixel_threshold,
                 lowest_healpix_order=lowest_healpix_order,
+                highest_healpix_order=highest_healpix_order,
+                **({"expected_total_rows": expected_total_rows}
+                   if expected_total_rows is not None else {}),
             )
             .add_margin(margin_threshold=margin_threshold_arcsec, is_default=True)
         )
+
+    succeeded = False
+    try:
         with _client_ctx(client, n_workers, debug) as c:
-            pipeline_with_client(import_args, c)
+            for attempt in range(mapping_retries + 1):
+                try:
+                    pipeline_with_client(_import_arguments(), c)
+                    break
+                except RuntimeError as exc:
+                    _report_missing_maps()
+                    incomplete = "some map stages did not complete successfully" in str(exc).lower()
+                    if not incomplete or attempt >= mapping_retries:
+                        raise
+                    LOGGER.warning(
+                        "Retrying incomplete HATS mapping (%d/%d) from %s",
+                        attempt + 1, mapping_retries, staging_dir,
+                    )
+        succeeded = True
+    except BaseException:
+        LOGGER.exception("HATS import failed; staging directory: %s", staging_dir)
+        raise
     finally:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        if succeeded or not resumable:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        else:
+            LOGGER.error("Preserved resumable HATS checkpoints at %s", staging_dir)
 
     return os.path.join(output_path, catalog_name, catalog_name)

@@ -699,7 +699,9 @@ def main() -> None:
                    help="Maximum image records held in memory for Arrow serialization")
     p.add_argument("--rows-per-file", type=int, default=64,
                    help="Target records per completed Parquet checkpoint shard")
-    p.add_argument("--pixel-threshold", type=int, default=256)
+    p.add_argument("--pixel-threshold", type=int, default=1024)
+    p.add_argument("--highest-healpix-order", type=int, default=13,
+                   help="Maximum HEALPix order for dense JADES fields (default: 13; preflight first)")
     p.add_argument("--ingest-workers", type=int, default=2)
     p.add_argument("--hats-batch-size", type=int, default=4,
                    help="Maximum records in a HATS import batch per worker")
@@ -710,6 +712,10 @@ def main() -> None:
     p.add_argument("--min-ingest-workers", type=int, default=1,
                    help="Wait for this many external Dask workers before starting HATS import")
     p.add_argument("--tmp-dir", type=Path)
+    p.add_argument("--hats-resume", action="store_true",
+                   help="Keep HATS intermediate files on failure and resume an identical import")
+    p.add_argument("--hats-mapping-retries", type=int, default=0,
+                   help="Retry incomplete HATS mapping with retained checkpoints (requires --hats-resume)")
     args = p.parse_args()
     if args.chunk_size <= 0:
         p.error("--chunk-size must be > 0")
@@ -733,8 +739,16 @@ def main() -> None:
         p.error("--min-ingest-workers must be > 0")
     if args.min_ingest_workers > 1 and args.scheduler_file is None:
         p.error("--min-ingest-workers > 1 requires --scheduler-file")
+    if args.hats_mapping_retries < 0:
+        p.error("--hats-mapping-retries must be >= 0")
+    if args.hats_resume and args.tmp_dir is None:
+        p.error("--hats-resume requires --tmp-dir")
+    if args.hats_mapping_retries and not args.hats_resume:
+        p.error("--hats-mapping-retries requires --hats-resume")
     if args.image_size <= 0:
         p.error("--image-size must be > 0")
+    if args.highest_healpix_order < 4:
+        p.error("--highest-healpix-order must be >= 4")
     if (args.mag_band is None) != (args.mag_max is None):
         p.error("--mag-band and --mag-max must be set together")
     allowed = JWST_BANDS if args.instrument == "jwst" else HST_BANDS
@@ -788,14 +802,23 @@ def main() -> None:
             return
 
     if output_root.exists() and any(output_root.iterdir()):
-        raise FileExistsError(f"HATS output root already contains data: {output_root}. "
-                              "Choose a new --output-root to preserve existing results")
+        resume_identity = (
+            args.tmp_dir / f"hats_import_{catalog_name}_resume" / "_mmu_resume_identity.json"
+            if args.hats_resume else None
+        )
+        if resume_identity is None or not resume_identity.is_file():
+            raise FileExistsError(f"HATS output root already contains data: {output_root}. "
+                                  "Choose a new --output-root to preserve existing results")
     from mmu.hats_import import write_hats_from_parquet_dir
 
     kwargs = {"output_path": str(output_root), "catalog_name": catalog_name,
               "pixel_threshold": args.pixel_threshold, "n_workers": args.ingest_workers,
               "chunksize": args.hats_batch_size,
-              "tmp_dir": str(args.tmp_dir) if args.tmp_dir else None}
+              "highest_healpix_order": args.highest_healpix_order,
+              "expected_total_rows": total,
+              "tmp_dir": str(args.tmp_dir) if args.tmp_dir else None,
+              "resumable": args.hats_resume,
+              "mapping_retries": args.hats_mapping_retries}
     if args.scheduler_file:
         from dask.distributed import Client
 

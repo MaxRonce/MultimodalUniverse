@@ -17,7 +17,10 @@ exec uv run python -m scripts.jades.build_parent_sample_hats \
     --num-shards "$JADES_NUM_SHARDS" --ingest-only \
     --output-root "$JADES_HATS_OUT" \
     --tmp-dir "${JADES_HATS_TMP:-${JADES_RUN}/hats_tmp_jwst_v2}" \
-    --pixel-threshold "${JADES_HATS_PIXEL_THRESHOLD:-256}" \
+    --hats-resume \
+    --hats-mapping-retries "${JADES_HATS_MAPPING_RETRIES:-1}" \
+    --pixel-threshold "${JADES_HATS_PIXEL_THRESHOLD:-1024}" \
+    --highest-healpix-order "${JADES_HATS_MAX_ORDER:-13}" \
     --hats-batch-size "${JADES_HATS_BATCH_SIZE:-4}" \
     --scheduler-file "$JADES_DASK_FILE" \
     --min-ingest-workers "${JADES_DASK_WORKERS:-8}"
