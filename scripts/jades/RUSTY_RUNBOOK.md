@@ -538,9 +538,13 @@ If an older ingest failed **without** `--hats-resume`, its temporary checkpoints
 were deleted: start with a fresh output and temp path. Never reuse an existing
 partially written HATS output from an old non-resumable run.
 
-Run the read-only coordinate/partition audit first. It reads only `ra` and
-`dec` from the existing Parquet files (not the 160×160 cutout arrays) and
-reports the maximum occupancy and theoretical *single-array* dense histogram
+Run the coordinate/partition audit first. It never modifies the extraction.
+On the first run it reads only `field`, `object_id`, `ra`, `dec`, with bounded
+parallel `ParquetFile` readers and `pre_buffer=False`, then saves a small atomic
+coordinate cache beside the scratch directory. It avoids dataset-wide schema
+discovery and background range coalescing across image-heavy row groups.
+It reports progress every roughly 100 files, per-field checkpoint counts,
+a selected-ID SHA256, maximum occupancy and theoretical *single-array* dense histogram
 RAM for orders 10–13. The selected threshold must be at least as large as
 the maximum occupancy at the selected finest order, and actual binning peak
 RAM is higher than the histogram size alone:
@@ -548,8 +552,37 @@ RAM is higher than the histogram size alone:
 ```bash
 uv run python -m scripts.jades.hats_healpix_preflight \
   --scratch-dir "$JADES_SCRATCH" \
+  --raw-root "$JADES_RAW" --manifest "$JADES_MANIFEST" \
+  --io-workers 8 \
   --highest-order 13 --pixel-threshold 1024 --expected-rows 484219
 ```
+
+The default cache is `${JADES_SCRATCH}.preflight-coordinates.npz`. Subsequent
+runs validate the complete file inventory, sizes/mtimes and completed extraction
+checkpoints, then reuse it **without opening any Parquet files**. There are still
+directory/stat calls on Ceph. Use `--coordinate-cache PATH.npz` to choose another
+cache location, or `--refresh-cache` to force a fresh scalar scan. Cache validity
+assumes ordinary immutable checkpoint files; after storage repair that preserves
+both file size and mtime, explicitly refresh. A corrupt cache fails visibly;
+refresh it to rebuild. No cutout images or extraction files are rewritten.
+
+The two original FITS catalogs include sources rejected during cutout extraction.
+Checkpoint counts/positions alone cannot identify those rejected sources. Thus
+the first exact preflight still has to open the committed Parquet files; it must
+not silently use all 485,510 parent sources or infer selection from a row count.
+The 484,219 retained IDs and their original coordinates are preserved directly.
+`--raw-root` additionally joins those field-qualified IDs to each FITS `SIZE`
+table, verifies exact RA/Dec equality, and prints retained/excluded field counts.
+Unknown/duplicate IDs, null/invalid coordinates, incomplete shard grids,
+missing/extra Parquet files, and per-checkpoint row-count mismatches fail.
+Both GOODS fields and every shard must be complete before this final preflight.
+
+For Rusty, run within a compute allocation, for example
+`srun --partition=genx --cpus-per-task=2 --mem=4G --time=01:00:00 --pty bash -l`,
+then run the command above from the repository root. Eight I/O readers overlap
+filesystem latency; they do not require eight CPUs. The first-run speed depends
+on Ceph latency; no Rusty timing is claimed from local tests. To compare a cold
+and warm run, prefix each with `time`; use `--refresh-cache` only for the cold run.
 
 If the audit fails, **do not submit the HATS jobs**. Adjust the threshold or
 order based on the printed occupancies and rerun the preflight. A higher order
