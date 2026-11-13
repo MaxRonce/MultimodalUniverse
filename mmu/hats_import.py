@@ -103,6 +103,76 @@ class ArrowTableReader(InputReader):
         yield table
 
 
+def _sparse_map_to_pixels(input_file, pickled_reader_file, resume_path, mapping_key,
+                          highest_order, ra_column, dec_column, use_healpix_29=False,
+                          threshold_mode="row_count", column_size_info=None):
+    """Write the upstream sparse checkpoint without allocating sky-wide arrays.
+
+    Mapping is a file-producing task. Returning successfully is only valid once
+    its atomic checkpoint can be read back with the expected order and count.
+    The upstream iterator preserves the installed reader and pixel semantics.
+    """
+    from hats_import.catalog.map_reduce import _iterate_input_file
+    from hats_import.catalog.resume_plan import ResumePlan
+    from hats.pixel_math.sparse_histogram import SparseHistogram
+    from hats.pixel_math.spatial_index import SPATIAL_INDEX_COLUMN
+
+    if threshold_mode != "row_count":
+        raise ValueError("Sparse mapping supports row-count thresholds only")
+    columns = [SPATIAL_INDEX_COLUMN] if use_healpix_29 else [ra_column, dec_column]
+    counts = {}
+    rows = 0
+    for _, data, pixels in _iterate_input_file(
+            input_file, pickled_reader_file, highest_order, ra_column, dec_column,
+            use_healpix_29, columns):
+        indexes, frequencies = np.unique(pixels, return_counts=True)
+        for index, count in zip(indexes, frequencies):
+            counts[int(index)] = counts.get(int(index), 0) + int(count)
+        rows += len(data)
+    indexes = np.array(sorted(counts), dtype=np.int64)
+    frequencies = np.array([counts[int(i)] for i in indexes], dtype=np.int64)
+    target = Path(str(ResumePlan.partial_histogram_file(
+        tmp_path=resume_path, mapping_key=mapping_key)))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, suffix=".npz.part", delete=False) as out:
+            temporary = Path(out.name)
+            np.savez(out, indexes=indexes, counts=frequencies, order=highest_order)
+        os.replace(temporary, target)
+        saved = SparseHistogram.from_file(str(target))
+        if (int(saved.order) != highest_order or int(saved.counts.sum()) != rows
+                or not np.array_equal(saved.indexes, indexes)
+                or not np.array_equal(saved.counts, frequencies)):
+            raise RuntimeError(f"Invalid mapping checkpoint {target} for {input_file}")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return {"checkpoint": str(target), "rows": rows}
+
+
+class _MappingClient:
+    """Delegate the Dask API, replacing only row-count catalog map tasks.
+
+    pure=False is required for file side effects: a retry must execute again,
+    even when the scheduler remembers an earlier result with the same inputs.
+    Splitting, reducing and margins retain their upstream implementations.
+    """
+
+    def __init__(self, client):
+        self.client = client
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    def submit(self, func, *args, **kwargs):
+        if (getattr(func, "__module__", "") == "hats_import.catalog.map_reduce"
+                and getattr(func, "__name__", "") == "map_to_pixels"
+                and kwargs.get("threshold_mode", "row_count") == "row_count"):
+            func = _sparse_map_to_pixels
+            kwargs["pure"] = False
+        return self.client.submit(func, *args, **kwargs)
+
+
 @contextlib.contextmanager
 def _client_ctx(client: Client | None, n_workers: int, debug: bool):
     """Yield a dask Client. If ``client`` is provided, use it as-is and DO NOT
@@ -387,9 +457,11 @@ def write_hats_from_parquet_dir(
     succeeded = False
     try:
         with _client_ctx(client, n_workers, debug) as c:
+            print("HATS row-count mapping: sparse counters, atomic checked checkpoints, "
+                  "Dask pure=False", flush=True)
             for attempt in range(mapping_retries + 1):
                 try:
-                    pipeline_with_client(_import_arguments(), c)
+                    pipeline_with_client(_import_arguments(), _MappingClient(c))
                     break
                 except RuntimeError as exc:
                     _report_missing_maps()

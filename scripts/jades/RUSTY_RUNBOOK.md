@@ -519,6 +519,36 @@ overwrite active output.
 
 ### 8.4 Distributed HATS ingest across several compute nodes
 
+Recovery after run `7462528`: its controller reports 0/7600 map checkpoints,
+but the available controller and worker excerpts contain no individual mapping
+exception. The original storage/runtime cause is therefore not established.
+The MMU importer now replaces row-count mapping tasks with a sparse counter:
+it uses the installed reader and upstream coordinate-to-pixel iterator, writes
+the same `indexes/counts/order` NPZ format atomically, and reads each checkpoint
+back before returning success. Dask submits these file-producing tasks with
+`pure=False` so a retry cannot reuse a cached successful result after a file
+has disappeared. Other mapping modes and split/reduce/margin code are unchanged.
+The sparse mapper avoids full-sky arrays per input file. Binning still uses
+upstream dense arrays on the **client**, which needs more memory than the
+previous 16 GiB request at high orders.
+
+The measured preflight for this extraction is:
+GOODS-S=303762, GOODS-N=180457, total=484219; maximum occupancy 1718 at order
+12 and 485 at order 13. A recovery run can use **order 12 / threshold 2048**,
+with **64G for the HATS client** and the existing eight 64G workers (56GiB
+Dask limit). This reduces the dense sky footprint by four relative to order
+13 without dropping or changing any selected source. Recheck with the cached
+preflight using `--highest-order 12 --pixel-threshold 2048 --expected-rows
+484219`. These changed parameters require a **new HATS output and staging
+pair**: retain the old pair for diagnosis, reuse the existing extraction, and
+do not bypass the old resume identity check. Always use a new scheduler JSON.
+
+Local validation covers real HATS readers/checkpoints, a real Dask retry after
+deleting a completed checkpoint, and an entire tiny collection import including
+nested image values and margins. This is a tested mapping replacement, not a
+claim that the unidentified Rusty failure has been reproduced or that all
+cluster stages have been validated on the full dataset.
+
 Start this stage **only after** every extraction task is complete, after
 reviewing the image audit and confirming available Ceph space. HATS ingestion
 can require substantial additional temporary space for partitioning and margin
