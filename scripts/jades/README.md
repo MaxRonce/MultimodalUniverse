@@ -22,6 +22,14 @@ JWST path uses the 34 NIRCam v5.0 + 18 MIRI v1.0 images downloaded for this
 project, along with the two GOODS-S/GOODS-N photometric catalogs. The HST
 builder remains separate and requires HST images not yet obtained here.
 
+**Resuming the November 2026 full extraction:** see [runbook §8.3a](RUSTY_RUNBOOK.md#83a-fast-checkpoint-compatible-recovery-of-extraction-array-7453873).
+The faster mode uses 64 Slurm array elements across the *existing* 32 shard
+directories (one GOODS field per job), plus configurable concurrent FITS
+reads and spatial batching. It deliberately preserves already committed
+Parquet files, the existing checkpoint fingerprints, 160×160 native pixels,
+photometric scalars and the real SCI/ERR-derived IVAR/masks. Do not run it
+concurrently with the original extraction array.
+
 ## Scientific sources
 
 - [Official release and attribution](https://jades-survey.github.io/scientists/data.html)

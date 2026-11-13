@@ -15,6 +15,8 @@ import json
 import math
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -427,12 +429,20 @@ def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root:
                   image_size: int = IMAGE_SIZE, rows_per_file: int = 64,
                   sample_mode: str = "first",
                   phot_bands: tuple[str, ...] | None = None,
-                  num_shards: int = 1, shard_index: int = 0) -> int:
+                  num_shards: int = 1, shard_index: int = 0,
+                  extract_threads: int = 1, spatial_batch_size: int = 1) -> int:
     """Extract a field to bounded-memory Parquet shards with crash checkpoints.
 
     A checkpoint is committed only after a shard is atomically published. On
     resume, at most one in-progress shard is recomputed; complete shards stay.
+
+    Threads overlap FITS memory-map page faults. Spatial batching schedules
+    nearby cutouts together but restores *catalog order* before writing. Both
+    execution knobs are excluded from the fingerprint intentionally: changing
+    them cannot change a source's pixels, row order or checkpoint semantics.
     """
+    if extract_threads < 1 or spatial_batch_size < 1:
+        raise ValueError("extract_threads and spatial_batch_size must both be >= 1")
     done = scratch / f"{field}.done"
     progress = scratch / f"{field}.progress.json"
     shard_directory(scratch, shard_index, num_shards)  # validate before doing any I/O
@@ -573,36 +583,67 @@ def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root:
         count = checkpoint["count"]
         shard = checkpoint["next_shard"]
         chunk, shard_rows, writer = [], 0, None
-        for position in range(checkpoint["next_index"], n):
+
+        def extract_one(position: int) -> dict | None:
             i = int(selected[position])
             if magnitude is not None and (not np.isfinite(magnitude[i]) or magnitude[i] >= mag_max):
-                continue
-            row = _record(i, size, flags, images, field, image_size,
-                          phot_bands=phot_bands, phot_columns=phot_columns,
-                          photoz_columns=photoz_columns,
-                          photoz_kron_columns=photoz_kron_columns,
-                          coord_index=position)
-            if row is None:
-                continue
-            chunk.append(row)
-            if len(chunk) >= chunk_size:
-                batch = _table(chunk)
-                if writer is None:
-                    target = scratch / f"{field}_{shard:05d}.parquet"
-                    temporary = target.with_suffix(".parquet.part")
-                    writer = pq.ParquetWriter(temporary, batch.schema, compression="zstd")
-                writer.write_table(batch)
-                shard_rows += len(chunk)
-                chunk.clear()
-                if shard_rows >= rows_per_file:
-                    writer.close()
-                    os.replace(temporary, target)
-                    count += shard_rows
-                    shard += 1
-                    writer, shard_rows = None, 0
-                    commit(position + 1, count, shard)
-                    print(f"{field}: checkpoint {position+1}/{n} scanned, "
-                          f"{count} cutouts, {shard} parquet files", flush=True)
+                return None
+            return _record(i, size, flags, images, field, image_size,
+                           phot_bands=phot_bands, phot_columns=phot_columns,
+                           photoz_columns=photoz_columns,
+                           photoz_kron_columns=photoz_kron_columns,
+                           coord_index=position)
+
+        def spatial_key(position: int) -> tuple[int, int, int]:
+            # All GOODS mosaics share a sky footprint. One reference WCS is
+            # enough to improve local page reuse without changing any pixels.
+            x, y = images[0]["x"][position], images[0]["y"][position]
+            if not np.isfinite(x) or not np.isfinite(y):
+                return (2**62, 2**62, position)
+            return (math.floor(float(y) / image_size),
+                    math.floor(float(x) / image_size), position)
+
+        started = time.monotonic()
+        scanned = 0
+        # Each batch bounds the number of in-flight cutouts and retains the
+        # original output/checkpoint order, even when tasks run out of order.
+        with ThreadPoolExecutor(max_workers=extract_threads) as executor:
+            for start_index in range(checkpoint["next_index"], n, spatial_batch_size):
+                positions = list(range(start_index, min(n, start_index + spatial_batch_size)))
+                ordered = (sorted(positions, key=spatial_key)
+                           if spatial_batch_size > 1 else positions)
+                if extract_threads > 1:
+                    futures = {pos: executor.submit(extract_one, pos) for pos in ordered}
+                    rows = {pos: futures[pos].result() for pos in positions}
+                else:
+                    rows = {pos: extract_one(pos) for pos in ordered}
+
+                for position in positions:
+                    scanned += 1
+                    row = rows.pop(position)
+                    if row is None:
+                        continue
+                    chunk.append(row)
+                    if len(chunk) >= chunk_size:
+                        batch = _table(chunk)
+                        if writer is None:
+                            target = scratch / f"{field}_{shard:05d}.parquet"
+                            temporary = target.with_suffix(".parquet.part")
+                            writer = pq.ParquetWriter(temporary, batch.schema, compression="zstd")
+                        writer.write_table(batch)
+                        shard_rows += len(chunk)
+                        chunk.clear()
+                        if shard_rows >= rows_per_file:
+                            writer.close()
+                            os.replace(temporary, target)
+                            count += shard_rows
+                            shard += 1
+                            writer, shard_rows = None, 0
+                            commit(position + 1, count, shard)
+                            rate = scanned / max(time.monotonic() - started, 1e-6)
+                            print(f"{field}: checkpoint {position+1}/{n} scanned, "
+                                  f"{count} cutouts, {shard} parquet files "
+                                  f"({rate:.2f} scanned/s)", flush=True)
         if chunk:
             batch = _table(chunk)
             if writer is None:
@@ -617,7 +658,11 @@ def process_field(field: str, catalog_path: Path, mosaics: list[dict], raw_root:
             count += shard_rows
             shard += 1
         commit(n, count, shard)
-    done.write_text(str(count))
+    # Atomic completion marker: a Slurm cancellation must never leave an
+    # empty/partially written .done file that prevents future resumption.
+    done_temporary = done.with_name(done.name + ".part")
+    done_temporary.write_text(str(count))
+    os.replace(done_temporary, done)
     return count
 
 
@@ -636,6 +681,12 @@ def main() -> None:
                    help="Split each field's selected galaxies into this many independent Slurm tasks")
     p.add_argument("--shard-index", type=int, default=0,
                    help="Zero-based task number, 0 <= index < num-shards")
+    p.add_argument("--field", choices=("GOODS-S", "GOODS-N"),
+                   help="Extract only one GOODS field; allows 2*num-shards independent Slurm tasks")
+    p.add_argument("--extract-threads", type=int, default=1,
+                   help="Concurrent FITS cutout readers within a shard (I/O-bound)")
+    p.add_argument("--spatial-batch-size", type=int, default=1,
+                   help="Schedule this many nearby galaxies together; output order unchanged")
     p.add_argument("--ingest-only", action="store_true",
                    help="Verify all extraction shards, then build the unified HATS collection")
     p.add_argument("--sample-mode", choices=("first", "miri"), default="first",
@@ -662,6 +713,8 @@ def main() -> None:
     args = p.parse_args()
     if args.chunk_size <= 0:
         p.error("--chunk-size must be > 0")
+    if args.extract_threads <= 0 or args.spatial_batch_size <= 0:
+        p.error("--extract-threads and --spatial-batch-size must be > 0")
     if args.max_objects is not None and args.max_objects <= 0:
         p.error("--max-objects must be > 0")
     if args.rows_per_file <= 0 or args.hats_batch_size <= 0:
@@ -674,6 +727,8 @@ def main() -> None:
         p.error("--ingest-only and --skip-hats are mutually exclusive")
     if args.ingest_only and args.shard_index:
         p.error("--shard-index applies only to extraction, not --ingest-only")
+    if args.ingest_only and args.field:
+        p.error("--field applies only to extraction, not --ingest-only")
     if args.min_ingest_workers <= 0:
         p.error("--min-ingest-workers must be > 0")
     if args.min_ingest_workers > 1 and args.scheduler_file is None:
@@ -705,7 +760,11 @@ def main() -> None:
         scratch = shard_directory(args.scratch_dir, args.shard_index, args.num_shards)
         scratch.mkdir(parents=True, exist_ok=True)
         total = 0
-        for cat in manifest["catalogs"]:
+        catalogs = [cat for cat in manifest["catalogs"]
+                    if args.field is None or cat["field"] == args.field]
+        if not catalogs:
+            p.error(f"Field {args.field} is missing from the manifest")
+        for cat in catalogs:
             field = cat["field"]
             entries = [m for m in manifest["mosaics"]
                        if m["field"] == field and m["band"].upper() in allowed]
@@ -714,7 +773,9 @@ def main() -> None:
                               mag_band, args.mag_max, args.image_size, args.rows_per_file,
                               sample_mode=args.sample_mode,
                               phot_bands=tuple(sorted(allowed, key=_band_sort_key)),
-                              num_shards=args.num_shards, shard_index=args.shard_index)
+                              num_shards=args.num_shards, shard_index=args.shard_index,
+                              extract_threads=args.extract_threads,
+                              spatial_batch_size=args.spatial_batch_size)
             print(f"{field} task {args.shard_index}/{args.num_shards}: "
                   f"{n} objects with real image inverse variance", flush=True)
             total += n

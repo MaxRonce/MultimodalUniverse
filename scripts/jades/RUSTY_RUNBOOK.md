@@ -405,6 +405,118 @@ sbatch --export=ALL --job-name=jades-retry --partition=genx \
 These task indices are **examples**, not tasks to rerun automatically. Check
 `sacct` and logs before deciding which ones actually failed.
 
+### 8.3a Fast, checkpoint-compatible recovery of extraction array 7453873
+
+The first full run used `--array=0-31%8`, one CPU and 16 GiB per task. Its
+checkpoint/Parquet layout **must be retained**: the 32 shards contain separate
+`GOODS-S` and `GOODS-N` `.progress.json`, `.done` and Parquet files. Low CPU
+utilization and highly variable runtime suggest Ceph page faults / I/O waits,
+but only a representative Rusty benchmark can establish the speedup.
+
+The accelerated extractor makes two *execution-only* changes:
+
+1. `JADES_SPLIT_FIELDS=1` schedules **64 independent Slurm tasks**: indices
+   `0..31` extract GOODS-S shards `0..31`; indices `32..63` extract GOODS-N
+   shards `0..31`. Each task writes to the existing field-specific filenames
+   under **the same 32 shard directories**. Completed `.done` fields return
+   immediately without reading mosaics.
+2. `JADES_EXTRACT_THREADS=4` overlaps blocking FITS cutout reads in each task;
+   `JADES_SPATIAL_BATCH_SIZE=256` groups nearby pixel coordinates within a
+   *bounded* batch. Results are serialized back in the exact original catalog
+   order, so old `next_index`, file numbers and fingerprints remain valid.
+
+**Migration on the login node.** First record the current state, then cancel
+**only** the old extraction array. The last committed Parquet file per field
+and its `.progress.json` are preserved; at most its unfinished temporary file
+and records since the last checkpoint will need to be recomputed. This does
+**not** delete the ~600 GiB of saved outputs.
+
+```bash
+export JADES_RAW=/mnt/ceph/users/polymathic/external_data/Astro/JADES_DR5
+export JADES_RUN=/mnt/ceph/users/polymathic/mronceray/jades_dr5_runs
+export JADES_MANIFEST="$JADES_RUN/jades_dr5_manifest.json"
+export JADES_SCRATCH="$JADES_RUN/scratch_jades_jwst_full_dist_v2"
+export JADES_NUM_SHARDS=32
+unset JADES_MAX_OBJECTS
+
+sacct -X -j 7453873 --format=JobID,State,Elapsed,ExitCode
+find "$JADES_SCRATCH" -name '*.done' | wc -l
+du -sh "$JADES_SCRATCH"
+
+scancel 7453873
+squeue -r -j 7453873
+```
+
+Wait until the final `squeue` prints **no active tasks** (including
+`COMPLETING`). Never run old and new jobs against the same scratch at once:
+the old code does not acquire the new field lock files.
+
+Update the Rusty repository *after the old tasks stop*:
+
+```bash
+cd /mnt/ceph/users/polymathic/mronceray/MultimodalUniverse-jades
+git pull --ff-only origin feat/jades-dr5
+uv run --extra dev python -m pytest -q scripts/jades/test_jades.py
+
+export JADES_SPLIT_FIELDS=1
+export JADES_EXTRACT_THREADS=4
+export JADES_SPATIAL_BATCH_SIZE=256
+
+# Verify the mapping without touching any images or checkpoints.
+SLURM_ARRAY_TASK_ID=15 SLURM_SUBMIT_DIR="$PWD" JADES_PLAN_ONLY=1 \
+  bash scripts/jades/slurm_extract.sh  # GOODS-S, shard 15
+SLURM_ARRAY_TASK_ID=47 SLURM_SUBMIT_DIR="$PWD" JADES_PLAN_ONLY=1 \
+  bash scripts/jades/slurm_extract.sh  # GOODS-N, shard 15
+```
+
+**Start with 24 concurrent jobs**, each assigned four CPUs and 32 GiB. This
+is already up to 96 allocated CPUs, with up to 64 independently restartable
+tasks. Slurm chooses the compute nodes; the script does not run on `rusty3`.
+More jobs is not automatically faster on a shared Ceph filesystem.
+
+```bash
+FAST_JOB=$(sbatch --parsable --export=ALL \
+  --job-name=jades-fast --partition=genx \
+  --array=0-63%24 --nodes=1 --ntasks=1 --cpus-per-task=4 \
+  --mem=32G --time=2-00:00:00 \
+  --output="$JADES_RUN/logs/fast_%A_%a.out" \
+  scripts/jades/slurm_extract.sh)
+echo "FAST_JOB=$FAST_JOB"
+```
+
+The first checkpoint log now reports `scanned/s`. Compare fresh logs from
+`GOODS-N` unfinished shards with the previous run (shard 15 previously reached
+only 2688/5661 GOODS-N cutouts before a 12-hour timeout):
+
+```bash
+squeue -r -j "$FAST_JOB"
+tail -n 15 "$JADES_RUN/logs/fast_${FAST_JOB}_47.out"
+find "$JADES_SCRATCH" -name '*.done' | wc -l  # 64 field markers in total
+```
+
+After measuring throughput and observing healthy memory/IO performance, raise
+the array concurrency **without restarting it**:
+
+```bash
+scontrol update JobId="$FAST_JOB" ArrayTaskThrottle=32
+```
+
+If the throughput degrades at 32 simultaneous tasks, lower it to 16 or 24.
+Increasing concurrency indefinitely can make all tasks slower, especially if
+the shared filesystem is saturated. The 48-hour walltime is a fail-safe, **not
+a prediction that extraction will take 48 hours**. Finishing in one day is a
+goal to measure, not something this script can guarantee without Rusty I/O
+benchmarks.
+
+At completion, use the original HATS verification/ingestion described in
+section 8.4 with `--num-shards 32`, **not 64**. The two fields have been split
+across 64 *jobs*, not into 64 new output shard directories. Check the array's
+`sacct` states and all 64 `.done` files before starting ingestion. If a task
+fails, resubmit its exact **new** array index with the same environment and
+scratch; its field-specific checkpoint is still reusable. The new extractor
+uses a nonblocking per-field lock so accidental duplicate fast jobs refuse to
+overwrite active output.
+
 ### 8.4 Distributed HATS ingest across several compute nodes
 
 Start this stage **only after** every extraction task is complete, after

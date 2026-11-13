@@ -1,7 +1,10 @@
 """Tiny synthetic-FITS checks; no network or HATS cluster required."""
 
 import json
+import os
+import subprocess
 import sys
+from pathlib import Path
 from types import ModuleType
 
 import numpy as np
@@ -433,3 +436,132 @@ def test_manifest_detects_correct_products_and_requires_complete_set(tmp_path):
     assert manifest["mosaics"][0]["uncertainty_kind"] == "sigma"
     with pytest.raises(ValueError, match="Unexpected input counts"):
         make_manifest(tmp_path)
+
+
+def test_threaded_spatial_extraction_resumes_old_checkpoint_without_changing_rows(
+    tmp_path, monkeypatch,
+):
+    """Switching worker strategy must preserve old Parquet and original row order."""
+    catalog = tmp_path / "catalog.fits"
+    wcs = _wcs()
+    x = np.array([40, 150, 80, 120, 55, 135, 60, 130, 70, 115, 90, 100], dtype=float)
+    y = np.array([140, 40, 95, 60, 130, 50, 120, 70, 110, 80, 100, 90], dtype=float)
+    ra, dec = wcs.all_pix2world(x, y, 0)
+    ids = fits.Column(name="ID", format="J", array=np.arange(1, 13, dtype=np.int32))
+    table_cols = [ids,
+                  fits.Column(name="RA", format="D", array=ra),
+                  fits.Column(name="DEC", format="D", array=dec)]
+    fits.HDUList([
+        fits.PrimaryHDU(),
+        fits.BinTableHDU.from_columns([
+            *table_cols,
+            fits.Column(name="A", format="E", array=np.full(12, 0.2)),
+            fits.Column(name="B", format="E", array=np.full(12, 0.1)),
+        ], name="SIZE"),
+        fits.BinTableHDU.from_columns(table_cols, name="CIRC"),
+    ]).writeto(catalog)
+    arr = np.arange(200 * 200, dtype=np.float32).reshape((200, 200))
+    mosaic = tmp_path / "image.fits"
+    fits.HDUList([
+        fits.PrimaryHDU(),
+        fits.ImageHDU(arr, wcs.to_header(), name="SCI"),
+        fits.ImageHDU(np.ones_like(arr), name="ERR"),
+    ]).writeto(mosaic)
+    entries = [{"field": "GOODS-S", "band": "F277W", "path": "image.fits",
+                "sci_hdu": "SCI", "uncertainty_hdu": "ERR",
+                "uncertainty_kind": "sigma", "unit": "nJy"}]
+
+    baseline = tmp_path / "baseline"
+    baseline.mkdir()
+    assert process_field("GOODS-S", catalog, entries, tmp_path, baseline,
+                         chunk_size=1, max_objects=None, rows_per_file=2,
+                         image_size=8) == 12
+
+    interrupted = tmp_path / "interrupted"
+    interrupted.mkdir()
+    original = builder._record
+
+    def fail_after_committed_prefix(index, *args, **kwargs):
+        if index == 5:
+            raise RuntimeError("simulated old worker interruption")
+        return original(index, *args, **kwargs)
+
+    monkeypatch.setattr(builder, "_record", fail_after_committed_prefix)
+    with pytest.raises(RuntimeError, match="simulated old worker interruption"):
+        process_field("GOODS-S", catalog, entries, tmp_path, interrupted,
+                      chunk_size=1, max_objects=None, rows_per_file=2,
+                      image_size=8)
+    checkpoint = json.loads((interrupted / "GOODS-S.progress.json").read_text())
+    assert checkpoint["next_index"] == 4
+    assert checkpoint["count"] == 4
+    first_parquet_bytes = (interrupted / "GOODS-S_00000.parquet").read_bytes()
+
+    monkeypatch.setattr(builder, "_record", original)
+    assert process_field("GOODS-S", catalog, entries, tmp_path, interrupted,
+                         chunk_size=1, max_objects=None, rows_per_file=2,
+                         image_size=8, extract_threads=4, spatial_batch_size=7) == 12
+    assert (interrupted / "GOODS-S_00000.parquet").read_bytes() == first_parquet_bytes
+
+    import pyarrow.parquet as pq
+
+    def saved_rows(root):
+        return [row for part in sorted(root.glob("GOODS-S_*.parquet"))
+                for row in pq.read_table(part).to_pylist()]
+
+    assert saved_rows(interrupted) == saved_rows(baseline)
+    assert [row["object_id"] for row in saved_rows(interrupted)] == [
+        f"GOODS-S:{i}" for i in range(1, 13)
+    ]
+
+
+def test_field_split_selects_only_requested_catalog(tmp_path, monkeypatch):
+    paths = []
+    for field in ("GOODS-S", "GOODS-N"):
+        path = tmp_path / f"{field}.fits"
+        _catalog(path)
+        paths.append({"field": field, "path": path.name})
+    image = tmp_path / "image.fits"
+    fits.HDUList([
+        fits.PrimaryHDU(),
+        fits.ImageHDU(np.ones((200, 200), np.float32), _wcs().to_header(), name="SCI"),
+        fits.ImageHDU(np.ones((200, 200), np.float32), name="ERR"),
+    ]).writeto(image)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "release": "JADES_DR5", "catalogs": paths,
+        "mosaics": [{"field": field, "band": "F277W", "path": image.name,
+                     "sci_hdu": "SCI", "uncertainty_hdu": "ERR",
+                     "uncertainty_kind": "sigma", "unit": "nJy"}
+                    for field in ("GOODS-S", "GOODS-N")],
+    }))
+    scratch = tmp_path / "split"
+    command = ["build_parent_sample_hats", "--instrument", "jwst",
+               "--manifest", str(manifest), "--raw-root", str(tmp_path),
+               "--scratch-dir", str(scratch), "--skip-hats",
+               "--extract-threads", "2", "--spatial-batch-size", "4"]
+    monkeypatch.setattr(sys, "argv", command + ["--field", "GOODS-S"])
+    builder.main()
+    assert (scratch / "GOODS-S.done").exists()
+    assert not (scratch / "GOODS-N.done").exists()
+    monkeypatch.setattr(sys, "argv", command + ["--field", "GOODS-N"])
+    builder.main()
+    assert verify_completed_shards(scratch, ["GOODS-S", "GOODS-N"], 1)["total_objects"] == 4
+
+
+@pytest.mark.parametrize("task_index,field,shard", [
+    (0, "GOODS-S", 0), (31, "GOODS-S", 31),
+    (32, "GOODS-N", 0), (63, "GOODS-N", 31),
+])
+def test_slurm_fast_array_mapping_plan_only(task_index, field, shard):
+    repo = Path(__file__).resolve().parents[2]
+    env = dict(os.environ, SLURM_SUBMIT_DIR=str(repo),
+               SLURM_ARRAY_TASK_ID=str(task_index), JADES_NUM_SHARDS="32",
+               JADES_RAW="/not/required", JADES_RUN="/not/required",
+               JADES_SPLIT_FIELDS="1", JADES_PLAN_ONLY="1",
+               JADES_EXTRACT_THREADS="4", JADES_SPATIAL_BATCH_SIZE="256")
+    result = subprocess.run(["bash", str(repo / "scripts/jades/slurm_extract.sh")],
+                            env=env, cwd=repo, text=True, capture_output=True, check=True)
+    assert f"shard={shard}/32 field={field}" in result.stdout
+    assert f"--shard-index {shard}" in result.stdout
+    assert f"--field {field}" in result.stdout
+    assert "--extract-threads 4 --spatial-batch-size 256" in result.stdout
