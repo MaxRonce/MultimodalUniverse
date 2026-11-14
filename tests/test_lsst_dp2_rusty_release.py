@@ -19,8 +19,12 @@ from unittest.mock import patch
 import numpy as np
 from astropy.table import MaskedColumn, Table
 
-REPO = Path(__file__).resolve().parents[1]
-SCRIPT = REPO / "scripts/lsst_dp2/rusty_release.slurm"
+REPO = Path(os.environ.get(
+    "MMU_LSST_RELEASE_TEST_REPO", str(Path(__file__).resolve().parents[1])
+)).resolve()
+SCRIPT = Path(os.environ.get(
+    "MMU_LSST_RELEASE_TEST_SCRIPT", str(REPO / "scripts/lsst_dp2/rusty_release.slurm")
+)).resolve()
 
 
 def python_stages():
