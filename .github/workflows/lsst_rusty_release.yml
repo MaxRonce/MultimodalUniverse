@@ -1,0 +1,28 @@
+name: LSST Rusty release checks
+on:
+  push:
+    branches: ["feat/lsst-dp2-rusty-release"]
+    paths:
+      - "scripts/lsst_dp2/rusty_release.slurm"
+      - "tests/test_lsst_dp2_rusty_release.py"
+      - ".github/workflows/lsst_rusty_release.yml"
+  pull_request:
+    paths:
+      - "scripts/lsst_dp2/rusty_release.slurm"
+      - "tests/test_lsst_dp2_rusty_release.py"
+      - ".github/workflows/lsst_rusty_release.yml"
+permissions:
+  contents: read
+jobs:
+  release-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install lightweight test dependencies
+        run: python -m pip install numpy astropy pyarrow filelock
+      - name: Test snapshot and publication contracts
+        run: python -m unittest discover -s tests -p test_lsst_dp2_rusty_release.py -v
