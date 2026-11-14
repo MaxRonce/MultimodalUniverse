@@ -16,6 +16,7 @@ build their own PyArrow tables from the survey-native raw inputs and call
 """
 
 import contextlib
+from collections import deque
 import glob
 import hashlib
 import json
@@ -158,8 +159,12 @@ class _MappingClient:
     Splitting, reducing and margins retain their upstream implementations.
     """
 
-    def __init__(self, client):
+    def __init__(self, client, max_in_flight=16):
         self.client = client
+        self.max_in_flight = max_in_flight
+        self.pending = deque()
+        self.first_verified = False
+        self.mapping_submissions = 0
 
     def __getattr__(self, name):
         return getattr(self.client, name)
@@ -168,9 +173,42 @@ class _MappingClient:
         if (getattr(func, "__module__", "") == "hats_import.catalog.map_reduce"
                 and getattr(func, "__name__", "") == "map_to_pixels"
                 and kwargs.get("threshold_mode", "row_count") == "row_count"):
-            func = _sparse_map_to_pixels
+            # Backpressure keeps thousands of separate update-graph requests
+            # from monopolizing the scheduler event loop before workers run.
+            if len(self.pending) >= self.max_in_flight:
+                self._check_result(self.pending.popleft())
             kwargs["pure"] = False
+            future = self.client.submit(_sparse_map_to_pixels, *args, **kwargs)
+            self.mapping_submissions += 1
+            self.pending.append(future)
+            if not self.first_verified:
+                self._check_result(self.pending.popleft(), check_storage=True)
+                self.first_verified = True
+            return future
         return self.client.submit(func, *args, **kwargs)
+
+    def _check_result(self, future, check_storage=False):
+        result = future.result(timeout=600)
+        if (not isinstance(result, dict) or not isinstance(result.get("checkpoint"), str)
+                or type(result.get("rows")) is not int or result["rows"] < 0):
+            raise RuntimeError(f"Mapping task {future.key} returned no verified checkpoint: {result!r}")
+        if check_storage:
+            from hats.pixel_math.sparse_histogram import SparseHistogram
+            try:
+                saved = SparseHistogram.from_file(result["checkpoint"])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Worker reported {result['checkpoint']}, but the HATS client cannot read it. "
+                    "Check shared Ceph visibility between client and workers."
+                ) from exc
+            if int(saved.counts.sum()) != result["rows"]:
+                raise RuntimeError("First mapping checkpoint count differs between worker and client")
+            print(f"First HATS map verified from client: {result}", flush=True)
+        return result
+
+    def finish_mapping(self):
+        while self.pending:
+            self._check_result(self.pending.popleft())
 
 
 @contextlib.contextmanager
@@ -458,12 +496,17 @@ def write_hats_from_parquet_dir(
     try:
         with _client_ctx(client, n_workers, debug) as c:
             print("HATS row-count mapping: sparse counters, atomic checked checkpoints, "
-                  "Dask pure=False", flush=True)
+                  "Dask pure=False, max 16 in flight, first-file shared-storage probe", flush=True)
             for attempt in range(mapping_retries + 1):
+                mapping_client = _MappingClient(c)
                 try:
-                    pipeline_with_client(_import_arguments(), _MappingClient(c))
+                    pipeline_with_client(_import_arguments(), mapping_client)
+                    mapping_client.finish_mapping()
                     break
                 except RuntimeError as exc:
+                    # Surface the actual task error/result before a generic
+                    # "missing histograms" message can hide it.
+                    mapping_client.finish_mapping()
                     _report_missing_maps()
                     incomplete = "some map stages did not complete successfully" in str(exc).lower()
                     if not incomplete or attempt >= mapping_retries:

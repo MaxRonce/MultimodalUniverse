@@ -519,6 +519,36 @@ overwrite active output.
 
 ### 8.4 Distributed HATS ingest across several compute nodes
 
+Run `7462727` still reported no histograms with the sparse mapper. Its scheduler
+log reports an unresponsive event loop for 62.61 seconds during mapping, followed
+by client reconnects. The subsequent scheduler SIGTERM is consistent with the
+submitted cleanup job, not evidence that Slurm caused the initial mapping failure.
+No individual worker computation exception appears in the supplied excerpts.
+Do not launch another full run on that evidence alone.
+
+The mapper client now blocks for the **first task result**, verifies its NPZ
+from the controller (shared storage check), and limits outstanding mapping
+submissions to 16. It also consumes actual task results, surfacing cancellations,
+timeouts and missing return values rather than relying only on a progress bar.
+This addresses the submission burst; the scheduler log alone does not prove why
+no checkpoints were written. Binning/splitting/reducing have not been changed.
+
+Before another full import, submit a single compute job running:
+
+```bash
+uv run python -m scripts.jades.probe_hats_mapping \
+  --scratch-dir "$JADES_SCRATCH" --probe-root "$JADES_RUN" --highest-order 12
+```
+
+Request 2 CPUs, 8G RAM and 15 minutes for this probe. It creates one local Dask
+worker **in a separate process**, maps only one existing Parquet file, checks
+package/mapper consistency and row count, then reads its checkpoint from the
+client. No extraction/HATS outputs are changed; diagnostic files are kept in a
+new `hats_mapping_probe_*` directory under `JADES_RUN`. A zero exit and `PASS`
+establish that this one-file local-process path works, not that an external
+multi-node cluster or the full import works. To test a live external cluster,
+add `--scheduler-file "$JADES_DASK_FILE"` to this same probe before full import.
+
 Recovery after run `7462528`: its controller reports 0/7600 map checkpoints,
 but the available controller and worker excerpts contain no individual mapping
 exception. The original storage/runtime cause is therefore not established.

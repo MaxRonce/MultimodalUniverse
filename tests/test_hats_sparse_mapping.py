@@ -51,9 +51,10 @@ def test_mapping_failure_propagates_and_publishes_no_checkpoint(tmp_path):
     assert not list(tmp_path.rglob("*.npz"))
 
 
-def test_actual_dask_retry_reexecutes_side_effects(tmp_path):
+@pytest.mark.parametrize("processes", [False, True])
+def test_actual_dask_retry_reexecutes_side_effects(tmp_path, processes):
     options, _, _ = inputs(tmp_path)
-    with Client(processes=False, n_workers=1, threads_per_worker=1,
+    with Client(processes=processes, n_workers=1, threads_per_worker=1,
                 dashboard_address=None) as client:
         wrapped = _MappingClient(client)
         first = wrapped.submit(map_to_pixels, **options)
@@ -66,6 +67,59 @@ def test_actual_dask_retry_reexecutes_side_effects(tmp_path):
         assert first.key != second.key
         assert target.is_file()
         assert int(SparseHistogram.from_file(str(target)).counts.sum()) == 5
+
+
+def test_submission_window_checks_results_before_more_work(tmp_path):
+    options, _, _ = inputs(tmp_path)
+    class Future:
+        key = "fake"
+        def __init__(self, result):
+            self.value = result
+            self.checked = False
+        def result(self, timeout):
+            self.checked = True
+            return self.value
+    class Recorder:
+        def __init__(self):
+            self.futures = []
+        def submit(self, function, *args, **kwargs):
+            if len(self.futures) >= 3:
+                assert self.futures[-3].checked
+            future = Future(_sparse_map_to_pixels(*args, **{k: v for k, v in kwargs.items() if k != "pure"}))
+            self.futures.append(future)
+            return future
+    recorder = Recorder()
+    wrapped = _MappingClient(recorder, max_in_flight=2)
+    for index in range(8):
+        wrapped.submit(map_to_pixels, **(options | {"mapping_key": f"map_{index}"}))
+        assert len(wrapped.pending) <= 2
+    wrapped.finish_mapping()
+    assert all(f.checked for f in recorder.futures)
+
+
+def test_no_side_effect_result_fails_on_first_task():
+    class Future:
+        key = "no-op"
+        def result(self, timeout):
+            return None
+    class Recorder:
+        def submit(self, *args, **kwargs):
+            return Future()
+    with pytest.raises(RuntimeError, match="no verified checkpoint"):
+        _MappingClient(Recorder()).submit(map_to_pixels)
+
+
+def test_one_file_probe_cli(tmp_path):
+    import subprocess
+    import sys
+    inputs(tmp_path)
+    result = subprocess.run([
+        sys.executable, "-m", "scripts.jades.probe_hats_mapping",
+        "--scratch-dir", str(tmp_path), "--probe-root", str(tmp_path),
+    ], text=True, capture_output=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "First HATS map verified from client:" in result.stdout
+    assert "PASS: ONE mapping task executed" in result.stdout
 
 
 def test_other_dask_tasks_are_not_replaced():
