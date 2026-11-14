@@ -1,0 +1,79 @@
+"""Report JADES DR5 photometric SNR cut yields without imposing a build cut."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+from astropy.io import fits
+
+from scripts.jades.build_parent_sample_hats import apparent_mag_from_njy
+
+
+def summarize_snr(catalogs: list[Path], bands: list[str], aperture: str = "CIRC3",
+                  mag_band: str | None = None, mag_cuts: tuple[float, ...] = ()) -> dict:
+    summaries = {}
+    for path in catalogs:
+        # FITS binary tables are memory mapped; access only requested columns.
+        # Creating an Astropy Table of the full DR5 CIRC extension can require
+        # several GB of RAM despite needing only a handful of columns.
+        with fits.open(path, memmap=True) as hdus:
+            table = hdus["CIRC"].data
+            n = len(table)
+            snrs = np.full((n, len(bands)), np.nan, dtype=np.float32)
+            for i, band in enumerate(bands):
+                value, error = f"{band}_{aperture}", f"{band}_{aperture}_e"
+                if value not in table.names or error not in table.names:
+                    continue
+                flux = np.asarray(table[value], dtype=np.float32)
+                sigma = np.asarray(table[error], dtype=np.float32)
+                good = np.isfinite(flux) & np.isfinite(sigma) & (sigma > 0)
+                np.divide(flux, sigma, out=snrs[:, i], where=good)
+            valid = np.isfinite(snrs)
+            summary = {"objects": n, "aperture": aperture, "available_bands": {}}
+            for i, band in enumerate(bands):
+                summary["available_bands"][band] = int(valid[:, i].sum())
+            for threshold in (2, 3, 5, 10):
+                count = ((snrs >= threshold) & valid).sum(axis=1)
+                summary[f"snr_ge_{threshold}"] = {
+                    "at_least_1_band": int((count >= 1).sum()),
+                    "at_least_2_bands": int((count >= 2).sum()),
+                    "at_least_4_bands": int((count >= 4).sum()),
+                }
+            if mag_band is not None:
+                kron = hdus["KRON"].data
+                if len(kron) != n or not np.array_equal(kron["ID"], table["ID"]):
+                    raise ValueError(f"{path}: KRON and CIRC IDs not aligned")
+                name = f"{mag_band}_KRON"
+                if name not in kron.names:
+                    raise ValueError(f"{path}: missing {name} for AB magnitude counts")
+                mag = apparent_mag_from_njy(kron[name])
+                summary["magnitude_reference"] = mag_band
+                summary["magnitude_cuts"] = {
+                    str(cut): int((np.isfinite(mag) & (mag < cut)).sum()) for cut in mag_cuts
+                }
+            summaries[path.stem] = summary
+    return summaries
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("catalogs", nargs="+", type=Path)
+    parser.add_argument("--bands", nargs="+", required=True)
+    parser.add_argument("--aperture", default="CIRC3")
+    parser.add_argument("--mag-band", help="Reference band for a magnitude completeness audit (KRON)")
+    parser.add_argument("--mag-cuts", nargs="+", type=float, default=[26, 27, 28, 29, 30])
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    summary = summarize_snr(args.catalogs, [b.upper() for b in args.bands], args.aperture,
+                            args.mag_band.upper() if args.mag_band else None,
+                            tuple(args.mag_cuts))
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(summary, indent=2) + "\n")
+    print(f"Wrote {args.output}")
+
+
+if __name__ == "__main__":
+    main()
