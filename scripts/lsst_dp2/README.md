@@ -22,6 +22,13 @@ The implementation is split by responsibility:
 - `publish_review.py`: explicit W&B upload of review panels and metadata;
 - `Snakefile`: single-node Jean-Zay workflow with durable stage markers.
 
+## Rusty release builds
+
+See [RUSTY_RELEASE.md](RUSTY_RELEASE.md) for a CPU-only snapshot/build/publish
+launcher that can run while raw download campaigns continue. It includes
+synthetic preflight tests, independent per-shard validation, and optional
+publication with the previous shared collection retained as an archive.
+
 ## Data contract
 
 Each source has a fixed `160 x 160` cutout centered from its DP2 Object
@@ -41,6 +48,14 @@ The `image` struct contains:
 | `scale` | `(6,)` float32 | pixel scale, currently `0.2` arcsec/pixel |
 | `band_present` | `(6,)` bool | availability of each deep coadd |
 | provenance | `(6,)` | dataset ID, SHA-256, mask-plane map, PSF source |
+
+Scalar photometry is stored as top-level float32 columns independently of the
+image arrays: each of `u,g,r,i,z,y` has `psfFlux`, `psfFluxErr`,
+`cModelFlux`, and `cModelFluxErr` (24 columns total). These are Rubin catalog
+measurements, not sums over the cutout. The selection metadata also includes
+`i_cModelMag`, `i_cModelMagErr`, major/minor Sersic radii, Sersic index,
+fit quality, extendedness measures and flags. The stored schema does not include
+scalar errors for the Sersic parameters.
 
 Invalid pixels have `ivar=0` and `mask=False`. Non-finite input flux is stored
 as zero only where the mask rejects that pixel. A missing or non-finite Rubin
