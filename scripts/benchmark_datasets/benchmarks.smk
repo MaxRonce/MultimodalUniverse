@@ -2,7 +2,7 @@ import sys
 
 
 BENCHMARK_ROOT = _resolve("benchmark_root", f"{HATS_ROOT}/benchmarks").rstrip("/")
-validate_hats_root(BENCHMARK_ROOT)
+validate_hats_root(BENCHMARK_ROOT, benchmark=True)
 BENCHMARKS = ("gz10", "desi_provabgs", "galaxy_cruise", "euclid_q1_morphology")
 
 

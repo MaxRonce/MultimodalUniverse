@@ -141,6 +141,27 @@ class TestForbiddenPaths:
             )
 
 
+def test_personal_benchmark_root():
+    root = "/mnt/ceph/users/polymathic/mronceray/benchmark-datasets"
+    validate_hats_root(root, benchmark=True)
+    with pytest.raises(UnsafeOutputPathError):
+        validate_hats_root(root)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/mnt/ceph/users/polymathic/mronceray",
+        "/mnt/ceph/users/polymathic/mronceray/benchmark-datasets-old",
+        "/mnt/ceph/users/polymathic/AION-2-tokens/aion2.lancedb",
+        "/mnt/ceph/users/polymathic/external_data",
+    ],
+)
+def test_benchmark_mode_rejects_other_shared_paths(path):
+    with pytest.raises(UnsafeOutputPathError):
+        validate_hats_root(path, benchmark=True)
+
+
 class TestAllowlistInvariants:
     """Meta-tests on the allowlist itself, catching changes that weaken safety."""
 

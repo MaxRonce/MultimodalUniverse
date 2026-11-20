@@ -20,14 +20,12 @@ import os
 # The Flatiron shared research mount.
 POLYMATHIC_ROOT = "/mnt/ceph/users/polymathic"
 
-# The only subdirectories of POLYMATHIC_ROOT that our pipeline is permitted to
-# write into. Everything else under POLYMATHIC_ROOT is off-limits — especially
-# ``external_data/`` (read-only raw data) and any neighbor project that's not
-# part of MMU v2 HATS work.
+# Shared production and test roots for regular survey builds.
 ALLOWED_HATS_ROOT_PREFIXES: tuple[str, ...] = (
     f"{POLYMATHIC_ROOT}/MultimodalUniverse_v2_hats",
     f"{POLYMATHIC_ROOT}/MultimodalUniverse_v2_hats_cosmos",
 )
+BENCHMARK_HATS_ROOT = f"{POLYMATHIC_ROOT}/mronceray/benchmark-datasets"
 
 # Explicit denylist substrings that ABSOLUTELY must not appear in any output
 # path. Adds a second layer of defense on top of the allowlist: even if a new
@@ -70,7 +68,7 @@ def _is_under(path: str, prefix: str) -> bool:
     )
 
 
-def validate_hats_root(hats_root: str) -> None:
+def validate_hats_root(hats_root: str, *, benchmark: bool = False) -> None:
     """Raise ``UnsafeOutputPathError`` if ``hats_root`` is not safe to write into.
 
     Rules:
@@ -79,9 +77,9 @@ def validate_hats_root(hats_root: str) -> None:
     2. Symlinks along ``hats_root`` are resolved via ``os.path.realpath`` so
        a symlink pointing at ``external_data/`` can't bypass the check.
     3. If the resolved path starts with ``/mnt/ceph/users/polymathic/`` it must
-       also match one of :data:`ALLOWED_HATS_ROOT_PREFIXES`. Matching is done
-       by path-segment comparison so ``/mmu_v2_hats_extra`` does NOT match
-       ``/mmu_v2_hats`` (no substring false positives).
+       also match one of :data:`ALLOWED_HATS_ROOT_PREFIXES`. Benchmark builds
+       can also use :data:`BENCHMARK_HATS_ROOT`. Prefixes are matched by path
+       component.
     4. The resolved path must not have any component equal to a
        :data:`FORBIDDEN_SUBSTRINGS` entry (e.g. an ``external_data`` segment
        anywhere in the path).
@@ -120,11 +118,11 @@ def validate_hats_root(hats_root: str) -> None:
     # Rule 3: anything under POLYMATHIC_ROOT must match an allowed prefix
     # by path-segment comparison (not string startswith).
     if _is_under(resolved, POLYMATHIC_ROOT):
-        is_allowed = any(
-            _is_under(resolved, prefix) for prefix in ALLOWED_HATS_ROOT_PREFIXES
-        )
-        if not is_allowed:
-            allowed = "\n  - ".join(ALLOWED_HATS_ROOT_PREFIXES)
+        prefixes = ALLOWED_HATS_ROOT_PREFIXES
+        if benchmark:
+            prefixes += (BENCHMARK_HATS_ROOT,)
+        if not any(_is_under(resolved, prefix) for prefix in prefixes):
+            allowed = "\n  - ".join(prefixes)
             raise UnsafeOutputPathError(
                 f"Refusing to use hats_root={hats_root!r} "
                 f"(resolved to {resolved!r}). "

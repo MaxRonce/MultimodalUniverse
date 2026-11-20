@@ -93,7 +93,7 @@ def read_labels(name: str, scratch: Path) -> tuple[pa.Table, str]:
 
 
 def build(name: str, root: Path, workers: int) -> None:
-    validate_hats_root(str(root))
+    validate_hats_root(str(root), benchmark=True)
     root.mkdir(parents=True, exist_ok=True)
     output = root / name
     if output.exists():

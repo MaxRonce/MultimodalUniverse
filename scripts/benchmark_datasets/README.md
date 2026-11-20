@@ -31,6 +31,8 @@ srun -p genx -n 1 -c 4 --mem=16G --time=02:00:00 \
 
 Replace `benchmark_datasets` with `"$ROOT/gz10"` to build one collection.
 Without `benchmark_root`, the target writes under `<hats_root>/benchmarks`.
+On shared Ceph, this fork also accepts
+`/mnt/ceph/users/polymathic/mronceray/benchmark-datasets` for benchmark builds.
 
 ## Match raw survey catalogs
 
