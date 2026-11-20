@@ -42,6 +42,7 @@ EUCLID_COLUMNS = {
     "declination": "dec",
     "object_id": "object_id",
     "tile_index": "tile_index",
+    "warning_galaxy_fails_training_cuts": "warning_galaxy_fails_training_cuts",
     "smooth-or-featured_smooth_fraction": "p_smooth",
     "smooth-or-featured_featured-or-disk_fraction": "p_featured_or_disk",
     "smooth-or-featured_problem_fraction": "p_problem",
