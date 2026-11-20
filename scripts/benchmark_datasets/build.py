@@ -16,7 +16,6 @@ import requests
 from mmu.hats_import import write_hats
 from mmu.safety import validate_hats_root
 
-
 HUB_SOURCES = {
     "gz10": (
         "hf://datasets/UniverseTBD/mmu_gz10@e99918709f5c6bccf496bebbc2790cb69c51851c",
@@ -36,6 +35,22 @@ DOWNLOADS = {
         "https://galaxycruise.mtk.nao.ac.jp/data/galaxy_cruise_season1.cat.gz",
         "e2eac568d979c2c74f450e70499421734c81c49d799f56c2547bb674b1f1452a",
     ),
+    "galaxy_zoo_decals": (
+        "https://zenodo.org/records/4573248/files/gz_decals_volunteers_5.parquet",
+        "f8959f933d0ad88a8dbb5d1db2d003e131c2fb098778a3d45ad0416995355153",
+    ),
+}
+GZD_QUESTIONS = {
+    "smooth-or-featured",
+    "disk-edge-on",
+    "has-spiral-arms",
+    "bar",
+    "bulge-size",
+    "how-rounded",
+    "edge-on-bulge",
+    "spiral-winding",
+    "spiral-arm-count",
+    "merging",
 }
 EUCLID_COLUMNS = {
     "right_ascension": "ra",
@@ -86,6 +101,11 @@ def read_labels(name: str, scratch: Path) -> tuple[pa.Table, str]:
     if name == "euclid_q1_morphology":
         table = pq.read_table(source, columns=list(EUCLID_COLUMNS))
         return table.rename_columns(EUCLID_COLUMNS), uri
+    if name == "galaxy_zoo_decals":
+        parquet = pq.ParquetFile(source)
+        votes = [col for col in parquet.schema_arrow.names if col.split("_", 1)[0] in GZD_QUESTIONS]
+        table = parquet.read(columns=["ra", "dec", "iauname", *votes])
+        return table.rename_columns({"iauname": "object_id"}), uri
 
     frame = pd.read_csv(
         source, sep=r"\s+", header=None, usecols=list(CRUISE_COLUMNS), dtype={0: "string"}
