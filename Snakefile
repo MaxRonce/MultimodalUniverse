@@ -8,9 +8,9 @@ The Snakefile is intentionally a thin wrapper: it just declares one rule per
 ported dataset and a top-level `all` target. Adding a new dataset is two lines
 in `PORTED` plus the build script.
 
-REQUIREMENTS: this pipeline only runs on the Flatiron cluster. Raw inputs live
-under `/mnt/ceph/users/polymathic/external_data/astro/` and are NOT downloaded
-by anything here. For local development use the unit tests in `tests/`.
+The regular survey builds use Flatiron raw inputs under
+`/mnt/ceph/users/polymathic/external_data/astro/`. The optional benchmark
+target downloads public label catalogs. The unit tests in `tests/` run locally.
 
 Usage (run from a cluster login/compute node):
 
@@ -714,3 +714,5 @@ rule build_swift_sne_ia:
         qos = slurm_qos(SLURM_PARTITION),
     shell:
         "{params.cmd}"
+
+include: "scripts/benchmark_datasets/benchmarks.smk"

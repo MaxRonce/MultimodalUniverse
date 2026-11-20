@@ -98,6 +98,10 @@ gaia = lsdb.read_hats(f"{HATS}/gaia_xp/gaia_xp")
 df = desi.crossmatch(gaia, radius_arcsec=1.0).compute()
 ```
 
+## Benchmark datasets
+
+Build public label catalogs and match them to survey data or AION token tables. [Benchmark dataset guide](scripts/benchmark_datasets/README.md)
+
 ## Datasets
 The Multimodal Universe currently contains data from the following surveys/modalities:
 | **Survey**             | **Modality**        | **Science Use Case** | **# samples** |
