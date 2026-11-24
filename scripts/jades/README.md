@@ -22,6 +22,12 @@ JWST path uses the 34 NIRCam v5.0 + 18 MIRI v1.0 images downloaded for this
 project, along with the two GOODS-S/GOODS-N photometric catalogs. The HST
 builder remains separate and requires HST images not yet obtained here.
 
+**Publishing the completed JWST collection:** follow [PUBLISHING.md](PUBLISHING.md)
+for Rusty validation, exact-source checks, hardlink staging, restartable private
+Hugging Face upload and release licensing. The accompanying
+[dataset card](DATASET_CARD.md) describes the 484,219-source November export,
+its schema, selection, limitations and planned AION-2 use.
+
 **Resuming the November 2026 full extraction:** see [runbook §8.3a](RUSTY_RUNBOOK.md#83a-fast-checkpoint-compatible-recovery-of-extraction-array-7453873).
 The faster mode uses 64 Slurm array elements across the *existing* 32 shard
 directories (one GOODS field per job), plus configurable concurrent FITS
