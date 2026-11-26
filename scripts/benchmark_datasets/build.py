@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from zipfile import ZipFile
 
 import numpy as np
 import pandas as pd
@@ -39,6 +40,25 @@ DOWNLOADS = {
         "https://zenodo.org/records/4573248/files/gz_decals_volunteers_5.parquet",
         "f8959f933d0ad88a8dbb5d1db2d003e131c2fb098778a3d45ad0416995355153",
     ),
+    "euclid_dr1_eclipse": (
+        "https://zenodo.org/records/19654904/files/ECLIPSE_object_catalogue.zip",
+        "5486e82867a0209767d542478b5375413f68bc8adf033f157da940b4c6f75438",
+    ),
+    "desi_dr1_strong_lens_observations": (
+        "https://data.desi.lbl.gov/public/dr1/vac/dr1/strong-lensing/v1.0/desi-sl-vac-v1.fits",
+        "0fb81f2272635605244e0c024b8405219f30d60ed60b58c0ed3079c47d3139b0",
+    ),
+}
+ECLIPSE_COLUMNS = {
+    "Unique_Identifier": "object_id",
+    "RA_obj": "ra",
+    "DEC_obj": "dec",
+    "Expert_Grade": "expert_grade",
+    "Expert_Score": "expert_score",
+    "MER_object_id": "mer_object_id",
+    "desi_deflector_specz": "desi_deflector_specz",
+    "large_system_warning": "large_system_warning",
+    "earliest_publication_bibcode": "earliest_publication_bibcode",
 }
 GZD_QUESTIONS = {
     "smooth-or-featured",
@@ -98,6 +118,32 @@ def read_labels(name: str, scratch: Path) -> tuple[pa.Table, str]:
         digest = hashlib.file_digest(downloaded, "sha256").hexdigest()
     if digest != sha256:
         raise ValueError(f"{name}: {uri} does not match the pinned SHA-256")
+    if name == "euclid_dr1_eclipse":
+        with ZipFile(source) as archive, archive.open(
+            "ECLIPSE_object_catalogue/ECLIPSE_object_catalogue.csv"
+        ) as csv:
+            frame = pd.read_csv(csv, usecols=list(ECLIPSE_COLUMNS), dtype={"MER_object_id": "string"})
+        counts = frame["Expert_Grade"].value_counts(dropna=False).to_dict()
+        if counts != {"A": 6073, "B": 8999, "C": 9010, "X": 2580}:
+            raise ValueError(f"Unexpected ECLIPSE grade counts: {counts}")
+        return pa.Table.from_pandas(frame.rename(columns=ECLIPSE_COLUMNS), preserve_index=False), uri
+    if name == "desi_dr1_strong_lens_observations":
+        from astropy.io import fits
+
+        with fits.open(source) as hdus:
+            rows = hdus["DESI_SL_CATALOG"].data
+            target_ids = np.asarray(rows["TARGETID"], dtype=np.int64)
+            table = pa.table({
+                "object_id": [f"{target_id}:{index}" for index, target_id in enumerate(target_ids)],
+                "ra": np.asarray(rows["TARGET_RA"], dtype=np.float64),
+                "dec": np.asarray(rows["TARGET_DEC"], dtype=np.float64),
+                "target_id": target_ids,
+                "survey_program": np.char.strip(rows["PROGRAM"].astype(str)).tolist(),
+                "redshift": np.asarray(rows["Z"], dtype=np.float64),
+                "redshift_error": np.asarray(rows["ZERR"], dtype=np.float64),
+                "zwarn": np.asarray(rows["ZWARN"], dtype=np.int64),
+            })
+        return table, uri
     if name == "euclid_q1_morphology":
         table = pq.read_table(source, columns=list(EUCLID_COLUMNS))
         return table.rename_columns(EUCLID_COLUMNS), uri
@@ -138,6 +184,11 @@ def build(name: str, root: Path, workers: int) -> None:
         metadata = {"source": source, "rows": len(table), "columns": table.column_names}
         if name in DOWNLOADS:
             metadata["sha256"] = DOWNLOADS[name][1]
+        if name == "euclid_dr1_eclipse":
+            metadata.update(doi="10.5281/zenodo.19654904", license="CC-BY-4.0", row_unit="system")
+        if name == "desi_dr1_strong_lens_observations":
+            metadata.update(license="CC-BY-4.0", row_unit="observation",
+                            object_id="DESI TARGETID:zero-based FITS row")
         (collection / "source.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
         collection.rename(output)
     print(f"{name}: {len(table):,} labels -> {output}")

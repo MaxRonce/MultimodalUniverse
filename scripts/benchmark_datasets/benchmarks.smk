@@ -9,6 +9,8 @@ BENCHMARKS = (
     "galaxy_cruise",
     "euclid_q1_morphology",
     "galaxy_zoo_decals",
+    "euclid_dr1_eclipse",
+    "desi_dr1_strong_lens_observations",
 )
 
 
